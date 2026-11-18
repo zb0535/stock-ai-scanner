@@ -11,6 +11,8 @@ import {
 } from "recharts";
 import "./App.css";
 
+const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
 const TABS = {
   "인기": [
     { symbol: "NVDA", name: "NVIDIA Corp.", exchange: "NASDAQ" },
@@ -76,7 +78,7 @@ export default function App() {
   const [sp500, setSp500] = useState([]);
 
     const loadDefault = () => {
-    fetch("http://localhost:8000/api/watchlist")
+    fetch(`${API_BASE}/api/watchlist`)
       .then((r) => r.json())
       .then((d) => setTickers(d.tickers || []))
       .catch(() => setTickers(["AAPL", "MSFT", "NVDA", "AMZN", "LLY"]));
@@ -103,7 +105,7 @@ export default function App() {
   }, [tickers]);
 
   useEffect(() => {
-  fetch("http://localhost:8000/api/sp500")
+  fetch(`${API_BASE}/api/sp500`)
     .then((r) => r.json())
     .then((d) => setSp500(d.results || []))
     .catch(() => {});
@@ -117,7 +119,7 @@ export default function App() {
     const timer = setTimeout(async () => {
       setSearching(true);
       try {
-        const res = await fetch(`http://localhost:8000/api/search?q=${encodeURIComponent(query)}`);
+        const res = await fetch(`${API_BASE}/api/search?q=${encodeURIComponent(query)}`);
         const data = await res.json();
         setSearchResults(data.results || []);
       } catch {
@@ -141,7 +143,7 @@ export default function App() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch("http://localhost:8000/api/screen", {
+      const res = await fetch(`${API_BASE}/api/screen`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ criteria, tickers }),
