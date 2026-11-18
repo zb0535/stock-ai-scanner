@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+yfinance
+pandas
+lxml
+google-genai
+pydantic
