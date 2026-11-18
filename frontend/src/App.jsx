@@ -8,6 +8,7 @@ import {
   CartesianGrid,
   Tooltip,
   Legend,
+  ReferenceLine,
 } from "recharts";
 import "./App.css";
 
@@ -77,6 +78,21 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [sp500, setSp500] = useState([]);
 
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  const openDetail = async (pick) => {
+    setDetail({ ...pick, levels: null, quarters: [] });
+    setDetailLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/stock/${pick.ticker}`);
+      const data = await res.json();
+      setDetail({ ...pick, ...data });
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+    
     const loadDefault = () => {
     fetch(`${API_BASE}/api/watchlist`)
       .then((r) => r.json())
@@ -237,7 +253,7 @@ export default function App() {
 
             <section className="grid">
               {result.analysis.top_picks.map((pick, i) => (
-                <article className="card" key={pick.ticker}>
+                <article className="card clickable" key={pick.ticker} onClick={() => openDetail(pick)}>
                   <div className="card-top">
                     <div>
                       <span className="rank">TOP {i + 1}</span>
@@ -385,6 +401,70 @@ export default function App() {
               <button type="button" className="done" onClick={() => setModalOpen(false)}>
                 {tickers.length}개 선택 완료
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {detail && (
+        <div className="modal-backdrop" onClick={() => setDetail(null)}>
+          <div className="modal detail-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h2>{detail.ticker} 상세 분석 · 참고선</h2>
+              <button type="button" onClick={() => setDetail(null)}>✕</button>
+            </div>
+
+            <div className="modal-list">
+              {detailLoading && <div className="list-empty">분기 실적 · 참고선 불러오는 중...</div>}
+
+              {detail.levels?.current && (
+                <div className="level-grid">
+                  <div className="lvl"><span>현재가</span><strong>${detail.levels.current}</strong></div>
+                  <div className="lvl red"><span>저항(60일 고점)</span><strong>${detail.levels.resistance_60d}</strong></div>
+                  <div className="lvl yellow"><span>20일선</span><strong>${detail.levels.ma20}</strong></div>
+                  <div className="lvl green"><span>지지(60일 저점)</span><strong>${detail.levels.support_60d}</strong></div>
+                </div>
+              )}
+
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={220}>
+                  <LineChart data={detail.chart} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" />
+                    <XAxis dataKey="date" tick={{ fill: "#6e7681", fontSize: 10 }} minTickGap={15} />
+                    <YAxis domain={["auto", "auto"]} tick={{ fill: "#6e7681", fontSize: 10 }} />
+                    <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: "10px" }} />
+                    {detail.levels?.resistance_60d && (
+                      <ReferenceLine y={detail.levels.resistance_60d} stroke="#f87171" strokeDasharray="4 4" />
+                    )}
+                    {detail.levels?.support_60d && (
+                      <ReferenceLine y={detail.levels.support_60d} stroke="#34d399" strokeDasharray="4 4" />
+                    )}
+                    <Line type="monotone" dataKey="price" name="종가" stroke="#38bdf8" dot={false} strokeWidth={2.2} />
+                    <Line type="monotone" dataKey="ma20" name="20일선" stroke="#fbbf24" dot={false} strokeWidth={1.5} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+
+              {detail.quarters?.length > 0 && (
+                <div className="q-table">
+                  <strong>📊 최근 4분기 실적 (단위: 백만 달러 $M)</strong>
+                  <table>
+                    <thead>
+                      <tr><th>분기</th><th>매출</th><th>영업이익</th><th>순이익</th></tr>
+                    </thead>
+                    <tbody>
+                      {detail.quarters.map((q) => (
+                        <tr key={q.quarter}>
+                          <td>{q.quarter}</td>
+                          <td>{q.revenue_m?.toLocaleString() ?? "-"}</td>
+                          <td>{q.operating_m?.toLocaleString() ?? "-"}</td>
+                          <td>{q.net_m?.toLocaleString() ?? "-"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           </div>
         </div>
