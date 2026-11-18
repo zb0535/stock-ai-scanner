@@ -138,3 +138,38 @@ def screen_stocks(req: ScreenRequest):
         pick["news"] = _get_recent_news(pick["ticker"], limit=3)
 
     return {"analysis": data, "all_stocks": rows}
+
+@app.get("/api/stock/{ticker}")
+def get_stock_detail(ticker: str):
+    sym = ticker.strip().upper()
+    tk = yf.Ticker(sym)
+    hist = tk.history(period="3mo")
+    close = hist["Close"] if not hist.empty else pd.Series(dtype=float)
+
+    levels = {}
+    if not close.empty:
+        levels = {
+            "current": round(float(close.iloc[-1]), 2),
+            "resistance_60d": round(float(hist["High"].max()), 2),
+            "support_60d": round(float(hist["Low"].min()), 2),
+            "ma20": round(float(close.tail(20).mean()), 2),
+        }
+
+    quarters = []
+    try:
+        q = tk.quarterly_income_stmt
+        if q is not None and not q.empty:
+            for col in list(q.columns)[:4]:
+                rev = q.loc["Total Revenue", col] if "Total Revenue" in q.index else None
+                op = q.loc["Operating Income", col] if "Operating Income" in q.index else None
+                net = q.loc["Net Income", col] if "Net Income" in q.index else None
+                quarters.append({
+                    "quarter": col.strftime("%Y-%m"),
+                    "revenue_m": None if pd.isna(rev) else round(float(rev) / 1e6, 1),
+                    "operating_m": None if pd.isna(op) else round(float(op) / 1e6, 1),
+                    "net_m": None if pd.isna(net) else round(float(net) / 1e6, 1),
+                })
+    except Exception:
+        quarters = []
+
+    return {"ticker": sym, "levels": levels, "quarters": quarters}
