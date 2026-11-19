@@ -31,8 +31,9 @@ MODEL_ID = "gemini-3.5-flash-lite"
 # Gemini 호출 상한·예산(밀리초). 모델이 느리거나 503을 받았을 때 재시도로 수십 초를
 # 버리지 않도록, 시도당 상한(GEMINI_TIMEOUT_MS)과 AI 단계 전체 예산(GEMINI_TOTAL_BUDGET_MS)을
 # 함께 둔다. 예산을 넘긴 뒤의 시도는 아예 보내지 않고 점수 기반 폴백으로 간다.
-GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "20000"))
-GEMINI_TOTAL_BUDGET_MS = int(os.environ.get("GEMINI_TOTAL_BUDGET_MS", "40000"))
+GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "30000"))
+GEMINI_FALLBACK_TIMEOUT_MS = int(os.environ.get("GEMINI_FALLBACK_TIMEOUT_MS", "15000"))
+GEMINI_TOTAL_BUDGET_MS = int(os.environ.get("GEMINI_TOTAL_BUDGET_MS", "45000"))
 # 2순위 모델 — 주 모델이 503(과부하)·타임아웃이면 다른 모델 풀에 한 번 더 물어본다.
 # (같은 모델을 반복하면 과부하가 계속되기만 하고, 사용자는 'AI 해설 없음' 카드를 받는다.)
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash").strip()
@@ -462,12 +463,17 @@ def _gemini_client(timeout_ms: int | None = None):
         return genai.Client()
 
 
-def _gemini_model_plan() -> list[str]:
-    """시도할 모델 순서 — 1·2회차는 주 모델, 3회차는 2순위 모델(있으면)."""
-    plan = [MODEL_ID] * 2
+def _gemini_model_plan() -> list[tuple[str, int]]:
+    """시도할 (모델, 시도당 상한 ms) 목록.
+
+    주 모델은 한 번만, 넉넉하게(30초) 부른다 — 과부하 상황에서 정상 호출이 20~25초 걸리는
+    것을 실서버에서 확인했고, 같은 모델을 두 번 부르면 늦은 호출에 값을 두 번 치른다.
+    주 모델이 503·타임아웃이면 다른 모델 풀(2순위)에 짧게(15초) 한 번 더 물어본다.
+    """
+    plan = [(MODEL_ID, GEMINI_TIMEOUT_MS)]
     if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != MODEL_ID:
-        plan.append(GEMINI_FALLBACK_MODEL)
-    return plan[:GEMINI_MAX_ATTEMPTS]
+        plan.append((GEMINI_FALLBACK_MODEL, GEMINI_FALLBACK_TIMEOUT_MS))
+    return plan[:max(1, GEMINI_MAX_ATTEMPTS)]
 
 
 def _gemini_config(thinking_budget: int | None) -> types.GenerateContentConfig:
@@ -575,20 +581,22 @@ def screen_stocks(req: ScreenRequest):
     plan = _gemini_model_plan()
     deadline = time.time() + GEMINI_TOTAL_BUDGET_MS / 1000.0
     last_error = None
+    analysis_model = None
     _t = time.perf_counter()
-    for attempt, model in enumerate(plan, 1):
+    for attempt, (model, budget_ms) in enumerate(plan, 1):
         remaining_ms = int((deadline - time.time()) * 1000)
         if remaining_ms < 3000:  # 남은 예산으로는 의미 있는 응답을 못 받는다
             analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
             break
         try:
-            client = _gemini_client(min(GEMINI_TIMEOUT_MS, remaining_ms))
+            client = _gemini_client(min(budget_ms, remaining_ms))
             res = client.models.generate_content(
                 model=model,
                 contents=prompt,
                 config=_gemini_config(thinking_budget),
             )
             data = _parse_analysis(res.text)
+            analysis_model = model
             break
         except Exception as exc:
             logger.warning("Gemini 분석 실패(%d/%d, %s) → %s: %s", attempt, len(plan), model,
@@ -645,7 +653,7 @@ def screen_stocks(req: ScreenRequest):
     return _json_safe({"analysis": data, "all_stocks": rows, "strategy": strategy,
                        "mode": mode, "universe_scanned": universe_scanned,
                        "analysis_source": analysis_source, "analysis_note": analysis_note,
-                       "timings": timings})
+                       "analysis_model": analysis_model, "timings": timings})
 
 
 @app.get("/api/performance")

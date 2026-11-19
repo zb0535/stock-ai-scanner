@@ -551,8 +551,8 @@ class ScreenIntegrationTests(unittest.TestCase):
             "/api/screen", json={"criteria": "모멘텀 돌파", "tickers": ["MID"]}).json()
 
         self.assertEqual(sorted(body),
-                         ["all_stocks", "analysis", "analysis_note", "analysis_source",
-                          "mode", "strategy", "timings", "universe_scanned"])
+                         ["all_stocks", "analysis", "analysis_model", "analysis_note",
+                          "analysis_source", "mode", "strategy", "timings", "universe_scanned"])
         self.assertEqual(body["analysis_source"], "gemini")  # 정상 경로는 모델 해설
         self.assertEqual(body["analysis_note"], "")
         self.assertEqual(body["mode"], "watchlist")  # 기본값은 기존과 같은 관심 종목 모드

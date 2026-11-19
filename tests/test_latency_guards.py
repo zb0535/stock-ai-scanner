@@ -391,11 +391,11 @@ class GeminiGuardTests(unittest.TestCase):
     def test_503_is_retryable(self):
         self.assertTrue(api._retryable_gemini_error(Exception("503 UNAVAILABLE. high demand")))
 
-    def test_model_plan_ends_with_fallback_model(self):
+    def test_model_plan_tries_primary_once_then_fallback(self):
         plan = api._gemini_model_plan()
-        self.assertEqual(len(plan), api.GEMINI_MAX_ATTEMPTS)
-        self.assertEqual(plan[0], api.MODEL_ID)
-        self.assertEqual(plan[-1], api.GEMINI_FALLBACK_MODEL)
+        self.assertEqual([m for m, _ in plan], [api.MODEL_ID, api.GEMINI_FALLBACK_MODEL])
+        # 주 모델은 한 번만(늦은 호출에 값을 두 번 치르지 않는다), 2순위는 짧게
+        self.assertGreater(plan[0][1], plan[1][1])
 
     def test_thinking_is_disabled_by_default(self):
         cfg = api._gemini_config(api.GEMINI_THINKING_BUDGET)
@@ -433,7 +433,8 @@ class GeminiGuardTests(unittest.TestCase):
         body = TestClient(api.app).post(
             "/api/screen", json={"criteria": "저PER", "tickers": ["AAPL"]}).json()
         models_called = [c["model"] for c in calls]
-        self.assertEqual(models_called, api._gemini_model_plan())   # 모든 모델 시도
+        self.assertEqual(models_called, [m for m, _ in api._gemini_model_plan()])   # 모든 모델 시도
+        self.assertIsNone(body["analysis_model"])
         self.assertEqual(body["analysis_source"], "fallback")
         self.assertEqual(calls[0]["config"].thinking_config.thinking_budget, 0)
 
