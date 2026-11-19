@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI
@@ -14,6 +15,7 @@ MODEL_ID = "gemini-3.5-flash-lite"
 SYSTEM_PROMPT = """너는 미국 주식 차트·재무제표 스크리닝 보조 봇이다.
 제공된 데이터에 없는 가격·지표·뉴스를 절대 지어내지 마라.
 선정한 종목마다 차트 추세(이평선·RSI), 재무 지표(PER·매출성장률·영업이익률·부채비율), 그리고 제공된 최근 뉴스 맥락이 있다면 함께 인용하고 리스크도 짚어라.
+만약 일부 종목의 재무 지표가 일시적 API 제한으로 비어(`null`) 있더라도, 주가·이동평균·RSI 등 제공된 수치만으로 분석하거나 값이 있는 다른 종목을 우선 추천하고, '전체 정보가 없다'고 뭉뚱그리지 마라. `financials_note`가 붙은 종목은 재무 지표만 일시 미수신일 뿐 차트 수치는 유효하다.
 반드시 아래 JSON 형식으로만 출력하라:
 {
   "market_note": "후보군 전반 요약 1~2문장",
@@ -42,17 +44,37 @@ class ScreenRequest(BaseModel):
     tickers: list[str] | None = None
 
 
+# --- 뉴스 캐시: 종목별 30분 (429/401 방지) -----------------------------------
+_NEWS_TTL = 1800
+_NEWS_TTL_EMPTY = 60
+_NEWS_FETCH_LIMIT = 5
+# ticker -> (저장 시각, 유지 시간, 제목 목록)
+_NEWS_CACHE: dict[str, tuple[float, float, list[str]]] = {}
+
+
 def _get_recent_news(ticker: str, limit: int = 3) -> list[str]:
+    sym = (ticker or "").strip().upper()
+    if not sym:
+        return []
+    now = time.time()
+    cached = _NEWS_CACHE.get(sym)
+    if cached and now - cached[0] < cached[1]:
+        return list(cached[2][:limit])
+
+    titles: list[str] = []
     try:
-        items = yf.Ticker(ticker).news or []
-        titles = []
-        for item in items[:limit]:
-            title = item.get("title") or item.get("content", {}).get("title")
+        items = yf.Ticker(sym).news or []
+        for item in items[:_NEWS_FETCH_LIMIT]:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title") or (item.get("content") or {}).get("title")
             if title:
                 titles.append(title)
-        return titles
     except Exception:
-        return []
+        titles = []
+
+    _NEWS_CACHE[sym] = (now, _NEWS_TTL if titles else _NEWS_TTL_EMPTY, titles)
+    return list(titles[:limit])
 
 
 @app.get("/api/watchlist")
@@ -122,10 +144,11 @@ def screen_stocks(req: ScreenRequest):
     data = json.loads(raw)
 
     for pick in data.get("top_picks", []):
-        hist = yf.Ticker(pick["ticker"]).history(period="6mo")["Close"]
-        ma20 = hist.rolling(20).mean()
-        ma60 = hist.rolling(60).mean()
-        recent = pd.DataFrame({"price": hist, "ma20": ma20, "ma60": ma60}).tail(60)
+        hist = stock_tools.get_history(pick["ticker"], "6mo")
+        close = pd.Series(dtype=float) if hist is None or hist.empty else hist["Close"]
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+        recent = pd.DataFrame({"price": close, "ma20": ma20, "ma60": ma60}).tail(60)
         pick["chart"] = [
             {
                 "date": idx.strftime("%m/%d"),
@@ -143,8 +166,8 @@ def screen_stocks(req: ScreenRequest):
 def get_stock_detail(ticker: str):
     sym = ticker.strip().upper()
     tk = yf.Ticker(sym)
-    hist = tk.history(period="3mo")
-    close = hist["Close"] if not hist.empty else pd.Series(dtype=float)
+    hist = stock_tools.get_history(sym, "3mo")
+    close = hist["Close"] if hist is not None and not hist.empty else pd.Series(dtype=float)
 
     levels = {}
     if not close.empty:

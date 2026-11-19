@@ -1,6 +1,7 @@
 fastapi
 uvicorn
-yfinance
+yfinance>=0.2.58
+curl_cffi>=0.7
 pandas
 lxml
 google-genai
