@@ -26,7 +26,7 @@ from finnhub_client import status as finnhub_status
 
 logger = logging.getLogger("api")
 
-MODEL_ID = "gemini-3.5-flash-lite"
+MODEL_ID = "gemini-3.8-flash"
 
 # Gemini 호출 상한·예산(밀리초). 모델이 느리거나 503을 받았을 때 재시도로 수십 초를
 # 버리지 않도록, 시도당 상한(GEMINI_TIMEOUT_MS)과 AI 단계 전체 예산(GEMINI_TOTAL_BUDGET_MS)을
@@ -36,7 +36,7 @@ GEMINI_FALLBACK_TIMEOUT_MS = int(os.environ.get("GEMINI_FALLBACK_TIMEOUT_MS", "1
 GEMINI_TOTAL_BUDGET_MS = int(os.environ.get("GEMINI_TOTAL_BUDGET_MS", "45000"))
 # 2순위 모델 — 주 모델이 503(과부하)·타임아웃이면 다른 모델 풀에 한 번 더 물어본다.
 # (같은 모델을 반복하면 과부하가 계속되기만 하고, 사용자는 'AI 해설 없음' 카드를 받는다.)
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash").strip()
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip()
 GEMINI_MAX_ATTEMPTS = 3
 # gemini-3 계열 flash는 기본적으로 '생각(thinking)'을 켜고 답한다. 이 분석은 주어진 수치를
 # 정리해 JSON으로 옮기는 작업이라 사고에 10~60초를 쓰고도 결과가 나아지지 않았다.

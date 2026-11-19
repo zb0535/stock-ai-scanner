@@ -162,6 +162,6 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `GEMINI_TIMEOUT_MS` | 주 모델 호출 상한(기본 30000ms) |
 | `GEMINI_FALLBACK_TIMEOUT_MS` | 2순위 모델 호출 상한(기본 15000ms) |
 | `GEMINI_TOTAL_BUDGET_MS` | AI 분석 단계 전체 예산(기본 45000ms). 넘으면 정량 점수 폴백으로 응답 |
-| `GEMINI_FALLBACK_MODEL` | 주 모델이 과부하·타임아웃일 때 2순위로 부를 모델(기본 `gemini-3.8-flash`) |
+| `GEMINI_FALLBACK_MODEL` | 주 모델이 과부하·타임아웃일 때 2순위로 부를 모델(기본 `gemini-3.5-flash-lite`) |
 | `GEMINI_THINKING_BUDGET` | Gemini 사고 토큰 예산(기본 `0`=끔, 빠름). `-1`이면 모델 자동 |
 | `SEC_EDGAR_FALLBACK` / `FINNHUB_FALLBACK` | Yahoo `t.info` 대체 경로 스위치(기본 켜짐). `0`이면 끔 |
