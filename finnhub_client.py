@@ -58,8 +58,24 @@ class FinnhubHTTPError(RuntimeError):
 # --- 설정 -------------------------------------------------------------------
 
 def get_api_key() -> str:
-    """환경변수에서 Finnhub API 키를 읽는다(테스트에서 env를 바꿔 끼울 수 있게 매번 읽음)."""
-    return (os.environ.get("FINNHUB_API_KEY") or "").strip()
+    """환경변수에서 Finnhub API 키를 읽는다(테스트에서 env를 바꿔 끼울 수 있게 매번 읽음).
+
+    `FINNHUB_API_KEY`가 표준이고, 대시보드에서 이름을 달리 넣은 경우를 위해
+    흔한 별칭도 받아준다. 어느 이름으로 읽혔는지는 `status()`의 env_name에 남는다.
+    """
+    return _resolve_key()[1]
+
+
+_KEY_ENV_NAMES = ("FINNHUB_API_KEY", "FINNHUB_KEY", "FINNHUB_TOKEN", "FINNHUB_API_TOKEN")
+
+
+def _resolve_key() -> tuple[str, str]:
+    """(사용한 환경변수 이름, 키 값). 없으면 ("", "")."""
+    for name in _KEY_ENV_NAMES:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return name, value
+    return "", ""
 
 
 def is_enabled() -> bool:
@@ -105,10 +121,13 @@ def status() -> dict:
     키 본문은 절대 담지 않고 길이와 설정 여부만 노출한다.
     """
     key = get_api_key()
+    env_name, _ = _resolve_key()
     with _LAST_ERROR_LOCK:
         last_error = _LAST_ERROR
     return {
         "configured": bool(key),
+        "env_name": env_name,
+        "env_flags": {name: bool((os.environ.get(name) or "").strip()) for name in _KEY_ENV_NAMES},
         "key_len": len(key),
         "enabled": is_enabled(),
         "last_error": last_error,

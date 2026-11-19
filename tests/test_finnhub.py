@@ -223,6 +223,16 @@ class StatusTests(FinnhubTestBase):
             st = finnhub_client.status()
         self.assertFalse(st["configured"])
         self.assertFalse(st["enabled"])
+        self.assertEqual(st["env_name"], "")
+
+    def test_alias_env_name_is_accepted_and_reported(self):
+        with patch.dict(os.environ, {"FINNHUB_API_KEY": "", "FINNHUB_KEY": "alias-key"}):
+            st = finnhub_client.status()
+            self.assertEqual(st["env_name"], "FINNHUB_KEY")
+            self.assertTrue(st["enabled"])
+            self.assertEqual(finnhub_client.get_api_key(), "alias-key")
+            self.assertFalse(st["env_flags"]["FINNHUB_API_KEY"])
+            self.assertTrue(st["env_flags"]["FINNHUB_KEY"])
 
     def test_last_error_redacts_token(self):
         leaky = RuntimeError(
