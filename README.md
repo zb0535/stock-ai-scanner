@@ -158,6 +158,8 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `SP500_PREWARM` | S&P 500 스냅샷 백그라운드 예열(기본 켜짐). `0`이면 끔(단위 테스트·로컬 실행). 켜져 있지 않으면 코스피 200 예열도 함께 꺼진다 |
 | `KOSPI200_PREWARM` | 코스피 200 스냅샷 백그라운드 예열(기본 켜짐). `0`이면 이 시장만 끔 |
 | `PREWARM_ENABLED` | 백그라운드 예열 전체 스위치(기본 켜짐). `0`이면 S&P 500·코스피 200 모두 예열하지 않음 |
-| `GEMINI_TIMEOUT_MS` | Gemini 호출 한 번의 상한(기본 30000ms). 넘으면 정량 점수 폴백으로 응답 |
+| `GEMINI_TIMEOUT_MS` | Gemini 호출 한 번의 상한(기본 20000ms) |
+| `GEMINI_TOTAL_BUDGET_MS` | AI 분석 단계 전체 예산(기본 40000ms). 넘으면 정량 점수 폴백으로 응답 |
+| `GEMINI_FALLBACK_MODEL` | 주 모델이 과부하·타임아웃일 때 2순위로 부를 모델(기본 `gemini-2.5-flash`) |
 | `GEMINI_THINKING_BUDGET` | Gemini 사고 토큰 예산(기본 `0`=끔, 빠름). `-1`이면 모델 자동 |
 | `SEC_EDGAR_FALLBACK` / `FINNHUB_FALLBACK` | Yahoo `t.info` 대체 경로 스위치(기본 켜짐). `0`이면 끔 |

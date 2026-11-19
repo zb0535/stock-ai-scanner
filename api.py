@@ -28,10 +28,14 @@ logger = logging.getLogger("api")
 
 MODEL_ID = "gemini-3.5-flash-lite"
 
-# Gemini 호출 상한(밀리초). 모델이 느리거나 503을 받았을 때 재시도로 수십 초를
-# 버리지 않도록, 시도당 상한을 짧게 잡고 그 안에서만 재시도한다(실패하면 점수 기반 폴백).
-GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "30000"))
-# 503(모델 과부하)은 1~2초에 빨리 실패하므로 한 번은 더 시도할 값이 있다(총 3회, 최악 +약 2초).
+# Gemini 호출 상한·예산(밀리초). 모델이 느리거나 503을 받았을 때 재시도로 수십 초를
+# 버리지 않도록, 시도당 상한(GEMINI_TIMEOUT_MS)과 AI 단계 전체 예산(GEMINI_TOTAL_BUDGET_MS)을
+# 함께 둔다. 예산을 넘긴 뒤의 시도는 아예 보내지 않고 점수 기반 폴백으로 간다.
+GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "20000"))
+GEMINI_TOTAL_BUDGET_MS = int(os.environ.get("GEMINI_TOTAL_BUDGET_MS", "40000"))
+# 2순위 모델 — 주 모델이 503(과부하)·타임아웃이면 다른 모델 풀에 한 번 더 물어본다.
+# (같은 모델을 반복하면 과부하가 계속되기만 하고, 사용자는 'AI 해설 없음' 카드를 받는다.)
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip()
 GEMINI_MAX_ATTEMPTS = 3
 # gemini-3 계열 flash는 기본적으로 '생각(thinking)'을 켜고 답한다. 이 분석은 주어진 수치를
 # 정리해 JSON으로 옮기는 작업이라 사고에 10~60초를 쓰고도 결과가 나아지지 않았다.
@@ -442,19 +446,28 @@ def _fallback_analysis(rows: list[dict], note: str) -> dict:
     return {"market_note": note, "top_picks": picks}
 
 
-def _gemini_client():
+def _gemini_client(timeout_ms: int | None = None):
     """Gemini 클라이언트 — 요청당 타임아웃을 고정한다(느린 모델 하나가 배치를 잡아먹지 않게).
 
     google-genai가 `http_options`를 모르는 예전 버전이면 그냥 기본 클라이언트를 쓴다
     (해설이 조금 느려질 뿐, 스크리닝은 그대로 돈다).
     """
+    timeout = GEMINI_TIMEOUT_MS if timeout_ms is None else int(timeout_ms)
     try:
         return genai.Client(http_options=types.HttpOptions(
-            timeout=GEMINI_TIMEOUT_MS,
+            timeout=timeout,
             retry_options=types.HttpRetryOptions(attempts=1),  # 재시도는 우리 루프가 맡는다
         ))
     except TypeError:  # 구버전 google-genai
         return genai.Client()
+
+
+def _gemini_model_plan() -> list[str]:
+    """시도할 모델 순서 — 1·2회차는 주 모델, 3회차는 2순위 모델(있으면)."""
+    plan = [MODEL_ID] * 2
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != MODEL_ID:
+        plan.append(GEMINI_FALLBACK_MODEL)
+    return plan[:GEMINI_MAX_ATTEMPTS]
 
 
 def _gemini_config(thinking_budget: int | None) -> types.GenerateContentConfig:
@@ -550,35 +563,47 @@ def screen_stocks(req: ScreenRequest):
         f"종목 데이터(quant_score 내림차순):\n{json.dumps(rows, ensure_ascii=False, default=str)}"
     )
 
-    # AI 분석은 최대 3회 시도하고, 끝내 실패해도 500 대신 서버 점수 기반 요약을 돌려준다.
-    # (Gemini 쿼터·장애·모델 응답 형식 오류가 사용자 화면을 500으로 만들지 않게)
-    # 503(모델 과부하는 1~2초에 빨리 돌아온다)만 짧게 재시도하고, 타임아웃은 재시도하지 않는다.
+    # AI 분석은 모델 순서대로(주 모델 → 주 모델 → 2순위 모델) 시도하고, AI 단계 전체
+    # 예산(GEMINI_TOTAL_BUDGET_MS)을 넘기면 더 보내지 않는다. 끝내 실패해도 500 대신
+    # 서버 점수 기반 요약을 돌려준다(Gemini 쿼터·장애가 사용자 화면을 500으로 만들지 않게).
+    # 타임아웃(DEADLINE_EXCEEDED)·503은 다음 모델로 넘어간다 — 같은 모델을 다시 부르면
+    # 같은 지연을 또 기다리거나 같은 과부하를 만난다.
     data = None
     analysis_source = "gemini"
     analysis_note = ""
     thinking_budget = GEMINI_THINKING_BUDGET
+    plan = _gemini_model_plan()
+    deadline = time.time() + GEMINI_TOTAL_BUDGET_MS / 1000.0
+    last_error = None
     _t = time.perf_counter()
-    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+    for attempt, model in enumerate(plan, 1):
+        remaining_ms = int((deadline - time.time()) * 1000)
+        if remaining_ms < 3000:  # 남은 예산으로는 의미 있는 응답을 못 받는다
+            analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
+            break
         try:
-            client = _gemini_client()
+            client = _gemini_client(min(GEMINI_TIMEOUT_MS, remaining_ms))
             res = client.models.generate_content(
-                model=MODEL_ID,
+                model=model,
                 contents=prompt,
                 config=_gemini_config(thinking_budget),
             )
             data = _parse_analysis(res.text)
             break
         except Exception as exc:
-            logger.warning("Gemini 분석 실패(%d/%d) → %s: %s", attempt, GEMINI_MAX_ATTEMPTS,
+            logger.warning("Gemini 분석 실패(%d/%d, %s) → %s: %s", attempt, len(plan), model,
                            type(exc).__name__, str(exc)[:200])
-            if attempt >= GEMINI_MAX_ATTEMPTS or not _retryable_gemini_error(exc):
-                analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
-                _record_error(uuid.uuid4().hex[:8], "POST /api/screen (gemini)", exc,
-                              note="폴백 분석으로 응답")
-                break
+            last_error = exc
             if _thinking_rejected(exc):
                 thinking_budget = None   # 사고 예산을 모르는 모델이면 빼고 다시 보낸다
-            time.sleep(0.3 * attempt)
+            if _retryable_gemini_error(exc):
+                time.sleep(0.3 * attempt)   # 빨리 돌아온 과부하만 짧게 쉰다
+    if data is None:
+        if analysis_note == "":
+            analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
+            _record_error(uuid.uuid4().hex[:8], "POST /api/screen (gemini)",
+                          last_error if last_error else Exception("gemini_budget_exhausted"),
+                          note="폴백 분석으로 응답")
     _mark("gemini_ms", _t)
     if data is None:
         data = _fallback_analysis(rows, analysis_note)

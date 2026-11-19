@@ -382,29 +382,31 @@ class ScreenGuardIntegrationTests(BaseCase):
 
 
 class GeminiGuardTests(unittest.TestCase):
-    """Gemini 호출 상한·재시도 규칙 — 타임아웃 재시도로 대기가 두 배가 되지 않게."""
+    """Gemini 호출 상한·재시도·모델 폴백 규칙."""
 
-    def test_deadline_exceeded_is_not_retried(self):
+    def test_deadline_exceeded_is_not_slept_on(self):
         exc = Exception("504 DEADLINE_EXCEEDED. Deadline expired before operation could complete.")
         self.assertFalse(api._retryable_gemini_error(exc))
 
-    def test_503_is_retried(self):
+    def test_503_is_retryable(self):
         self.assertTrue(api._retryable_gemini_error(Exception("503 UNAVAILABLE. high demand")))
 
-    def test_three_attempts_for_server_errors(self):
-        self.assertEqual(api.GEMINI_MAX_ATTEMPTS, 3)
-
-    def test_thinking_budget_rejection_is_detected(self):
-        self.assertTrue(api._thinking_rejected(
-            Exception("400 INVALID_ARGUMENT. thinking_budget is not supported")))
-        self.assertFalse(api._thinking_rejected(Exception("503 UNAVAILABLE")))
+    def test_model_plan_ends_with_fallback_model(self):
+        plan = api._gemini_model_plan()
+        self.assertEqual(len(plan), api.GEMINI_MAX_ATTEMPTS)
+        self.assertEqual(plan[0], api.MODEL_ID)
+        self.assertEqual(plan[-1], api.GEMINI_FALLBACK_MODEL)
 
     def test_thinking_is_disabled_by_default(self):
         cfg = api._gemini_config(api.GEMINI_THINKING_BUDGET)
         self.assertEqual(cfg.thinking_config.thinking_budget, 0)
 
-    def test_deadline_failure_calls_model_once(self):
-        """504면 재시도 없이 바로 폴백 — 25초를 두 번 기다리지 않는다."""
+    def test_budget_is_bounded(self):
+        """AI 단계 전체 예산이 있어 최악 대기가 무한하지 않다."""
+        self.assertLessEqual(api.GEMINI_TOTAL_BUDGET_MS, 60000)
+        self.assertLessEqual(api.GEMINI_TIMEOUT_MS, api.GEMINI_TOTAL_BUDGET_MS)
+
+    def test_falls_through_to_quant_summary_when_every_model_fails(self):
         try:
             from fastapi.testclient import TestClient
         except ImportError:  # pragma: no cover
@@ -416,22 +418,22 @@ class GeminiGuardTests(unittest.TestCase):
                 @staticmethod
                 def generate_content(**kwargs):
                     calls.append(kwargs)
-                    raise Exception("504 DEADLINE_EXCEEDED. Deadline expired")
-
-        import pandas as pd  # noqa: F401  (테스트 파일 import 순서 유지)
+                    raise Exception("503 UNAVAILABLE. high demand")
 
         patches = [patch.object(api.genai, "Client", lambda **_: BoomClient()),
                    patch.object(stock_tools, "get_stock_metrics",
                                 return_value={"ticker": "AAPL", "price": 100.0,
                                               "quant_score": 50.0, "signals": ["ok"]}),
-                   patch.object(api, "_get_recent_news", return_value=[])]
+                   patch.object(api, "_get_recent_news", return_value=[]),
+                   patch.object(api.time, "sleep", lambda *_: None)]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
 
         body = TestClient(api.app).post(
             "/api/screen", json={"criteria": "저PER", "tickers": ["AAPL"]}).json()
-        self.assertEqual(len(calls), 1)
+        models_called = [c["model"] for c in calls]
+        self.assertEqual(models_called, api._gemini_model_plan())   # 모든 모델 시도
         self.assertEqual(body["analysis_source"], "fallback")
         self.assertEqual(calls[0]["config"].thinking_config.thinking_budget, 0)
 
