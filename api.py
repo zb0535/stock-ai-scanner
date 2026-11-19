@@ -35,7 +35,7 @@ GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "20000"))
 GEMINI_TOTAL_BUDGET_MS = int(os.environ.get("GEMINI_TOTAL_BUDGET_MS", "40000"))
 # 2순위 모델 — 주 모델이 503(과부하)·타임아웃이면 다른 모델 풀에 한 번 더 물어본다.
 # (같은 모델을 반복하면 과부하가 계속되기만 하고, 사용자는 'AI 해설 없음' 카드를 받는다.)
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip()
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash").strip()
 GEMINI_MAX_ATTEMPTS = 3
 # gemini-3 계열 flash는 기본적으로 '생각(thinking)'을 켜고 답한다. 이 분석은 주어진 수치를
 # 정리해 JSON으로 옮기는 작업이라 사고에 10~60초를 쓰고도 결과가 나아지지 않았다.
