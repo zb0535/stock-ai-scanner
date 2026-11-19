@@ -24,6 +24,20 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   기본값은 `"watchlist"`라 기존 클라이언트는 그대로 동작한다. 첫 스캔은 수십 초, 이후 1시간은 캐시.
   종목 목록은 Wikipedia(8초 타임아웃) → 실패 시 내장 503종목 폴백으로 항상 채워진다.
 - Recharts 인터랙티브 차트 및 최근 뉴스 요약
+- **AI 추천 성적표**(`history_store.py`): `/api/screen`이 추천을 돌려줄 때마다 `top_picks`를 SQLite에
+  자동 기록하고, `GET /api/performance`가 현재가와 비교해 **적중률·평균 수익률**을 계산한다.
+  - 저장: `ticker`·`recommended_date`(KST YYYY-MM-DD)·`recommended_at`(ISO)·`entry_price`·`strategy`·
+    `mode`·`quant_score`·`criteria`. 진입가는 Gemini가 적은 값이 아니라 서버가 계산한 최신 종가를 쓴다.
+  - 같은 날 같은 `(date, ticker, strategy)`는 한 행만 남긴다(첫 진입가·첫 시각 유지, 점수·mode·criteria만 갱신).
+  - DB 경로: `HISTORY_DB_PATH` 환경변수 > `data/recommendations.db`(부모 폴더 자동 생성) >
+    만들 수 없으면 `/tmp/stock_scanner_history.db`. DB 쓰기가 실패해도 `/api/screen`은 정상 응답한다.
+  - 현재가는 `yf.download`로 **최대 50종목을 한 번에** 받아 5분 캐시한다(`t.info` 호출 없음).
+  - 응답: `{"summary": {total_picks, evaluated_picks, win_count, win_rate_pct, avg_return_pct,
+    best_pick, worst_pick}, "picks": [...], "as_of", "limit"}`. 이력이 비면 개수 0·비율 `null`.
+    픽별로 `entry_price`·`current_price`·`return_pct`·`is_win`(return > 0)·`days_held`가 붙는다.
+  - 웹 UI 상단에 **📊 AI 추천 성적표** 패널(요약 3개 지표 + 추천 이력 표 + 새로고침)이 있다.
+  - ⚠️ Render 무료 플랜은 영구 디스크가 없어 재배포·재시작 시 이력 파일이 초기화된다.
+    오래 쌓아 두려면 Render Persistent Disk를 붙이고 `HISTORY_DB_PATH=/var/data/recommendations.db`처럼 지정한다.
 - Yahoo Finance `t.info`가 서버 IP에서 막히면(429/401) **SEC EDGAR 공시(XBRL)** 에서
   PER·매출성장률·영업이익률·부채비율을 계산해 채운다(API 키 불필요).
 - SEC 공시에도 값이 없으면(예: us-gaap 태그가 없는 외국 ADR `TSM`) **Finnhub**
@@ -39,4 +53,4 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·API 계약 검증)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·API 계약 검증)

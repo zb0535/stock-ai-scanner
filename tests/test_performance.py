@@ -1,0 +1,530 @@
+"""AI 추천 성적표(history_store + GET /api/performance) 테스트.
+
+다루는 것
+1. SQLite 기록: 필드·KST 날짜·진입가·전략/모드/점수, 스키마 멱등성
+2. 같은 날 중복 제거: (date, ticker, strategy) UNIQUE, 첫 진입가 유지
+3. 수익률·적중률 계산: 승/패, 평균, 최고/최악, 반올림
+4. 현재가 배치 조회: 멀티/단일 컬럼 파싱, 5분 캐시, 실패 시 수익률만 비움
+5. 빈 이력: 개수 0, 비율 null
+6. /api/screen → /api/performance 통합(스크리닝이 기록을 남기고 성적표가 평가)
+7. 회귀: DB 쓰기가 실패해도 /api/screen은 200, 응답 키는 그대로
+
+실행: python -m unittest discover -s tests -v
+"""
+import json
+import os
+import sys
+import tempfile
+import unittest
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import api  # noqa: E402
+import history_store  # noqa: E402
+import stock_tools  # noqa: E402
+
+try:
+    from fastapi.testclient import TestClient
+except ImportError:  # pragma: no cover - httpx 미설치 환경
+    TestClient = None
+
+KST = timezone(timedelta(hours=9))
+
+
+def make_hist(days: int = 130, end="2026-11-18", start_price=100.0, end_price=150.0):
+    idx = pd.bdate_range(end=pd.Timestamp(end), periods=days)
+    close = pd.Series(np.linspace(start_price, end_price, days), index=idx)
+    return pd.DataFrame({"Open": close, "High": close + 1, "Low": close - 1,
+                         "Close": close, "Volume": 1_000_000})
+
+
+class FakeResponse:
+    def __init__(self, text):
+        self.text = text
+
+
+class FakeModels:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def generate_content(self, **kwargs):
+        return FakeResponse("```json\n" + json.dumps(self.payload, ensure_ascii=False) + "\n```")
+
+
+class FakeGenai:
+    def __init__(self, payload):
+        self.models = FakeModels(payload)
+
+
+class TempDB(unittest.TestCase):
+    """테스트마다 빈 SQLite 파일을 쓰도록 HISTORY_DB_PATH를 바꾼다."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = os.path.join(self._tmp.name, "sub", "perf.db")
+        patcher = patch.dict(os.environ, {"HISTORY_DB_PATH": self.db_path})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        history_store.clear_price_cache()
+        self.addCleanup(history_store.clear_price_cache)
+
+    def picks(self, *rows):
+        return history_store.recent_picks(limit=50)
+
+
+# ---------------------------------------------------------------------------
+# 1. 기록
+# ---------------------------------------------------------------------------
+
+
+class RecordTests(TempDB):
+    def test_record_persists_all_fields(self):
+        out = history_store.record_picks(
+            [{"ticker": "aapl", "price": 191.25, "quant_score": 82.5}],
+            strategy="value", mode="sp500", criteria="저PER 가치주",
+        )
+        self.assertEqual(out["inserted"], 1)
+        rows = self.picks()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["ticker"], "AAPL")                      # 대문자 정규화
+        self.assertEqual(row["entry_price"], 191.25)
+        self.assertEqual(row["strategy"], "value")
+        self.assertEqual(row["mode"], "sp500")
+        self.assertEqual(row["quant_score"], 82.5)
+        self.assertEqual(row["criteria"], "저PER 가치주")
+        # 날짜는 KST 기준 YYYY-MM-DD, 시각은 ISO(오프셋 포함)
+        self.assertRegex(row["recommended_date"], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertEqual(row["recommended_date"], history_store.kst_today().strftime("%Y-%m-%d"))
+        parsed = datetime.fromisoformat(row["recommended_at"])
+        self.assertEqual(parsed.utcoffset(), timedelta(hours=9))
+
+    def test_recommended_date_uses_kst_not_utc(self):
+        # UTC로는 11-18 15:30이지만 KST로는 11-19 00:30 → 날짜는 11-19여야 한다.
+        at = datetime(2026, 11, 18, 15, 30, tzinfo=timezone.utc)
+        history_store.record_picks([{"ticker": "MSFT", "price": 410}],
+                                   strategy="balanced", recommended_at=at.isoformat())
+        self.assertEqual(self.picks()[0]["recommended_date"], "2026-11-19")
+
+    def test_db_path_default_and_parent_creation(self):
+        self.assertFalse(os.path.exists(self.db_path))
+        history_store.init_db()
+        self.assertTrue(os.path.exists(self.db_path))                # 상위 폴더까지 생성
+        self.assertEqual(history_store.init_db(), os.path.join(self._tmp.name, "sub", "perf.db"))
+
+    def test_init_db_is_idempotent(self):
+        history_store.record_picks([{"ticker": "NVDA", "price": 100}], strategy="momentum")
+        history_store.init_db()
+        history_store.get_performance(price_fetcher=lambda t: {})
+        self.assertEqual(len(self.picks()), 1)
+
+    def test_missing_price_is_recorded_but_unevaluated(self):
+        history_store.record_picks([{"ticker": "TSLA", "price": None}], strategy="value")
+        row = self.picks()[0]
+        self.assertIsNone(row["entry_price"])
+        body = history_store.get_performance(price_fetcher=lambda t: {"TSLA": 250.0})
+        self.assertEqual(body["summary"]["total_picks"], 1)
+        self.assertEqual(body["summary"]["evaluated_picks"], 0)
+        self.assertIsNone(body["picks"][0]["return_pct"])
+
+    def test_invalid_picks_are_skipped_not_fatal(self):
+        out = history_store.record_picks(
+            [{"ticker": "", "price": 1}, {"price": 2}, "not-a-dict", {"ticker": "AMD", "price": 3}],
+            strategy="value",
+        )
+        self.assertEqual(out["inserted"], 1)
+        self.assertEqual(out["skipped"], 3)
+        self.assertEqual([r["ticker"] for r in self.picks()], ["AMD"])
+
+    def test_empty_picks_writes_nothing(self):
+        out = history_store.record_picks([], strategy="value")
+        self.assertEqual((out["inserted"], out["updated"]), (0, 0))
+        self.assertEqual(self.picks(), [])
+
+
+# ---------------------------------------------------------------------------
+# 2. 같은 날 중복 제거
+# ---------------------------------------------------------------------------
+
+
+class DedupeTests(TempDB):
+    def test_same_day_same_strategy_keeps_one_row_with_first_entry(self):
+        history_store.record_picks([{"ticker": "AAPL", "price": 100.0, "quant_score": 70}],
+                                   strategy="value", mode="watchlist", criteria="첫 조건")
+        out = history_store.record_picks([{"ticker": "AAPL", "price": 105.0, "quant_score": 88}],
+                                         strategy="value", mode="sp500", criteria="두 번째 조건")
+        self.assertEqual((out["inserted"], out["updated"]), (0, 1))
+
+        rows = self.picks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["entry_price"], 100.0)   # 최초 진입가 유지(수익률 왜곡 방지)
+        self.assertEqual(rows[0]["quant_score"], 88.0)    # 점수·모드는 최신
+        self.assertEqual(rows[0]["mode"], "sp500")
+        self.assertEqual(rows[0]["criteria"], "두 번째 조건")
+
+    def test_same_day_different_strategy_is_a_separate_row(self):
+        history_store.record_picks([{"ticker": "AAPL", "price": 100}], strategy="value")
+        history_store.record_picks([{"ticker": "AAPL", "price": 100}], strategy="momentum")
+        # 둘 다 strategy=""가 아니므로 2행
+        self.assertEqual(len(self.picks()), 2)
+
+    def test_different_day_same_ticker_is_a_separate_row(self):
+        history_store.record_picks([{"ticker": "AAPL", "price": 100}], strategy="value",
+                                   recommended_date="2026-11-17")
+        history_store.record_picks([{"ticker": "AAPL", "price": 102}], strategy="value",
+                                   recommended_date="2026-11-18")
+        rows = self.picks()
+        self.assertEqual([r["recommended_date"] for r in rows], ["2026-11-18", "2026-11-17"])
+
+    def test_empty_strategy_is_deduped_too(self):
+        history_store.record_picks([{"ticker": "AAPL", "price": 100}])
+        history_store.record_picks([{"ticker": "AAPL", "price": 101}])
+        self.assertEqual(len(self.picks()), 1)
+
+    def test_many_tickers_in_one_call(self):
+        picks = [{"ticker": t, "price": 10.0} for t in ("AAPL", "MSFT", "NVDA")]
+        out = history_store.record_picks(picks, strategy="value")
+        self.assertEqual(out["inserted"], 3)
+        self.assertEqual(sorted(r["ticker"] for r in self.picks()), ["AAPL", "MSFT", "NVDA"])
+
+
+# ---------------------------------------------------------------------------
+# 3. 수익률·적중률 계산
+# ---------------------------------------------------------------------------
+
+
+class MathTests(unittest.TestCase):
+    def test_returns_and_win_rate(self):
+        picks = [
+            {"ticker": "AAA", "recommended_date": "2026-11-10", "entry_price": 100.0,
+             "strategy": "value", "mode": "watchlist", "quant_score": 80},
+            {"ticker": "BBB", "recommended_date": "2026-11-10", "entry_price": 200.0,
+             "strategy": "value", "mode": "watchlist", "quant_score": 75},
+            {"ticker": "CCC", "recommended_date": "2026-11-12", "entry_price": 50.0,
+             "strategy": "value", "mode": "watchlist", "quant_score": 60},
+        ]
+        prices = {"AAA": 110.0, "BBB": 190.0, "CCC": 50.0}
+        body = history_store.compute_performance(picks, prices, today=date(2026, 11, 19))
+        rows = {r["ticker"]: r for r in body["picks"]}
+
+        self.assertAlmostEqual(rows["AAA"]["return_pct"], 10.0)
+        self.assertTrue(rows["AAA"]["is_win"])
+        self.assertAlmostEqual(rows["BBB"]["return_pct"], -5.0)
+        self.assertFalse(rows["BBB"]["is_win"])
+        self.assertEqual(rows["CCC"]["return_pct"], 0.0)
+        self.assertFalse(rows["CCC"]["is_win"])          # 본전은 승이 아니다(> 0)
+        self.assertEqual(rows["AAA"]["days_held"], 9)
+        self.assertEqual(rows["CCC"]["days_held"], 7)
+
+        summary = body["summary"]
+        self.assertEqual(summary["total_picks"], 3)
+        self.assertEqual(summary["evaluated_picks"], 3)
+        self.assertEqual(summary["win_count"], 1)
+        self.assertAlmostEqual(summary["win_rate_pct"], 33.3)
+        self.assertAlmostEqual(summary["avg_return_pct"], 1.67)   # (10-5+0)/3 = 1.667 → 1.67
+        self.assertEqual(summary["best_pick"]["ticker"], "AAA")
+        self.assertEqual(summary["worst_pick"]["ticker"], "BBB")
+
+    def test_all_winners_and_all_losers(self):
+        picks = [{"ticker": "A", "recommended_date": "2026-11-18", "entry_price": 10.0},
+                 {"ticker": "B", "recommended_date": "2026-11-18", "entry_price": 20.0}]
+        up = history_store.compute_performance(picks, {"A": 11.0, "B": 30.0},
+                                               today=date(2026, 11, 19))["summary"]
+        self.assertEqual((up["win_count"], up["win_rate_pct"]), (2, 100.0))
+        down = history_store.compute_performance(picks, {"A": 9.0, "B": 19.0},
+                                                 today=date(2026, 11, 19))["summary"]
+        self.assertEqual((down["win_count"], down["win_rate_pct"]), (0, 0.0))
+        self.assertIsNotNone(down["avg_return_pct"])
+        self.assertLess(down["avg_return_pct"], 0)
+
+    def test_zero_or_missing_entry_price_is_not_evaluated(self):
+        picks = [{"ticker": "A", "recommended_date": "2026-11-18", "entry_price": 0},
+                 {"ticker": "B", "recommended_date": "2026-11-18", "entry_price": None},
+                 {"ticker": "C", "recommended_date": "2026-11-18", "entry_price": "12.5"}]
+        body = history_store.compute_performance(picks, {"A": 10, "B": 10, "C": 13.75})
+        evaluated = [r for r in body["picks"] if r["return_pct"] is not None]
+        self.assertEqual([r["ticker"] for r in evaluated], ["C"])   # 문자열 숫자도 허용
+        self.assertAlmostEqual(evaluated[0]["return_pct"], 10.0)
+        self.assertEqual(body["summary"]["evaluated_picks"], 1)
+
+    def test_return_is_rounded_to_two_decimals(self):
+        picks = [{"ticker": "A", "recommended_date": "2026-11-18", "entry_price": 3.0}]
+        body = history_store.compute_performance(picks, {"A": 3.1})
+        self.assertEqual(body["picks"][0]["return_pct"], 3.33)
+
+    def test_quant_score_passthrough(self):
+        picks = [{"ticker": "A", "recommended_date": "2026-11-18", "entry_price": 1,
+                  "quant_score": 91, "strategy": "momentum", "mode": "sp500"}]
+        row = history_store.compute_performance(picks, {"A": 1.0})["picks"][0]
+        self.assertEqual((row["quant_score"], row["strategy"], row["mode"]),
+                         (91.0, "momentum", "sp500"))
+
+
+# ---------------------------------------------------------------------------
+# 4. 현재가 배치 조회·캐시·실패 견고성
+# ---------------------------------------------------------------------------
+
+
+class PriceTests(unittest.TestCase):
+    def setUp(self):
+        history_store.clear_price_cache()
+        self.addCleanup(history_store.clear_price_cache)
+
+    def test_extract_from_multiindex_columns(self):
+        idx = pd.bdate_range(end="2026-11-18", periods=3)
+        cols = pd.MultiIndex.from_tuples(
+            [("Close", "AAPL"), ("Open", "AAPL"), ("Close", "MSFT"), ("Open", "MSFT")])
+        df = pd.DataFrame(np.arange(12, dtype=float).reshape(3, 4), index=idx, columns=cols)
+        got = history_store._extract_last_closes(df, ["AAPL", "MSFT"])
+        self.assertEqual(got["AAPL"], 8.0)   # 마지막 행 Close/AAPL
+        self.assertEqual(got["MSFT"], 10.0)
+
+    def test_extract_from_single_ticker_frame(self):
+        idx = pd.bdate_range(end="2026-11-18", periods=3)
+        df = pd.DataFrame({"Close": [1.0, 2.0, 3.0], "Open": [0.5, 1.5, 2.5]}, index=idx)
+        self.assertEqual(history_store._extract_last_closes(df, ["AAPL"]), {"AAPL": 3.0})
+
+    def test_extract_ignores_empty_and_nan(self):
+        self.assertEqual(history_store._extract_last_closes(None, ["AAPL"]), {})
+        self.assertEqual(history_store._extract_last_closes(pd.DataFrame(), ["AAPL"]), {})
+        idx = pd.bdate_range(end="2026-11-18", periods=2)
+        df = pd.DataFrame({"Close": [np.nan, np.nan]}, index=idx)
+        self.assertEqual(history_store._extract_last_closes(df, ["AAPL"]), {})
+
+    def test_price_cache_hits_within_five_minutes(self):
+        calls = []
+
+        def fetcher(tickers):
+            calls.append(list(tickers))
+            return {t: 100.0 for t in tickers}
+
+        first = history_store.latest_prices(["AAPL", "MSFT"], fetcher=fetcher)
+        second = history_store.latest_prices(["AAPL"], fetcher=fetcher)
+        self.assertEqual(first, {"AAPL": 100.0, "MSFT": 100.0})
+        self.assertEqual(second, {"AAPL": 100.0})
+        self.assertEqual(len(calls), 1)                 # 두 번째는 캐시
+        # ttl=0 이면 다시 조회한다
+        history_store.latest_prices(["AAPL"], ttl=0, fetcher=fetcher)
+        self.assertEqual(len(calls), 2)
+
+    def test_failed_lookup_is_cached_as_none(self):
+        calls = []
+
+        def boom(tickers):
+            calls.append(1)
+            return {}
+
+        self.assertEqual(history_store.latest_prices(["AAPL"], fetcher=boom), {"AAPL": None})
+        self.assertEqual(history_store.latest_prices(["AAPL"], fetcher=boom), {"AAPL": None})
+        self.assertEqual(len(calls), 1)                 # 실패도 5분 캐시(장애 시 재시도 폭주 방지)
+
+    def test_fetch_batch_swallows_yfinance_errors(self):
+        with patch.object(history_store.yf, "download", side_effect=RuntimeError("429")):
+            self.assertEqual(history_store._fetch_prices_batch(["AAPL"]), {})
+
+    def test_performance_survives_price_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "perf.db")
+            history_store.record_picks([{"ticker": "AAPL", "price": 100}], strategy="value",
+                                       db_path=db)
+
+            def boom(tickers):
+                raise RuntimeError("network down")
+
+            with patch.object(history_store, "_fetch_prices_batch", side_effect=boom):
+                body = history_store.get_performance(db_path=db)
+            self.assertEqual(body["summary"]["total_picks"], 1)
+            self.assertEqual(body["summary"]["evaluated_picks"], 0)
+            self.assertIsNone(body["picks"][0]["current_price"])
+            self.assertEqual(body.get("error"), "price_unavailable")
+
+    def test_get_performance_uses_batch_once_for_all_tickers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "perf.db")
+            history_store.record_picks(
+                [{"ticker": t, "price": 100} for t in ("AAPL", "MSFT", "NVDA")],
+                strategy="value", db_path=db)
+            calls = []
+
+            def fetcher(tickers):
+                calls.append(sorted(tickers))
+                return {"AAPL": 101, "MSFT": 99, "NVDA": 120}
+
+            body = history_store.get_performance(db_path=db, price_fetcher=fetcher)
+            self.assertEqual(calls, [["AAPL", "MSFT", "NVDA"]])       # 한 번의 배치 호출
+            self.assertEqual(body["summary"]["win_count"], 2)
+
+
+# ---------------------------------------------------------------------------
+# 5. 빈 이력
+# ---------------------------------------------------------------------------
+
+
+class EmptyStateTests(TempDB):
+    def test_empty_history_summary_shape(self):
+        body = history_store.get_performance(price_fetcher=lambda t: {})
+        self.assertEqual(body["picks"], [])
+        self.assertEqual(body["summary"]["total_picks"], 0)
+        self.assertEqual(body["summary"]["evaluated_picks"], 0)
+        self.assertEqual(body["summary"]["win_count"], 0)
+        self.assertIsNone(body["summary"]["win_rate_pct"])
+        self.assertIsNone(body["summary"]["avg_return_pct"])
+        self.assertIsNone(body["summary"]["best_pick"])
+        self.assertIsNone(body["summary"]["worst_pick"])
+        self.assertIn("as_of", body)
+
+    def test_empty_performance_helper_is_consistent(self):
+        body = history_store.empty_performance(error="x")
+        self.assertEqual(body["error"], "x")
+        self.assertEqual(set(body["summary"]),
+                         {"total_picks", "evaluated_picks", "win_count", "win_rate_pct",
+                          "avg_return_pct", "best_pick", "worst_pick"})
+
+    def test_corrupt_db_path_reports_error_without_raising(self):
+        # 디렉터리 자리에 파일을 만들어 SQLite로 열 수 없게 만든다.
+        bogus = os.path.join(self._tmp.name, "not_a_dir")
+        Path(bogus).write_text("x", encoding="utf-8")
+        body = history_store.get_performance(db_path=os.path.join(bogus, "perf.db"))
+        self.assertEqual(body["picks"], [])
+        self.assertEqual(body["summary"]["total_picks"], 0)
+        self.assertEqual(body.get("error"), "history_unavailable")
+
+
+# ---------------------------------------------------------------------------
+# 6~7. /api/screen → /api/performance 통합 + 회귀
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipIf(TestClient is None, "fastapi.testclient 사용에 httpx가 필요합니다")
+class ScreenIntegrationTests(TempDB):
+    PICKS = [
+        {"ticker": "AAPL", "price": 999.0, "reason": "r", "risk": "k"},
+        {"ticker": "MSFT", "price": 888.0, "reason": "r", "risk": "k"},
+    ]
+
+    def setUp(self):
+        super().setUp()
+        stock_tools._METRICS_CACHE.clear()
+        stock_tools._HISTORY_CACHE.clear()
+        api._NEWS_CACHE.clear()
+        self.addCleanup(stock_tools._METRICS_CACHE.clear)
+        self.addCleanup(stock_tools._HISTORY_CACHE.clear)
+        self._patch(stock_tools, "get_stock_metrics",
+                    lambda t: {"ticker": t, "price": 100.0 if t == "AAPL" else 200.0,
+                               "financials_available": True})
+        self._patch(api, "_get_recent_news", lambda t, limit=3: [f"{t} news"])
+        self._patch(stock_tools, "get_history", lambda t, p="6mo": make_hist())
+        self._patch(api.genai, "Client",
+                    lambda: FakeGenai({"market_note": "ok", "top_picks": list(self.PICKS)}))
+        self.client = TestClient(api.app)
+
+    def _patch(self, target, name, value):
+        p = patch.object(target, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+        return value
+
+    def _screen(self, tickers=("AAPL", "MSFT"), criteria="저PER 가치주 상위 3개"):
+        return self.client.post("/api/screen", json={"tickers": list(tickers), "criteria": criteria})
+
+    def test_screen_records_picks_with_server_price(self):
+        resp = self._screen()
+        self.assertEqual(resp.status_code, 200)
+        rows = self.picks()
+        self.assertEqual([r["ticker"] for r in rows], ["MSFT", "AAPL"])   # 최신 기록 순
+        # 진입가는 Gemini가 적은 999/888이 아니라 서버가 계산한 종가
+        self.assertEqual({r["ticker"]: r["entry_price"] for r in rows},
+                         {"AAPL": 100.0, "MSFT": 200.0})
+        self.assertTrue(all(r["mode"] == "watchlist" for r in rows))
+        self.assertTrue(all(r["strategy"] == "value" for r in rows))
+        self.assertEqual(rows[0]["criteria"], "저PER 가치주 상위 3개")
+        self.assertTrue(all(r["quant_score"] is not None for r in rows))
+
+    def test_screen_response_contract_unchanged(self):
+        body = self._screen().json()
+        # 기존 클라이언트(웹/안드로이드)가 쓰는 키는 그대로 있어야 한다.
+        for key in ("analysis", "all_stocks", "strategy", "mode", "universe_scanned"):
+            self.assertIn(key, body)
+        self.assertTrue(body["mode"])
+        self.assertEqual([p["ticker"] for p in body["analysis"]["top_picks"]], ["AAPL", "MSFT"])
+        self.assertIn("chart", body["analysis"]["top_picks"][0])
+        self.assertNotIn("performance", body)          # 새 키를 끼워 넣지 않는다
+
+    def test_two_screens_same_day_do_not_duplicate(self):
+        self._screen()
+        self._screen()
+        self.assertEqual(len(self.picks()), 2)          # AAPL·MSFT 각 1행
+
+    def test_performance_endpoint_evaluates_recorded_picks(self):
+        self._screen()
+        self._patch(history_store, "_fetch_prices_batch",
+                    lambda tickers: {"AAPL": 110.0, "MSFT": 180.0})
+        history_store.clear_price_cache()
+
+        resp = self.client.get("/api/performance")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["summary"]["total_picks"], 2)
+        self.assertEqual(body["summary"]["evaluated_picks"], 2)
+        self.assertEqual(body["summary"]["win_count"], 1)
+        self.assertAlmostEqual(body["summary"]["win_rate_pct"], 50.0)
+        self.assertAlmostEqual(body["summary"]["avg_return_pct"], 0.0)
+        row = {p["ticker"]: p for p in body["picks"]}["AAPL"]
+        self.assertAlmostEqual(row["return_pct"], 10.0)
+        self.assertTrue(row["is_win"])
+        self.assertEqual(row["entry_price"], 100.0)
+        self.assertEqual(row["current_price"], 110.0)
+        self.assertEqual(row["days_held"], 0)
+
+    def test_performance_endpoint_empty_before_any_screen(self):
+        body = self.client.get("/api/performance").json()
+        self.assertEqual(body["summary"]["total_picks"], 0)
+        self.assertIsNone(body["summary"]["win_rate_pct"])
+        self.assertEqual(body["picks"], [])
+
+    def test_performance_limit_is_clamped(self):
+        self._screen()
+        body = self.client.get("/api/performance?limit=1").json()
+        self.assertEqual(len(body["picks"]), 1)
+        # 음수·과대 limit은 예외 없이 1~MAX_LIMIT로 잘린다.
+        self.assertEqual(self.client.get("/api/performance?limit=0").status_code, 200)
+        self.assertEqual(len(self.client.get("/api/performance?limit=9999").json()["picks"]), 2)
+        self.assertEqual(len(self.client.get("/api/performance?limit=-3").json()["picks"]), 1)
+
+    def test_screen_still_returns_picks_when_db_write_fails(self):
+        self._patch(history_store, "record_picks",
+                    lambda *a, **k: (_ for _ in ()).throw(sqlite3_like_error()))
+        resp = self._screen()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()["analysis"]["top_picks"]), 2)
+
+    def test_performance_endpoint_reports_error_instead_of_500(self):
+        self._patch(history_store, "get_performance",
+                    lambda *a, **k: (_ for _ in ()).throw(sqlite3_like_error()))
+        resp = self.client.get("/api/performance")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["summary"]["total_picks"], 0)
+        self.assertEqual(resp.json()["error"], "performance_unavailable")
+
+    def test_screen_with_no_picks_records_nothing(self):
+        self._patch(api.genai, "Client",
+                    lambda: FakeGenai({"market_note": "none", "top_picks": []}))
+        resp = self._screen()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.picks(), [])
+
+
+def sqlite3_like_error():
+    import sqlite3
+    return sqlite3.OperationalError("database is locked")
+
+
+if __name__ == "__main__":
+    unittest.main()

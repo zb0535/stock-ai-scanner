@@ -49,6 +49,24 @@ const TABS = {
   ],
 };
 
+const STRATEGY_LABELS = {
+  value: "가치",
+  oversold: "과매도",
+  momentum: "모멘텀",
+  balanced: "균형",
+};
+
+const fmtPrice = (v) =>
+  v === null || v === undefined
+    ? "-"
+    : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+
+const fmtPct = (v) =>
+  v === null || v === undefined ? "-" : `${v > 0 ? "+" : ""}${v.toFixed(2)}%`;
+
+const retClass = (v) =>
+  v === null || v === undefined ? "flat" : v > 0 ? "up" : v < 0 ? "down" : "flat";
+
 const PRESETS = [
   {
     label: "🔥 상승 추세 · 저과열",
@@ -81,6 +99,24 @@ export default function App() {
 
   const [detail, setDetail] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
+
+  const [perf, setPerf] = useState(null);
+  const [perfLoading, setPerfLoading] = useState(false);
+  const [perfError, setPerfError] = useState("");
+
+  const loadPerformance = async () => {
+    setPerfLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/performance`);
+      if (!res.ok) throw new Error(`성적표를 불러오지 못했습니다 (${res.status})`);
+      setPerf(await res.json());
+      setPerfError("");
+    } catch (err) {
+      setPerfError(err.message);
+    } finally {
+      setPerfLoading(false);
+    }
+  };
 
   const openDetail = async (pick) => {
     setDetail({ ...pick, levels: null, quarters: [] });
@@ -120,6 +156,10 @@ export default function App() {
       localStorage.setItem("stock_watchlist", JSON.stringify(tickers));
     }
   }, [tickers]);
+
+  useEffect(() => {
+    loadPerformance();
+  }, []);
 
   useEffect(() => {
   fetch(`${API_BASE}/api/sp500`)
@@ -169,6 +209,7 @@ export default function App() {
       });
       if (!res.ok) throw new Error(`서버 오류 (${res.status})`);
       setResult(await res.json());
+      loadPerformance(); // 이번 추천이 성적표에 바로 반영되도록
     } catch (err) {
       setError(err.message);
     } finally {
@@ -181,6 +222,16 @@ export default function App() {
   : tab === "S&P 500 (500개)"
     ? sp500
     : TABS[tab];
+
+  const perfSummary = perf?.summary || {
+    total_picks: 0,
+    evaluated_picks: 0,
+    win_count: 0,
+    win_rate_pct: null,
+    avg_return_pct: null,
+  };
+  const perfPicks = perf?.picks || [];
+  const lossCount = perfSummary.evaluated_picks - perfSummary.win_count;
 
   return (
     <div className="shell">
@@ -264,6 +315,89 @@ export default function App() {
         </section>
 
         {error && <div className="error">⚠️ {error}</div>}
+
+        <section className="panel scoreboard" aria-label="AI 추천 성적표">
+          <div className="score-head">
+            <div>
+              <h2 className="score-title">📊 AI 추천 성적표</h2>
+              <p className="score-sub">
+                추천한 종목을 진입가 대비 현재가로 추적합니다 · 최근 {perfSummary.total_picks}건
+                {perf?.as_of && ` · 기준 ${perf.as_of.slice(5, 10)} ${perf.as_of.slice(11, 16)}`}
+              </p>
+            </div>
+            <button type="button" className="refresh-btn" onClick={loadPerformance} disabled={perfLoading}>
+              {perfLoading ? "불러오는 중..." : "🔄 새로고침"}
+            </button>
+          </div>
+
+          {perfError && <div className="score-note">⚠️ {perfError}</div>}
+
+          <div className="score-metrics">
+            <div className="metric">
+              <span>총 추적 종목</span>
+              <strong>{perfSummary.total_picks}</strong>
+              <em>평가 {perfSummary.evaluated_picks}건</em>
+            </div>
+            <div className="metric">
+              <span>적중률</span>
+              <strong className={retClass(perfSummary.win_rate_pct)}>
+                {perfSummary.win_rate_pct === null ? "-" : `${perfSummary.win_rate_pct.toFixed(1)}%`}
+              </strong>
+              <em>승 {perfSummary.win_count} · 패 {lossCount}</em>
+            </div>
+            <div className="metric">
+              <span>평균 수익률</span>
+              <strong className={retClass(perfSummary.avg_return_pct)}>
+                {fmtPct(perfSummary.avg_return_pct)}
+              </strong>
+              <em>
+                {perfSummary.best_pick
+                  ? `최고 ${perfSummary.best_pick.ticker} ${fmtPct(perfSummary.best_pick.return_pct)}`
+                  : "아직 평가 전"}
+              </em>
+            </div>
+          </div>
+
+          {perfPicks.length > 0 ? (
+            <div className="table-scroll score-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th>추천일</th><th>티커</th><th>전략</th><th>진입가</th><th>현재가</th><th>수익률</th><th>보유</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {perfPicks.map((p) => (
+                    <tr key={`${p.recommended_date}-${p.ticker}-${p.strategy}`}>
+                      <td>{p.recommended_date?.slice(5)}</td>
+                      <td>
+                        <strong>{p.ticker}</strong>
+                        {p.mode === "sp500" && <span className="mini-tag">S&amp;P</span>}
+                      </td>
+                      <td>{STRATEGY_LABELS[p.strategy] || p.strategy || "-"}</td>
+                      <td>{fmtPrice(p.entry_price)}</td>
+                      <td>{fmtPrice(p.current_price)}</td>
+                      <td>
+                        <span className={`ret ${retClass(p.return_pct)}`}>
+                          {p.return_pct === null || p.return_pct === undefined
+                            ? "평가 대기"
+                            : fmtPct(p.return_pct)}
+                        </span>
+                      </td>
+                      <td>{p.days_held === null || p.days_held === undefined ? "-" : `${p.days_held}일`}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="score-empty">
+              {perfLoading
+                ? "성적표를 불러오는 중..."
+                : "아직 추적 중인 추천이 없습니다. 위에서 AI 분석을 실행하면 추천 종목이 자동으로 기록됩니다."}
+            </div>
+          )}
+        </section>
 
         {loading && (
           <section className="grid">

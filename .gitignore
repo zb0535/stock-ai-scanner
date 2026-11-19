@@ -3,3 +3,6 @@ __pycache__/
 .env
 frontend/node_modules/
 frontend/dist/
+
+# 추천 이력 SQLite(로컬 데이터)
+data/

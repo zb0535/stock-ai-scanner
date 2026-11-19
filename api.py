@@ -14,6 +14,7 @@ from google.genai import types
 import stock_tools
 import scoring
 import sp500_scanner
+import history_store
 from finnhub_client import status as finnhub_status
 
 logger = logging.getLogger("api")
@@ -245,9 +246,47 @@ def screen_stocks(req: ScreenRequest):
     # 추천 종목의 차트·뉴스도 선택된 개수만큼 병렬로 채운다(보통 3개).
     stock_tools.bounded_map(_attach_chart, picks)
 
+    # 추천 이력 저장(성적표용). 진입가는 Gemini가 적은 값보다 서버가 계산한 최신 종가를
+    # 우선한다. 저장 실패가 스크리닝 응답을 막아서는 안 되므로 경고만 남긴다.
+    try:
+        history_store.record_picks(
+            [
+                {
+                    "ticker": pick["ticker"],
+                    "entry_price": (score_by_ticker.get(
+                        str(pick.get("ticker") or "").strip().upper(), {}).get("price")
+                        or pick.get("price")),
+                    "quant_score": pick.get("quant_score"),
+                }
+                for pick in picks
+            ],
+            strategy=strategy,
+            mode=mode,
+            criteria=req.criteria,
+        )
+    except Exception as exc:  # DB 잠김·권한·경로 문제 모두 여기서 흡수
+        logger.warning("추천 이력 저장 실패(응답은 계속): %s: %s", type(exc).__name__, str(exc)[:200])
+
     # strategy·mode·universe_scanned는 추가 필드다(기존 클라이언트는 무시해도 동작한다).
     return {"analysis": data, "all_stocks": rows, "strategy": strategy,
             "mode": mode, "universe_scanned": universe_scanned}
+
+
+@app.get("/api/performance")
+def get_performance(limit: int = history_store.DEFAULT_LIMIT):
+    """AI 추천 성적표 — 기록된 추천을 현재가와 비교해 적중률·평균 수익률을 돌려준다.
+
+    응답: `{"summary": {...}, "picks": [...], "as_of": ISO, "limit": n}`
+    - `summary`: total_picks, evaluated_picks, win_count, win_rate_pct, avg_return_pct,
+      best_pick, worst_pick (이력이 없으면 개수 0, 비율 null)
+    - `picks`: 최신 추천부터 ticker·entry_price·current_price·return_pct·is_win·days_held 등
+    현재가는 성적표 조회 시점 기준 최근 종가(5분 캐시)를 쓴다.
+    """
+    try:
+        return history_store.get_performance(limit=limit)
+    except Exception as exc:
+        logger.warning("성적표 계산 실패: %s: %s", type(exc).__name__, str(exc)[:200])
+        return history_store.empty_performance(error="performance_unavailable")
 
 
 @app.get("/api/stock/{ticker}")
