@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 import stock_tools
+from finnhub_client import status as finnhub_status
 
 MODEL_ID = "gemini-3.5-flash-lite"
 
@@ -89,8 +90,10 @@ def health():
 
     `build`는 Render가 주는 배포 커밋(RENDER_GIT_COMMIT) 앞 7자다. 어느 커밋이
     실제로 떠 있는지 바로 확인할 수 있어 배포 검증에 쓴다(로컬 실행 시 "local").
+    `finnhub`은 키 설정 여부·마지막 실패 사유만 노출한다(키 본문은 응답에 없다).
     """
-    return {"status": "ok", "build": (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "local"}
+    return {"status": "ok", "build": (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "local",
+            "finnhub": finnhub_status()}
 
 
 @app.api_route("/api/watchlist", methods=["GET", "HEAD"])

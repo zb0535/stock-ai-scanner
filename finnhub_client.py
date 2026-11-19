@@ -20,6 +20,7 @@ Finnhub는 값을 퍼센트로 주는 항목이 있어 yfinance와 단위를 맞
 import logging
 import math
 import os
+import re
 import threading
 import time
 
@@ -40,6 +41,19 @@ FIELDS = ("trailing_pe", "forward_pe", "revenue_growth", "operating_margins", "d
 _CACHE: dict[str, tuple[float, float, dict | None]] = {}
 _CACHE_LOCK = threading.Lock()
 
+# 마지막 실패 사유(운영 진단용). 키 본문은 절대 남기지 않는다.
+_LAST_ERROR = ""
+_LAST_ERROR_LOCK = threading.Lock()
+
+
+class FinnhubHTTPError(RuntimeError):
+    """HTTP 실패를 상태코드만으로 전달한다(오류 메시지에 token이 섞이는 것을 막는다)."""
+
+    def __init__(self, status_code: int, body: str = ""):
+        self.status_code = status_code
+        self.body = (body or "")[:80]
+        super().__init__(f"HTTP {status_code}")
+
 
 # --- 설정 -------------------------------------------------------------------
 
@@ -58,15 +72,47 @@ def is_enabled() -> bool:
 # --- HTTP -------------------------------------------------------------------
 
 def _http_get_json(url: str, params: dict) -> dict:
-    """Finnhub JSON을 받아온다. 테스트에서는 이 함수만 바꿔 끼우면 네트워크가 필요 없다."""
+    """Finnhub JSON을 받아온다. 테스트에서는 이 함수만 바꿔 끼우면 네트워크가 필요 없다.
+
+    실패는 상태코드만 담은 FinnhubHTTPError로 올린다. requests의 기본 예외 메시지에는
+    요청 URL이 들어 있어 token(=API 키)이 로그·응답에 노출될 수 있기 때문이다.
+    """
     resp = requests.get(
         url,
         params=params,
         headers={"Accept": "application/json", "User-Agent": "StockAIScanner/1.0"},
         timeout=REQUEST_TIMEOUT,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise FinnhubHTTPError(resp.status_code, resp.text)
     return resp.json()
+
+
+def _redact(text: str) -> str:
+    """오류 문자열에 섞일 수 있는 token=... 값을 지운다(로그·헬스 노출 방지)."""
+    return re.sub(r"token=[^&\s\"']+", "token=***", str(text or ""))
+
+
+def _set_last_error(message: str) -> None:
+    global _LAST_ERROR
+    with _LAST_ERROR_LOCK:
+        _LAST_ERROR = _redact(message)[:160]
+
+
+def status() -> dict:
+    """키가 설정됐는지·마지막 호출이 실패했는지 비밀값 없이 알려준다(헬스 체크용).
+
+    키 본문은 절대 담지 않고 길이와 설정 여부만 노출한다.
+    """
+    key = get_api_key()
+    with _LAST_ERROR_LOCK:
+        last_error = _LAST_ERROR
+    return {
+        "configured": bool(key),
+        "key_len": len(key),
+        "enabled": is_enabled(),
+        "last_error": last_error,
+    }
 
 
 # --- 파싱 도우미 -------------------------------------------------------------
@@ -151,11 +197,14 @@ def get_financial_metrics(ticker: str) -> dict:
         )
         metrics = parse_metrics(payload)
     except Exception as exc:  # 429/네트워크/JSON 오류 모두 여기서 흡수
-        logger.warning("%s: Finnhub 조회 실패 → %s: %s", sym, type(exc).__name__, str(exc)[:200])
+        detail = f"{type(exc).__name__}: {exc}"
+        logger.warning("%s: Finnhub 조회 실패 → %s", sym, _redact(detail)[:200])
+        _set_last_error(f"{sym} {detail}")
         with _CACHE_LOCK:
             _CACHE[sym] = (now, ERROR_TTL, None)
         return empty
 
+    _set_last_error("")
     # 값이 하나도 없으면(지원하지 않는 티커 등) 15분만 기억해 다음에 다시 시도한다.
     ttl = METRICS_TTL if any(value is not None for value in metrics.values()) else ERROR_TTL
     with _CACHE_LOCK:
@@ -164,6 +213,7 @@ def get_financial_metrics(ticker: str) -> dict:
 
 
 def clear_cache() -> None:
-    """테스트용 캐시 초기화."""
+    """테스트용 캐시·오류 상태 초기화."""
     with _CACHE_LOCK:
         _CACHE.clear()
+    _set_last_error("")

@@ -6,6 +6,7 @@ Finnhub는 값을 퍼센트로 주는 항목이 있어(성장률·영업이익�
 
 실행: python -m unittest discover -s tests -v
 """
+import json
 import os
 import sys
 import time
@@ -191,6 +192,57 @@ class RequestCacheTests(FinnhubTestBase):
         first["trailing_pe"] = 999.0
         second = finnhub_client.get_financial_metrics("TSM")
         self.assertAlmostEqual(second["trailing_pe"], 31.2, places=6)
+
+
+class HttpTests(FinnhubTestBase):
+    def test_http_error_carries_status_only_without_token(self):
+        class Resp:
+            status_code = 401
+            text = '{"error":"Please verify your email"}'
+
+        with patch.object(finnhub_client.requests, "get", return_value=Resp()):
+            with self.assertRaises(finnhub_client.FinnhubHTTPError) as ctx:
+                finnhub_client._http_get_json(
+                    finnhub_client.BASE_URL,
+                    {"symbol": "TSM", "metric": "all", "token": "SECRET-KEY-123"},
+                )
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertNotIn("SECRET-KEY-123", str(ctx.exception))
+
+
+class StatusTests(FinnhubTestBase):
+    def test_status_reports_configuration_without_secret(self):
+        st = finnhub_client.status()
+        self.assertTrue(st["configured"])
+        self.assertEqual(st["key_len"], len("test-key"))
+        self.assertTrue(st["enabled"])
+        self.assertNotIn("test-key", json.dumps(st))
+
+    def test_status_without_key(self):
+        with patch.dict(os.environ, {"FINNHUB_API_KEY": ""}):
+            st = finnhub_client.status()
+        self.assertFalse(st["configured"])
+        self.assertFalse(st["enabled"])
+
+    def test_last_error_redacts_token(self):
+        leaky = RuntimeError(
+            "Max retries exceeded with url: /api/v1/stock/metric?symbol=TSM&metric=all&token=SECRET123"
+        )
+        self.patch_http(error=leaky)
+        finnhub_client.get_financial_metrics("TSM")
+        st = finnhub_client.status()
+        self.assertNotIn("SECRET123", st["last_error"])
+        self.assertIn("token=***", st["last_error"])
+
+    def test_success_clears_last_error(self):
+        self.patch_http(error=RuntimeError("boom"))
+        finnhub_client.get_financial_metrics("TSM")
+        self.assertNotEqual(finnhub_client.status()["last_error"], "")
+        finnhub_client.clear_cache()
+        finnhub_client._CACHE.clear()
+        with patch.object(finnhub_client, "_http_get_json", lambda url, params: TSM_PAYLOAD):
+            finnhub_client.get_financial_metrics("TSM")
+        self.assertEqual(finnhub_client.status()["last_error"], "")
 
 
 # --- stock_tools 3단계 폴백 연동 ---------------------------------------------
