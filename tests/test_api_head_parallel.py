@@ -130,7 +130,9 @@ class HeadRouteTests(BaseCase):
     def test_get_root_returns_ok_json(self):
         resp = self.client.get("/")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json(), {"status": "ok"})
+        self.assertEqual(resp.json()["status"], "ok")
+        # 배포 확인용 build 마커(로컬 실행은 "local", Render는 커밋 앞 7자리)
+        self.assertIn("build", resp.json())
 
 
 @unittest.skipIf(TestClient is None, "fastapi.testclient 사용에 httpx가 필요합니다")
