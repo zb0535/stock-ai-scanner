@@ -31,7 +31,8 @@ MODEL_ID = "gemini-3.5-flash-lite"
 # Gemini 호출 상한(밀리초). 모델이 느리거나 503을 받았을 때 재시도로 수십 초를
 # 버리지 않도록, 시도당 상한을 짧게 잡고 그 안에서만 재시도한다(실패하면 점수 기반 폴백).
 GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "25000"))
-GEMINI_MAX_ATTEMPTS = 2
+# 503(모델 과부하)은 1~2초에 빨리 실패하므로 한 번은 더 시도할 값이 있다(총 3회, 최악 +약 2초).
+GEMINI_MAX_ATTEMPTS = 3
 # gemini-3 계열 flash는 기본적으로 '생각(thinking)'을 켜고 답한다. 이 분석은 주어진 수치를
 # 정리해 JSON으로 옮기는 작업이라 사고에 10~60초를 쓰고도 결과가 나아지지 않았다.
 # 2026-11 실서버에서 15종목 배치가 25초 상한을 넘겨 504(DEADLINE_EXCEEDED)로 폴백된 원인이
@@ -481,6 +482,12 @@ def _retryable_gemini_error(exc: Exception) -> bool:
             and "timed out" not in text and "504" not in text)
 
 
+def _thinking_rejected(exc: Exception) -> bool:
+    """사고 예산을 거부하는 모델·버전인지(400 INVALID_ARGUMENT) — 그러면 사고 설정을 뺀다."""
+    text = f"{type(exc).__name__} {exc}".lower()
+    return "thinking" in text or "invalid_argument" in text or " 400" in text
+
+
 @app.post("/api/screen")
 def screen_stocks(req: ScreenRequest):
     mode = (req.mode or "watchlist").strip().lower()
@@ -543,22 +550,21 @@ def screen_stocks(req: ScreenRequest):
         f"종목 데이터(quant_score 내림차순):\n{json.dumps(rows, ensure_ascii=False, default=str)}"
     )
 
-    # AI 분석은 최대 2회 시도하고, 끝내 실패해도 500 대신 서버 점수 기반 요약을 돌려준다.
+    # AI 분석은 최대 3회 시도하고, 끝내 실패해도 500 대신 서버 점수 기반 요약을 돌려준다.
     # (Gemini 쿼터·장애·모델 응답 형식 오류가 사용자 화면을 500으로 만들지 않게)
-    # 1회차는 사고 끔(빠름), 2회차는 사고 설정 없이(모델 기본값) — 사고 예산을 거부하는
-    # 모델·버전에서도 한 번은 성공할 기회를 준다.
+    # 503(모델 과부하는 1~2초에 빨리 돌아온다)만 짧게 재시도하고, 타임아웃은 재시도하지 않는다.
     data = None
     analysis_source = "gemini"
     analysis_note = ""
+    thinking_budget = GEMINI_THINKING_BUDGET
     _t = time.perf_counter()
     for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
-        thinking = GEMINI_THINKING_BUDGET if attempt == 1 else None
         try:
             client = _gemini_client()
             res = client.models.generate_content(
                 model=MODEL_ID,
                 contents=prompt,
-                config=_gemini_config(thinking),
+                config=_gemini_config(thinking_budget),
             )
             data = _parse_analysis(res.text)
             break
@@ -570,7 +576,9 @@ def screen_stocks(req: ScreenRequest):
                 _record_error(uuid.uuid4().hex[:8], "POST /api/screen (gemini)", exc,
                               note="폴백 분석으로 응답")
                 break
-            time.sleep(0.5)
+            if _thinking_rejected(exc):
+                thinking_budget = None   # 사고 예산을 모르는 모델이면 빼고 다시 보낸다
+            time.sleep(0.3 * attempt)
     _mark("gemini_ms", _t)
     if data is None:
         data = _fallback_analysis(rows, analysis_note)

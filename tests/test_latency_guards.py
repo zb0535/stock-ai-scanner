@@ -391,6 +391,14 @@ class GeminiGuardTests(unittest.TestCase):
     def test_503_is_retried(self):
         self.assertTrue(api._retryable_gemini_error(Exception("503 UNAVAILABLE. high demand")))
 
+    def test_three_attempts_for_server_errors(self):
+        self.assertEqual(api.GEMINI_MAX_ATTEMPTS, 3)
+
+    def test_thinking_budget_rejection_is_detected(self):
+        self.assertTrue(api._thinking_rejected(
+            Exception("400 INVALID_ARGUMENT. thinking_budget is not supported")))
+        self.assertFalse(api._thinking_rejected(Exception("503 UNAVAILABLE")))
+
     def test_thinking_is_disabled_by_default(self):
         cfg = api._gemini_config(api.GEMINI_THINKING_BUDGET)
         self.assertEqual(cfg.thinking_config.thinking_budget, 0)

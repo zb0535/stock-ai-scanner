@@ -124,7 +124,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     넣어 두고(`prime_history`, 스냅샷 수명 70분), 발굴된 15종목의 지표·차트가 **재다운로드 0회**로
     끝난다. 종목 병렬도는 6 → 8(`MAX_FETCH_WORKERS`).
   - **Gemini**: `gemini-3.5-flash-lite`(빠른 lite 모델) 그대로, 시도당 25초 상한
-    (`GEMINI_TIMEOUT_MS`) + 최대 2회. 사고(thinking)는 꺼 둔다(`GEMINI_THINKING_BUDGET=0`) —
+    (`GEMINI_TIMEOUT_MS`) + 최대 3회(503 과부하만 짧게 재시도). 사고(thinking)는 꺼 둔다(`GEMINI_THINKING_BUDGET=0`) —
     켜져 있으면 15종목 배치가 25초를 넘겨 504로 폴백되던 것을 확인했다. 타임아웃은 재시도하지
     않고 바로 정량 점수 폴백으로 간다(대기가 두 배가 되지 않게).
   - 응답의 `timings`(ms)에 단계별 소요 시간이 담긴다 — `discovery_ms`(발굴·프리 스캔) ·
@@ -146,7 +146,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드 검증, 357개)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드 검증, 359개)
 
 ## 환경변수
 | 이름 | 설명 |
