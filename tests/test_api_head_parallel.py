@@ -100,6 +100,8 @@ class BaseCase(unittest.TestCase):
         stock_tools._info_fail_streak = 0
         stock_tools._info_cooldown_until = 0.0
         FakeTicker.calls = {"info": [], "history": []}
+        # t.info가 일부 값만 주는 대역이라 SEC EDGAR 폴백이 실네트워크를 타지 않게 막는다.
+        self.patch_attr(stock_tools.sec_edgar, "get_financial_metrics", lambda *a, **k: {})
 
 
 @unittest.skipIf(TestClient is None, "fastapi.testclient 사용에 httpx가 필요합니다")

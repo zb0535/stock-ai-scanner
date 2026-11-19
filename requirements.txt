@@ -6,3 +6,4 @@ pandas
 lxml
 google-genai
 pydantic
+requests>=2.31

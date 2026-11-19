@@ -1,11 +1,14 @@
 import logging
 import math
+import os
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import yfinance as yf
+
+import sec_edgar
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -44,6 +47,13 @@ _FIN_FIELDS = {
     "operating_margins": "operatingMargins",
     "debt_to_equity": "debtToEquity",
 }
+
+# SEC EDGAR가 대신 채울 수 있는 항목(선행 PER은 공시 데이터로 계산할 수 없다).
+_SEC_FIELDS = ("trailing_pe", "revenue_growth", "operating_margins", "debt_to_equity")
+
+# t.info가 막힌 서버(Render 등)에서도 재무 지표를 유지하기 위한 SEC EDGAR 폴백 스위치.
+# SEC_EDGAR_FALLBACK=0 으로 끌 수 있다.
+SEC_FALLBACK_ENABLED = os.environ.get("SEC_EDGAR_FALLBACK", "1") not in ("0", "false", "False")
 
 # t.info가 연속으로 실패하면 잠시 호출을 멈춘다(429 폭풍 방지).
 _INFO_FAIL_THRESHOLD = 5
@@ -216,25 +226,41 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     fresh_ok = any(value is not None for value in fresh.values())
     cached_payload = cached_payload or {}
     previous = {key: _to_number(cached_payload.get(key)) for key in _FIN_FIELDS}
-    previous_ok = any(value is not None for value in previous.values())
 
-    if fresh_ok:
-        # 이번 응답에서 빠진 필드는 직전 성공값으로 채운다(필드 단위 보전).
-        financials = {key: fresh[key] if fresh[key] is not None else previous[key] for key in _FIN_FIELDS}
-        financials_available, financials_stale = True, False
-    elif previous_ok:
-        # stale-while-error: t.info가 401/429로 죽어도 직전 성공값 유지
-        financials = dict(previous)
-        financials_available, financials_stale = True, True
-    else:
-        financials = {key: None for key in _FIN_FIELDS}
-        financials_available, financials_stale = False, False
+    # --- SEC EDGAR 폴백 ---
+    # Yahoo t.info가 막히거나(429/401) 값을 비우면 SEC 공시(XBRL)에서 계산해 채운다.
+    # current_price는 이미 차트에서 받은 값을 재사용하므로 추가 시세 호출이 없다.
+    sec_financials: dict = {}
+    if SEC_FALLBACK_ENABLED and price and any(fresh[key] is None for key in _SEC_FIELDS):
+        try:
+            sec_financials = sec_edgar.get_financial_metrics(sym, price) or {}
+        except Exception as exc:  # 폴백 실패가 차트·시세를 망가뜨리지 않게
+            logger.warning("%s: SEC EDGAR 폴백 실패 → %s: %s", sym, type(exc).__name__, str(exc)[:120])
+            sec_financials = {}
+
+    def _fill(key: str):
+        """yfinance 최신값 > SEC EDGAR 계산값 > 직전 캐시값 순으로 쓴다."""
+        if fresh[key] is not None:
+            return fresh[key]
+        if sec_financials.get(key) is not None:
+            return sec_financials[key]
+        return previous[key]
+
+    financials = {key: _fill(key) for key in _FIN_FIELDS}
+    sec_filled = [key for key in _SEC_FIELDS
+                  if fresh[key] is None and sec_financials.get(key) is not None]
+    cache_filled = any(
+        fresh[key] is None and sec_financials.get(key) is None and previous[key] is not None
+        for key in _FIN_FIELDS
+    )
+    financials_available = any(value is not None for value in financials.values())
+    # t.info가 죽었는데 SEC도 못 채우고 직전 캐시만 남은 경우에만 stale로 표시한다.
+    financials_stale = bool(cache_filled and not fresh_ok and not sec_filled)
 
     name = None
     if info:
         name = info.get("shortName") or info.get("longName")
     name = name or cached_payload.get("name") or sym
-
     payload = {
         "ticker": sym,
         "name": name,
@@ -249,8 +275,15 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     if financials_stale:
         payload["financials_stale"] = True
         payload["financials_note"] = "재무 지표 일시 미수신(Yahoo API 제한) — 직전 조회값 유지, 가격·이평선·RSI는 최신"
+    elif sec_filled and not fresh_ok:
+        payload["financials_note"] = "재무 지표는 SEC EDGAR 공시(XBRL) 기준으로 보완 — Yahoo API 제한 시 자동 대체, 가격·이평선·RSI는 최신"
+    elif sec_filled:
+        payload["financials_note"] = "일부 재무 지표는 SEC EDGAR 공시(XBRL)에서 보완"
     elif not financials_available:
         payload["financials_note"] = "재무 지표 일시 미수신(Yahoo API 제한) — 가격·이평선·RSI만 유효"
+    if financials_available:
+        # 어느 출처에서 채웠는지 남긴다(프론트엔드는 이 키를 몰라도 동작한다).
+        payload["financials_source"] = "sec_edgar" if (sec_filled and not fresh_ok) else "yfinance"
     if info_error and not financials_available:
         payload["financials_error"] = info_error
     return payload

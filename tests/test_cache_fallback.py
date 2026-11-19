@@ -89,9 +89,14 @@ class BaseCase(unittest.TestCase):
         ]
         self.patcher = patch.object(stock_tools.yf, "Ticker", FakeTicker)
         self.patcher.start()
+        # SEC EDGAR 폴백은 네트워크를 타므로 이 테스트들에서는 끈다.
+        # (폴백 자체는 tests/test_sec_edgar.py에서 검증한다.)
+        self.sec_patcher = patch.object(stock_tools.sec_edgar, "get_financial_metrics", return_value={})
+        self.sec_patcher.start()
 
     def tearDown(self):
         self.patcher.stop()
+        self.sec_patcher.stop()
 
 
 class MetricsCacheTests(BaseCase):
