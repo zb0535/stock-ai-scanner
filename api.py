@@ -113,7 +113,8 @@ def health():
     `finnhub`은 키 설정 여부·마지막 실패 사유만 노출한다(키 본문은 응답에 없다).
     """
     return {"status": "ok", "build": (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "local",
-            "finnhub": finnhub_status()}
+            "finnhub": finnhub_status(),
+            "storage_backend": history_store.storage_backend()}
 
 
 @app.api_route("/api/watchlist", methods=["GET", "HEAD"])
@@ -276,7 +277,8 @@ def screen_stocks(req: ScreenRequest):
 def get_performance(limit: int = history_store.DEFAULT_LIMIT):
     """AI 추천 성적표 — 기록된 추천을 현재가와 비교해 적중률·평균 수익률을 돌려준다.
 
-    응답: `{"summary": {...}, "picks": [...], "as_of": ISO, "limit": n}`
+    응답: `{"summary": {...}, "picks": [...], "as_of": ISO, "limit": n, "storage_backend": str}`
+    - `storage_backend`: 이력이 실제로 저장된 곳 — "postgres"(DATABASE_URL 설정) / "sqlite"(로컬 폴백)
     - `summary`: total_picks, evaluated_picks, win_count, win_rate_pct, avg_return_pct,
       best_pick, worst_pick (이력이 없으면 개수 0, 비율 null)
     - `picks`: 최신 추천부터 ticker·entry_price·current_price·return_pct·is_win·days_held 등

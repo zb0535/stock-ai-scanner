@@ -31,13 +31,23 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   - 같은 날 같은 `(date, ticker, strategy)`는 한 행만 남긴다(첫 진입가·첫 시각 유지, 점수·mode·criteria만 갱신).
   - DB 경로: `HISTORY_DB_PATH` 환경변수 > `data/recommendations.db`(부모 폴더 자동 생성) >
     만들 수 없으면 `/tmp/stock_scanner_history.db`. DB 쓰기가 실패해도 `/api/screen`은 정상 응답한다.
+  - **외부 PostgreSQL(선택)**: `DATABASE_URL`(Neon·Supabase·Render Postgres, `postgres://`/`postgresql://`)이
+    설정돼 있으면 SQLite 대신 PostgreSQL에 기록한다. 테이블(`recommendations`)과 인덱스는 첫 사용 시
+    자동 생성되며, `(recommended_date, ticker, strategy)` 충돌 시 `ON CONFLICT ... DO UPDATE`로
+    점수·mode·criteria만 갱신해 최초 진입가·추천 시각을 유지한다. `postgres://`는 `postgresql://`로
+    바꾸고, sslmode가 없고 원격 호스트면 `sslmode=require`를 붙인다(로컬 주소는 그대로).
+    `DATABASE_URL`이 없으면 기존 SQLite 그대로다. 저장소가 어디인지는 `GET /`와
+    `GET /api/performance`의 `storage_backend`(`postgres`|`sqlite`)로 확인한다(자격 증명은 노출하지 않음).
+    ⚠️ Render 무료 플랜은 영구 디스크가 없어 재배포 시 SQLite 이력이 초기화되므로,
+    오래 쌓으려면 무료 PostgreSQL(Neon 등)을 붙여 `DATABASE_URL`만 넣으면 된다.
   - 현재가는 `yf.download`로 **최대 50종목을 한 번에** 받아 5분 캐시한다(`t.info` 호출 없음).
   - 응답: `{"summary": {total_picks, evaluated_picks, win_count, win_rate_pct, avg_return_pct,
     best_pick, worst_pick}, "picks": [...], "as_of", "limit"}`. 이력이 비면 개수 0·비율 `null`.
     픽별로 `entry_price`·`current_price`·`return_pct`·`is_win`(return > 0)·`days_held`가 붙는다.
   - 웹 UI 상단에 **📊 AI 추천 성적표** 패널(요약 3개 지표 + 추천 이력 표 + 새로고침)이 있다.
   - ⚠️ Render 무료 플랜은 영구 디스크가 없어 재배포·재시작 시 이력 파일이 초기화된다.
-    오래 쌓아 두려면 Render Persistent Disk를 붙이고 `HISTORY_DB_PATH=/var/data/recommendations.db`처럼 지정한다.
+    위 `DATABASE_URL`(Neon 등 무료 PostgreSQL)을 넣으면 재배포에도 이력이 남는다.
+    굳이 파일로 유지하려면 Render Persistent Disk를 붙이고 `HISTORY_DB_PATH=/var/data/recommendations.db`처럼 지정한다.
 - Yahoo Finance `t.info`가 서버 IP에서 막히면(429/401) **SEC EDGAR 공시(XBRL)** 에서
   PER·매출성장률·영업이익률·부채비율을 계산해 채운다(API 키 불필요).
 - SEC 공시에도 값이 없으면(예: us-gaap 태그가 없는 외국 ADR `TSM`) **Finnhub**
@@ -47,10 +57,18 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   응답의 `financials_source`가 `sec_edgar`, `finnhub`, `sec_edgar+finnhub` 등이면
   그 경로로 보완된 행이다.
   `SEC_EDGAR_FALLBACK=0`, `FINNHUB_FALLBACK=0` 환경변수로 각각 끌 수 있다.
-- `GET /` 헬스 응답에 배포 커밋(`build`)과 Finnhub 키 설정·마지막 오류(`finnhub`)를
-  노출한다. 키 본문은 나오지 않고 설정 여부·이름·길이만 보인다.
+- `GET /` 헬스 응답에 배포 커밋(`build`)과 Finnhub 키 설정·마지막 오류(`finnhub`),
+  저장소 종류(`storage_backend`)를 노출한다. 키 본문은 나오지 않고 설정 여부·이름·길이만 보인다.
 
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·API 계약 검증)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약 검증)
+
+## 환경변수
+| 이름 | 설명 |
+| --- | --- |
+| `GEMINI_API_KEY` | Gemini 호출 키(필수) |
+| `DATABASE_URL` | 외부 PostgreSQL 접속 문자열(선택). 없으면 SQLite(`data/recommendations.db`) |
+| `HISTORY_DB_PATH` | SQLite 파일 경로(선택, `DATABASE_URL`이 없을 때만) |
+| `FINNHUB_API_KEY` / `FINN_API_KEY` | Finnhub 재무 보완(선택) |

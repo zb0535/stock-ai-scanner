@@ -1,7 +1,9 @@
-"""AI 추천 성적표 — 추천 이력 저장(SQLite)과 수익률·적중률 계산.
+"""AI 추천 성적표 — 추천 이력 저장(SQLite 또는 외부 PostgreSQL)과 수익률·적중률 계산.
 
 설계 원칙
-- 가볍게: 외부 DB 없이 SQLite 파일 하나. 경로는 `HISTORY_DB_PATH` 환경변수로 바꿀 수 있고,
+- 선택적 외부 DB: `DATABASE_URL`(postgres:// 또는 postgresql://)이 설정돼 있으면 PostgreSQL에
+  기록한다(Neon·Supabase·Render Postgres 호환). 설정이 없으면 예전처럼 SQLite를 쓴다.
+- 가볍게(로컬 폴백): SQLite 경로는 `HISTORY_DB_PATH` 환경변수로 바꿀 수 있고,
   기본값은 `data/recommendations.db`(저장소 기준)이며, 그 디렉터리를 만들 수 없으면
   `/tmp/stock_scanner_history.db`로 떨어진다. 부모 디렉터리는 안전하게 만든다.
 - 스크리닝을 망치지 않게: 모든 DB 함수는 예외를 그대로 올리되, `api.py`는 호출부에서
@@ -22,6 +24,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
+from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 import yfinance as yf
@@ -71,6 +74,122 @@ UNIQUE_INDEX = (
 DATE_INDEX = (
     f"CREATE INDEX IF NOT EXISTS ix_{TABLE}_recommended_at ON {TABLE} (recommended_at DESC)"
 )
+
+
+# --- 저장 백엔드 선택: PostgreSQL(DATABASE_URL) / SQLite(기본) -------------------
+
+DATABASE_URL_ENV = "DATABASE_URL"
+
+# 외부 DB 연결에만 쓰는 PostgreSQL 스키마. 컬럼 이름·의미·제약은 SQLite 스키마와 같다.
+# recommended_date/recommended_at은 두 백엔드 모두 TEXT(ISO)로 저장해 조회 결과가 달라지지 않는다.
+PG_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS {TABLE} (
+    id               SERIAL PRIMARY KEY,
+    ticker           TEXT    NOT NULL,
+    recommended_date TEXT    NOT NULL,          -- KST YYYY-MM-DD
+    recommended_at   TEXT    NOT NULL,          -- ISO 8601 (KST 오프셋 포함)
+    entry_price      DOUBLE PRECISION,
+    strategy         TEXT    NOT NULL DEFAULT '',
+    mode             TEXT    NOT NULL DEFAULT '',
+    quant_score      DOUBLE PRECISION,
+    criteria         TEXT    NOT NULL DEFAULT '',
+    CONSTRAINT ux_{TABLE}_date_ticker_strategy UNIQUE (recommended_date, ticker, strategy)
+)
+"""
+
+PG_DATE_INDEX = (
+    f"CREATE INDEX IF NOT EXISTS ix_{TABLE}_recommended_at ON {TABLE} (recommended_at DESC)"
+)
+
+# 같은 (날짜, 티커, 전략)은 한 행. DO UPDATE에서 entry_price·recommended_at을 건드리지 않으므로
+# 최초 진입가·최초 추천 시각이 유지된다(SQLite 경로와 동일한 규칙).
+# RETURNING (xmax = 0)은 이번 문장이 INSERT였는지(True) UPDATE였는지(False)를 알려준다.
+PG_UPSERT = f"""
+INSERT INTO {TABLE} (ticker, recommended_date, recommended_at, entry_price,
+                    strategy, mode, quant_score, criteria)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (recommended_date, ticker, strategy) DO UPDATE
+SET quant_score = EXCLUDED.quant_score,
+    mode        = EXCLUDED.mode,
+    criteria    = EXCLUDED.criteria
+RETURNING (xmax = 0) AS inserted
+"""
+
+PG_SELECT = (
+    f"SELECT ticker, recommended_date, recommended_at, entry_price, strategy, "
+    f"       mode, quant_score, criteria "
+    f"FROM {TABLE} ORDER BY recommended_date DESC, id DESC LIMIT %s"
+)
+
+# 외부 DB 연결 타임아웃(초). 무료 티어가 잠들었다 깨는 시간을 넉넉히 준다.
+PG_CONNECT_TIMEOUT = 10
+
+# 한 프로세스에서 스키마를 이미 보장한 접속 문자열(비밀번호 없는 정규화 URL은 아니고 원문).
+_PG_SCHEMA_READY: set[str] = set()
+_PG_SCHEMA_LOCK = threading.Lock()
+
+_LOCAL_HOSTS = {"", "localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def normalize_database_url(raw: Any = None) -> str:
+    """`DATABASE_URL`을 libpq가 이해하는 접속 문자열로 정리한다(순수 함수).
+
+    - 앞뒤 공백 제거. 비어 있으면 ""(→ SQLite 폴백).
+    - `postgres://` → `postgresql://` (Heroku·일부 대시보드가 주는 옛 스킴).
+    - 두 스킴이 아니면 "" — 실수로 다른 URL이 들어와도 SQLite로 계속 동작한다.
+    - sslmode가 없고 원격 호스트면 `sslmode=require`를 붙인다(Neon·Supabase는 SSL 필수,
+      Render Postgres도 SSL을 받는다). 로컬(localhost·127.0.0.1·::1)에는 붙이지 않는다.
+    - 질의 문자열은 문자열로만 다뤄 비밀번호의 % 인코딩을 건드리지 않는다.
+    """
+    url = str(raw).strip() if raw is not None else (os.environ.get(DATABASE_URL_ENV) or "").strip()
+    if not url:
+        return ""
+
+    lowered = url.lower()
+    if lowered.startswith("postgresql://"):
+        pass
+    elif lowered.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    else:
+        return ""
+
+    url = url.rstrip("?&")
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    names = [p.split("=", 1)[0].strip().lower() for p in parts.query.split("&") if p.strip()]
+    if "sslmode" in names or host in _LOCAL_HOSTS:
+        return url
+    return f"{url}{'&' if parts.query else '?'}sslmode=require"
+
+
+def database_url() -> str:
+    """현재 설정된 PostgreSQL 접속 문자열(정규화본). 없으면 ""."""
+    return normalize_database_url()
+
+
+def storage_backend(db_path: str | None = None) -> str:
+    """이번 호출이 쓰는 저장소: "postgres" 또는 "sqlite".
+
+    `db_path`를 명시하면(테스트·로컬 파일 지정) DATABASE_URL과 무관하게 SQLite다.
+    접속하지 않고 환경변수만 읽으므로 헬스 체크에서 불러도 I/O가 없다.
+    """
+    if db_path:
+        return "sqlite"
+    return "postgres" if database_url() else "sqlite"
+
+
+def redact_database_url(raw: Any = None) -> str:
+    """비밀번호를 지운 접속 문자열(로그·응답용). 자격 증명은 밖으로 나가지 않는다."""
+    url = normalize_database_url(raw)
+    if not url:
+        return ""
+    parts = urlsplit(url)
+    netloc = parts.netloc
+    if "@" in netloc:
+        userinfo, hostpart = netloc.rsplit("@", 1)
+        user = userinfo.split(":", 1)[0]
+        netloc = f"{user}:***@{hostpart}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 # --- 날짜/숫자 유틸 ----------------------------------------------------------
@@ -152,8 +271,54 @@ def _connect(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _pg_connect(url: str | None = None):
+    """PostgreSQL 연결(짧게 열고 닫는다). 첫 연결에서 스키마를 멱등하게 만든다.
+
+    psycopg는 여기서 늦게 import한다 — psycopg가 없는 환경에서도 SQLite 경로는 그대로 돈다.
+    """
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError as exc:  # pragma: no cover - requirements.txt에 포함
+        raise RuntimeError("psycopg가 설치되지 않아 PostgreSQL 백엔드를 쓸 수 없습니다") from exc
+
+    conninfo = normalize_database_url(url) if url else database_url()
+    if not conninfo:
+        raise RuntimeError("DATABASE_URL이 설정되지 않았습니다")
+
+    conn = psycopg.connect(conninfo, connect_timeout=PG_CONNECT_TIMEOUT, row_factory=dict_row,
+                           prepare_threshold=None)  # PgBouncer(Neon pooler) 연결 모드에서도 안전하게
+    try:
+        _ensure_pg_schema(conn, conninfo)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _ensure_pg_schema(conn, key: str) -> None:
+    """PostgreSQL 테이블·인덱스를 없으면 만든다(프로세스당 한 번)."""
+    if key in _PG_SCHEMA_READY:
+        return
+    with _PG_SCHEMA_LOCK:
+        if key in _PG_SCHEMA_READY:
+            return
+        conn.execute(PG_SCHEMA)
+        conn.execute(PG_DATE_INDEX)
+        conn.commit()
+        _PG_SCHEMA_READY.add(key)
+
+
 def init_db(db_path: str | None = None) -> str:
     """스키마를 만들거나 확인하고 실제 사용 경로를 돌려준다."""
+    if storage_backend(db_path) == "postgres":
+        with _WRITE_LOCK:
+            conn = _pg_connect()
+            try:
+                conn.commit()
+            finally:
+                conn.close()
+        return redact_database_url()
     with _WRITE_LOCK:
         conn = _connect(db_path)
         try:
@@ -170,21 +335,19 @@ def _clean(value: Any, default: str = "") -> str:
 # --- 기록 --------------------------------------------------------------------
 
 
-def record_picks(
+def _build_rows(
     picks: Iterable[dict],
     strategy: str = "",
     mode: str = "",
     criteria: str = "",
     recommended_date: str | None = None,
     recommended_at: str | None = None,
-    db_path: str | None = None,
-) -> dict:
-    """추천 종목들을 이력에 남긴다.
+) -> tuple[list[tuple], str, int]:
+    """픽 목록을 저장용 행 튜플로 바꿉니다(백엔드 공통).
 
-    같은 `(recommended_date, ticker, strategy)`가 이미 있으면 새 행을 만들지 않고
-    점수·mode·criteria만 갱신한다(첫 진입가·첫 추천 시각 유지).
-
-    반환: {"inserted": n, "updated": n, "skipped": n, "db_path": path}
+    행 튜플 순서는 `ticker, recommended_date, recommended_at, entry_price, strategy,
+    mode, quant_score, criteria` — SQLite INSERT와 PostgreSQL INSERT가 같은 순서를 쓴다.
+    반환: (행 목록, 기준 날짜(YYYY-MM-DD), 제외한 픽 수)
     """
     now = kst_now()
     if recommended_at:
@@ -211,9 +374,60 @@ def record_picks(
         rows.append((ticker, day, now.isoformat(timespec="seconds"),
                      _num(pick.get("entry_price", pick.get("price"))), strat, m,
                      _num(pick.get("quant_score")), crit))
+    return rows, day, skipped
+
+
+def _record_picks_pg(rows: list[tuple], day: str, skipped: int) -> dict:
+    """PostgreSQL upsert. `(recommended_date, ticker, strategy)` 충돌 시 점수·mode·criteria만 갱신."""
+    inserted = updated = 0
+    with _WRITE_LOCK:
+        conn = _pg_connect()
+        try:
+            for row in rows:
+                cur = conn.execute(PG_UPSERT, row)
+                res = cur.fetchone()
+                if res and res.get("inserted"):
+                    inserted += 1
+                else:
+                    updated += 1
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    logger.info("추천 이력(postgres) %s: 신규 %d · 갱신 %d · 제외 %d", day, inserted, updated, skipped)
+    return {"inserted": inserted, "updated": updated, "skipped": skipped,
+            "db_path": redact_database_url(), "backend": "postgres"}
+
+
+def record_picks(
+    picks: Iterable[dict],
+    strategy: str = "",
+    mode: str = "",
+    criteria: str = "",
+    recommended_date: str | None = None,
+    recommended_at: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """추천 종목들을 이력에 남긴다.
+
+    같은 `(recommended_date, ticker, strategy)`가 이미 있으면 새 행을 만들지 않고
+    점수·mode·criteria만 갱신한다(첫 진입가·첫 추천 시각 유지).
+    `DATABASE_URL`이 있으면 PostgreSQL, 없으면 SQLite(`db_path` 지정 시 강제 SQLite).
+
+    반환: {"inserted": n, "updated": n, "skipped": n, "db_path": path, "backend": ...}
+    """
+    rows, day, skipped = _build_rows(picks, strategy=strategy, mode=mode, criteria=criteria,
+                                     recommended_date=recommended_date,
+                                     recommended_at=recommended_at)
 
     if not rows:
-        return {"inserted": 0, "updated": 0, "skipped": skipped, "db_path": None}
+        return {"inserted": 0, "updated": 0, "skipped": skipped, "db_path": None,
+                "backend": storage_backend(db_path)}
+
+    if storage_backend(db_path) == "postgres":
+        return _record_picks_pg(rows, day, skipped)
 
     inserted = updated = 0
     with _WRITE_LOCK:
@@ -241,12 +455,19 @@ def record_picks(
         finally:
             conn.close()
     logger.info("추천 이력 %s: 신규 %d · 갱신 %d · 제외 %d", day, inserted, updated, skipped)
-    return {"inserted": inserted, "updated": updated, "skipped": skipped, "db_path": path}
+    return {"inserted": inserted, "updated": updated, "skipped": skipped, "db_path": path,
+            "backend": "sqlite"}
 
 
 def recent_picks(limit: int = DEFAULT_LIMIT, db_path: str | None = None) -> list[dict]:
     """최신 추천부터 최대 limit개를 돌려준다(저장된 원본 필드 그대로)."""
     n = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
+    if storage_backend(db_path) == "postgres":
+        conn = _pg_connect()
+        try:
+            return [dict(r) for r in conn.execute(PG_SELECT, (n,)).fetchall()]
+        finally:
+            conn.close()
     conn = _connect(db_path)
     try:
         cur = conn.execute(
@@ -374,7 +595,7 @@ def empty_performance(limit: int = DEFAULT_LIMIT, error: str | None = None) -> d
         "worst_pick": None,
     }
     body = {"summary": summary, "picks": [], "as_of": kst_now().isoformat(timespec="seconds"),
-            "limit": limit}
+            "limit": limit, "storage_backend": storage_backend()}
     if error:
         body["error"] = error
     return body
@@ -446,6 +667,12 @@ def compute_performance(picks: list[dict], prices: dict[str, float | None],
     return {"summary": _summary(rows), "picks": rows}
 
 
+def _tag_backend(body: dict, db_path: str | None = None) -> dict:
+    """응답에 이번 조회가 실제로 쓴 저장소를 붙인다(자격 증명은 넣지 않는다)."""
+    body["storage_backend"] = storage_backend(db_path)
+    return body
+
+
 def get_performance(limit: int = DEFAULT_LIMIT, db_path: str | None = None,
                     price_fetcher=None) -> dict:
     """최근 추천을 읽어 현재가로 평가한 성적표를 만든다.
@@ -457,12 +684,12 @@ def get_performance(limit: int = DEFAULT_LIMIT, db_path: str | None = None,
         picks = recent_picks(n, db_path=db_path)
     except Exception as exc:
         logger.warning("추천 이력 조회 실패: %s: %s", type(exc).__name__, str(exc)[:200])
-        return empty_performance(n, error="history_unavailable")
+        return _tag_backend(empty_performance(n, error="history_unavailable"), db_path)
 
     if not picks:
         body = empty_performance(n)
         body["picks"] = []
-        return body
+        return _tag_backend(body, db_path)
 
     try:
         prices = latest_prices([p["ticker"] for p in picks],
@@ -474,9 +701,9 @@ def get_performance(limit: int = DEFAULT_LIMIT, db_path: str | None = None,
         body["error"] = "price_unavailable"
         body["as_of"] = kst_now().isoformat(timespec="seconds")
         body["limit"] = n
-        return body
+        return _tag_backend(body, db_path)
 
     body = compute_performance(picks, prices)
     body["as_of"] = kst_now().isoformat(timespec="seconds")
     body["limit"] = n
-    return body
+    return _tag_backend(body, db_path)

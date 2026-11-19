@@ -7,3 +7,4 @@ lxml
 google-genai
 pydantic
 requests>=2.31
+psycopg[binary]>=3.2
