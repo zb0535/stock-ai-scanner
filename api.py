@@ -28,10 +28,15 @@ logger = logging.getLogger("api")
 
 MODEL_ID = "gemini-3.5-flash-lite"
 
-# Gemini 호출 상한(밀리초). 모델이 느리거나 503을 받았을 때 2회 재시도로 수십 초를
+# Gemini 호출 상한(밀리초). 모델이 느리거나 503을 받았을 때 재시도로 수십 초를
 # 버리지 않도록, 시도당 상한을 짧게 잡고 그 안에서만 재시도한다(실패하면 점수 기반 폴백).
 GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "25000"))
 GEMINI_MAX_ATTEMPTS = 2
+# gemini-3 계열 flash는 기본적으로 '생각(thinking)'을 켜고 답한다. 이 분석은 주어진 수치를
+# 정리해 JSON으로 옮기는 작업이라 사고에 10~60초를 쓰고도 결과가 나아지지 않았다.
+# 2026-11 실서버에서 15종목 배치가 25초 상한을 넘겨 504(DEADLINE_EXCEEDED)로 폴백된 원인이
+# 이것이라, 기본값을 '사고 끔'(0)으로 둔다. 필요하면 GEMINI_THINKING_BUDGET=-1(자동).
+GEMINI_THINKING_BUDGET = int(os.environ.get("GEMINI_THINKING_BUDGET", "0"))
 
 # S&P 500 자동 발굴에서 Gemini로 넘길 후보 수.
 DISCOVERY_TOP_N = sp500_scanner.TOP_N
@@ -451,6 +456,31 @@ def _gemini_client():
         return genai.Client()
 
 
+def _gemini_config(thinking_budget: int | None) -> types.GenerateContentConfig:
+    """분석 호출 설정 — 사고 토큰 예산으로 응답 지연을 통제한다."""
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        temperature=0,
+    )
+    if thinking_budget is not None:
+        try:
+            config.thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
+        except Exception:  # 사고 설정을 모르는 구버전 SDK — 기본값으로 둔다
+            pass
+    return config
+
+
+def _retryable_gemini_error(exc: Exception) -> bool:
+    """다시 시도해 나아질 수 있는 실패인지 — 타임아웃(504)은 재시도해도 같다.
+
+    DEADLINE_EXCEEDED는 그 프롬프트로 제한 시간을 넘긴 것이라 다시 보내면 같은 시간이
+    걸리거나 더 걸린다. 그 경우는 바로 점수 기반 폴백으로 간다(대기가 두 배가 되지 않게).
+    """
+    text = f"{type(exc).__name__} {exc}".lower()
+    return ("deadline" not in text and "timeout" not in text
+            and "timed out" not in text and "504" not in text)
+
+
 @app.post("/api/screen")
 def screen_stocks(req: ScreenRequest):
     mode = (req.mode or "watchlist").strip().lower()
@@ -513,34 +543,34 @@ def screen_stocks(req: ScreenRequest):
         f"종목 데이터(quant_score 내림차순):\n{json.dumps(rows, ensure_ascii=False, default=str)}"
     )
 
-    # AI 분석은 2회까지 시도하고, 끝내 실패해도 500 대신 서버 점수 기반 요약을 돌려준다.
+    # AI 분석은 최대 2회 시도하고, 끝내 실패해도 500 대신 서버 점수 기반 요약을 돌려준다.
     # (Gemini 쿼터·장애·모델 응답 형식 오류가 사용자 화면을 500으로 만들지 않게)
+    # 1회차는 사고 끔(빠름), 2회차는 사고 설정 없이(모델 기본값) — 사고 예산을 거부하는
+    # 모델·버전에서도 한 번은 성공할 기회를 준다.
     data = None
     analysis_source = "gemini"
     analysis_note = ""
     _t = time.perf_counter()
     for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+        thinking = GEMINI_THINKING_BUDGET if attempt == 1 else None
         try:
             client = _gemini_client()
             res = client.models.generate_content(
                 model=MODEL_ID,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    temperature=0,
-                ),
+                config=_gemini_config(thinking),
             )
             data = _parse_analysis(res.text)
             break
         except Exception as exc:
             logger.warning("Gemini 분석 실패(%d/%d) → %s: %s", attempt, GEMINI_MAX_ATTEMPTS,
                            type(exc).__name__, str(exc)[:200])
-            if attempt == GEMINI_MAX_ATTEMPTS:
+            if attempt >= GEMINI_MAX_ATTEMPTS or not _retryable_gemini_error(exc):
                 analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
                 _record_error(uuid.uuid4().hex[:8], "POST /api/screen (gemini)", exc,
                               note="폴백 분석으로 응답")
-            else:
-                time.sleep(0.5)
+                break
+            time.sleep(0.5)
     _mark("gemini_ms", _t)
     if data is None:
         data = _fallback_analysis(rows, analysis_note)

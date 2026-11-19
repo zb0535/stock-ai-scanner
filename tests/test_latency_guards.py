@@ -381,5 +381,52 @@ class ScreenGuardIntegrationTests(BaseCase):
             self.assertIsNotNone(row.get("price"))
 
 
+class GeminiGuardTests(unittest.TestCase):
+    """Gemini 호출 상한·재시도 규칙 — 타임아웃 재시도로 대기가 두 배가 되지 않게."""
+
+    def test_deadline_exceeded_is_not_retried(self):
+        exc = Exception("504 DEADLINE_EXCEEDED. Deadline expired before operation could complete.")
+        self.assertFalse(api._retryable_gemini_error(exc))
+
+    def test_503_is_retried(self):
+        self.assertTrue(api._retryable_gemini_error(Exception("503 UNAVAILABLE. high demand")))
+
+    def test_thinking_is_disabled_by_default(self):
+        cfg = api._gemini_config(api.GEMINI_THINKING_BUDGET)
+        self.assertEqual(cfg.thinking_config.thinking_budget, 0)
+
+    def test_deadline_failure_calls_model_once(self):
+        """504면 재시도 없이 바로 폴백 — 25초를 두 번 기다리지 않는다."""
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:  # pragma: no cover
+            self.skipTest("httpx 미설치")
+        calls = []
+
+        class BoomClient:
+            class models:
+                @staticmethod
+                def generate_content(**kwargs):
+                    calls.append(kwargs)
+                    raise Exception("504 DEADLINE_EXCEEDED. Deadline expired")
+
+        import pandas as pd  # noqa: F401  (테스트 파일 import 순서 유지)
+
+        patches = [patch.object(api.genai, "Client", lambda **_: BoomClient()),
+                   patch.object(stock_tools, "get_stock_metrics",
+                                return_value={"ticker": "AAPL", "price": 100.0,
+                                              "quant_score": 50.0, "signals": ["ok"]}),
+                   patch.object(api, "_get_recent_news", return_value=[])]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+        body = TestClient(api.app).post(
+            "/api/screen", json={"criteria": "저PER", "tickers": ["AAPL"]}).json()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(body["analysis_source"], "fallback")
+        self.assertEqual(calls[0]["config"].thinking_config.thinking_budget, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
