@@ -234,6 +234,14 @@ class StatusTests(FinnhubTestBase):
             self.assertFalse(st["env_flags"]["FINNHUB_API_KEY"])
             self.assertTrue(st["env_flags"]["FINNHUB_KEY"])
 
+    def test_finn_api_key_name_is_accepted(self):
+        """대시보드에서 FINN_API_KEY로 저장한 경우에도 읽어야 한다."""
+        with patch.dict(os.environ, {"FINNHUB_API_KEY": "", "FINN_API_KEY": "finn-key"}):
+            st = finnhub_client.status()
+            self.assertEqual(st["env_name"], "FINN_API_KEY")
+            self.assertEqual(st["key_len"], len("finn-key"))
+            self.assertTrue(st["enabled"])
+
     def test_last_error_redacts_token(self):
         leaky = RuntimeError(
             "Max retries exceeded with url: /api/v1/stock/metric?symbol=TSM&metric=all&token=SECRET123"

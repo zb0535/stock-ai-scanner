@@ -61,12 +61,13 @@ def get_api_key() -> str:
     """환경변수에서 Finnhub API 키를 읽는다(테스트에서 env를 바꿔 끼울 수 있게 매번 읽음).
 
     `FINNHUB_API_KEY`가 표준이고, 대시보드에서 이름을 달리 넣은 경우를 위해
-    흔한 별칭도 받아준다. 어느 이름으로 읽혔는지는 `status()`의 env_name에 남는다.
+    `FINN_API_KEY`·`FINNHUB_KEY` 같은 별칭도 받아준다. 어느 이름으로 읽혔는지는
+    `status()`의 env_name에 남는다.
     """
     return _resolve_key()[1]
 
 
-_KEY_ENV_NAMES = ("FINNHUB_API_KEY", "FINNHUB_KEY", "FINNHUB_TOKEN", "FINNHUB_API_TOKEN")
+_KEY_ENV_NAMES = ("FINNHUB_API_KEY", "FINN_API_KEY", "FINNHUB_KEY", "FINNHUB_TOKEN", "FINNHUB_API_TOKEN")
 
 
 def _resolve_key() -> tuple[str, str]:
