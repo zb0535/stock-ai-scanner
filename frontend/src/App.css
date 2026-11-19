@@ -248,6 +248,80 @@ button:active:not(:disabled) {
 
 .card:hover { transform: translateY(-3px); border-color: rgba(56, 189, 248, 0.45); }
 .card-top { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 10px; }
+
+/* 카드별 수동 추적·관심 종목 버튼 */
+.card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 12px; }
+
+.track-btn, .watch-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 7px 13px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #cbd5e1;
+  background: rgba(30, 41, 59, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.track-btn:hover:not(:disabled), .watch-btn:hover:not(:disabled) {
+  color: #fff;
+  border-color: rgba(56, 189, 248, 0.6);
+  background: rgba(51, 65, 85, 0.9);
+}
+
+.track-btn.on {
+  color: #a5f3fc;
+  background: rgba(56, 189, 248, 0.14);
+  border-color: rgba(56, 189, 248, 0.5);
+}
+
+.watch-btn.on {
+  color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.42);
+}
+
+.track-btn:disabled, .watch-btn:disabled { cursor: default; opacity: 0.85; }
+
+.watch-btn.mini { padding: 4px 10px; font-size: 11.5px; }
+
+.detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 22px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+/* 성적표 행별 삭제 */
+.del-btn {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 9px;
+  font-size: 14px;
+  line-height: 1;
+  color: #cbd5e1;
+  background: rgba(148, 163, 184, 0.1);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.del-btn:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.18);
+  border-color: rgba(239, 68, 68, 0.5);
+}
+
+.del-btn:disabled { opacity: 0.45; cursor: wait; }
 .rank { font-size: 11px; font-weight: 700; color: #fbbf24; letter-spacing: 0.06em; }
 .ticker { font-size: 24px; font-weight: 800; color: #fff; }
 .price { font-size: 22px; font-weight: 700; color: #38bdf8; font-variant-numeric: tabular-nums; }

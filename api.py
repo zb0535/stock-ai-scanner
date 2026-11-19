@@ -6,7 +6,7 @@ import threading
 import time
 import pandas as pd
 import yfinance as yf
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
@@ -65,6 +65,25 @@ class ScreenRequest(BaseModel):
     criteria: str
     tickers: list[str] | None = None
     mode: str = "watchlist"
+
+
+class TrackRequest(BaseModel):
+    """수동 추적 요청(`POST /api/performance/track`).
+
+    `entry_price`는 선택이다. 비었거나 0 이하면 서버가 최신 종가를 받아 채우고,
+    그마저 실패하면 400(잘못된 티커)이다.
+    """
+
+    ticker: str
+    entry_price: float | None = None
+    strategy: str = ""
+    mode: str = "watchlist"
+    quant_score: float | None = None
+    criteria: str = ""
+
+
+# 티커 허용 문자([A-Z0-9.-^=], 최대 12자) — 경로·쿼리 삽입을 막는다.
+_TICKER_RE = re.compile(r"^[A-Z0-9.\-^=]{1,12}$")
 
 
 # --- 뉴스 캐시: 종목별 30분 (429/401 방지) -----------------------------------
@@ -247,26 +266,9 @@ def screen_stocks(req: ScreenRequest):
     # 추천 종목의 차트·뉴스도 선택된 개수만큼 병렬로 채운다(보통 3개).
     stock_tools.bounded_map(_attach_chart, picks)
 
-    # 추천 이력 저장(성적표용). 진입가는 Gemini가 적은 값보다 서버가 계산한 최신 종가를
-    # 우선한다. 저장 실패가 스크리닝 응답을 막아서는 안 되므로 경고만 남긴다.
-    try:
-        history_store.record_picks(
-            [
-                {
-                    "ticker": pick["ticker"],
-                    "entry_price": (score_by_ticker.get(
-                        str(pick.get("ticker") or "").strip().upper(), {}).get("price")
-                        or pick.get("price")),
-                    "quant_score": pick.get("quant_score"),
-                }
-                for pick in picks
-            ],
-            strategy=strategy,
-            mode=mode,
-            criteria=req.criteria,
-        )
-    except Exception as exc:  # DB 잠김·권한·경로 문제 모두 여기서 흡수
-        logger.warning("추천 이력 저장 실패(응답은 계속): %s: %s", type(exc).__name__, str(exc)[:200])
+    # ⚠️ 여기서는 이력을 남기지 않는다(2026-11 변경). 자동 기록은 사용자가 분석만 돌려도
+    # 성적표를 오염시켰으므로, 클라이언트가 카드의 "📌 추적 추가"로 고른 픽만
+    # `POST /api/performance/track`에서 기록한다. 응답 모양은 그대로다.
 
     # strategy·mode·universe_scanned는 추가 필드다(기존 클라이언트는 무시해도 동작한다).
     return {"analysis": data, "all_stocks": rows, "strategy": strategy,
@@ -281,7 +283,8 @@ def get_performance(limit: int = history_store.DEFAULT_LIMIT):
     - `storage_backend`: 이력이 실제로 저장된 곳 — "postgres"(DATABASE_URL 설정) / "sqlite"(로컬 폴백)
     - `summary`: total_picks, evaluated_picks, win_count, win_rate_pct, avg_return_pct,
       best_pick, worst_pick (이력이 없으면 개수 0, 비율 null)
-    - `picks`: 최신 추천부터 ticker·entry_price·current_price·return_pct·is_win·days_held 등
+    - `picks`: 최신 추천부터 `id`(개별 삭제용 정수 PK)·ticker·entry_price·current_price·
+      return_pct·is_win·days_held 등
     현재가는 성적표 조회 시점 기준 최근 종가(5분 캐시)를 쓴다.
     """
     try:
@@ -289,6 +292,69 @@ def get_performance(limit: int = history_store.DEFAULT_LIMIT):
     except Exception as exc:
         logger.warning("성적표 계산 실패: %s: %s", type(exc).__name__, str(exc)[:200])
         return history_store.empty_performance(error="performance_unavailable")
+
+
+@app.post("/api/performance/track")
+def track_performance(req: TrackRequest):
+    """종목 하나를 사용자가 직접 추적 목록에 넣는다(추천 카드의 "📌 추적 추가").
+
+    - `entry_price`가 없거나 0 이하면 최근 종가를 채운다. 가격을 못 받으면 400(잘못된 티커).
+    - 같은 날 같은 `(티커, 전략)`을 다시 넣으면 새 행을 만들지 않고 기존 행을 돌려준다.
+    - 응답: `{"ok": true, "created": bool, "pick": {id, ticker, ..., criteria}}`
+    """
+    ticker = (req.ticker or "").strip().upper()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="ticker_required")
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(status_code=400, detail="invalid_ticker")
+
+    entry = req.entry_price
+    if entry is not None and entry == entry:  # NaN이면 서버가 채운다
+        entry = float(entry)
+    if entry is None or entry <= 0:
+        try:
+            price = history_store.latest_prices([ticker]).get(ticker)
+        except Exception as exc:  # 가격 조회가 죽어도 400으로 깔끔하게 끝낸다
+            logger.warning("추적 진입가 조회 실패 %s: %s", ticker, type(exc).__name__)
+            price = None
+        if not price or price <= 0:
+            raise HTTPException(status_code=400, detail="invalid_ticker")
+        entry = float(price)
+
+    try:
+        out = history_store.record_pick(
+            ticker=ticker,
+            entry_price=entry,
+            strategy=req.strategy or "",
+            mode=req.mode or "watchlist",
+            criteria=req.criteria or "",
+            quant_score=req.quant_score,
+        )
+    except Exception as exc:
+        logger.warning("추적 저장 실패 %s: %s: %s", ticker, type(exc).__name__, str(exc)[:200])
+        raise HTTPException(status_code=503, detail="storage_unavailable")
+
+    if not out.get("pick"):
+        # 저장은 됐는데 행을 못 읽은 경우(경합 등) — 클라이언트가 id를 못 받으므로 재시도를 유도한다.
+        raise HTTPException(status_code=503, detail="track_unavailable")
+    return {"ok": True, "created": out["created"], "pick": out["pick"],
+            "backend": out.get("backend")}
+
+
+@app.delete("/api/performance/{pick_id}")
+def delete_performance_pick(pick_id: int):
+    """성적표 행 **하나만** 지운다. 없으면 404.
+
+    응답: `{"ok": true, "deleted_id": pick_id}`
+    """
+    try:
+        deleted = history_store.delete_pick(pick_id)
+    except Exception as exc:
+        logger.warning("추적 삭제 실패 id=%s: %s: %s", pick_id, type(exc).__name__, str(exc)[:200])
+        raise HTTPException(status_code=503, detail="storage_unavailable")
+    if not deleted:
+        raise HTTPException(status_code=404, detail="pick_not_found")
+    return {"ok": True, "deleted_id": pick_id}
 
 
 @app.get("/api/stock/{ticker}")

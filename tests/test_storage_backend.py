@@ -43,6 +43,8 @@ KST = timezone(timedelta(hours=9))
 
 FIELDS = ("ticker", "recommended_date", "recommended_at", "entry_price",
           "strategy", "mode", "quant_score", "criteria")
+# 조회는 id를 포함한다(id가 있어야 클라이언트가 행 하나를 지울 수 있다).
+SELECT_FIELDS = ("id",) + FIELDS
 
 GOOD_URL = "postgresql://scanner:s3cret@ep-cool-1234.us-east-2.aws.neon.tech/neondb"
 
@@ -67,8 +69,8 @@ class FakeCursor:
 class FakePGConnection:
     """psycopg3 Connection 대역. recommendations 테이블을 dict로 흉내낸다.
 
-    `history_store`가 보내는 SQL의 의미(테이블 생성·upsert·정렬 조회)를 그대로 흉내내므로
-    코드가 파라미터 순서나 충돌 키를 잘못 잡으면 테스트가 깨진다.
+    `history_store`가 보내는 SQL의 의미(테이블 생성·upsert·정렬 조회·단건 조회·단건 삭제)를
+    그대로 흉내내므로 코드가 파라미터 순서나 충돌 키를 잘못 잡으면 테스트가 깨진다.
     """
 
     def __init__(self):
@@ -102,11 +104,22 @@ class FakePGConnection:
             # DO UPDATE는 entry_price·recommended_at을 건드리지 않는다.
             existing.update({"quant_score": score, "mode": mode, "criteria": criteria})
             return FakeCursor([{"inserted": False}])
-        if text.startswith("SELECT ticker"):
+        if text.startswith("SELECT id"):
+            if "WHERE recommended_date" in text:
+                day, ticker, strat = params
+                row = self.rows.get((day, ticker, strat))
+                return FakeCursor([{k: row[k] for k in SELECT_FIELDS}] if row else [])
             limit = params[0]
             ordered = sorted(self.rows.values(),
                              key=lambda r: (r["recommended_date"], r["id"]), reverse=True)
-            return FakeCursor([{k: r[k] for k in FIELDS} for r in ordered[:limit]])
+            return FakeCursor([{k: r[k] for k in SELECT_FIELDS} for r in ordered[:limit]])
+        if text.startswith("DELETE FROM recommendations"):
+            (pid,) = params
+            for key, row in list(self.rows.items()):
+                if row["id"] == pid:
+                    del self.rows[key]
+                    return FakeCursor([{"id": pid}])
+            return FakeCursor([])
         raise AssertionError(f"예상하지 못한 SQL: {text}")
 
     def commit(self):
@@ -353,6 +366,54 @@ class PostgresRecordTests(PostgresCase):
         self.assertEqual(body["storage_backend"], "postgres")
         self.assertEqual(body["summary"]["total_picks"], 0)
 
+    def test_record_pick_returns_id_and_upserts(self):
+        out = history_store.record_pick("aapl", entry_price=100.0, strategy="value",
+                                        mode="watchlist", criteria="수동 추적")
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["created"])
+        self.assertEqual(out["backend"], "postgres")
+        pid = out["pick"]["id"]
+        self.assertIsInstance(pid, int)
+        self.assertEqual((out["pick"]["ticker"], out["pick"]["entry_price"]), ("AAPL", 100.0))
+        self.assertEqual(out["pick"]["criteria"], "수동 추적")
+
+        again = history_store.record_pick("AAPL", entry_price=120.0, strategy="value")
+        self.assertFalse(again["created"])                       # 같은 날·같은 전략은 한 행
+        self.assertEqual(again["pick"]["id"], pid)
+        self.assertEqual(again["pick"]["entry_price"], 100.0)    # 최초 진입가 유지
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_recent_picks_and_performance_include_id(self):
+        history_store.record_picks([{"ticker": "AAPL", "price": 1.0}], strategy="value")
+        row = self.rows()[0]
+        self.assertIn("id", row)
+        self.assertIsInstance(row["id"], int)
+        body = history_store.get_performance(price_fetcher=lambda t: {"AAPL": 1.1})
+        self.assertEqual(body["picks"][0]["id"], row["id"])
+
+    def test_delete_pick_removes_only_target_row(self):
+        a = history_store.record_pick("AAPL", entry_price=1.0, strategy="value")["pick"]["id"]
+        b = history_store.record_pick("MSFT", entry_price=2.0, strategy="value")["pick"]["id"]
+        self.assertTrue(history_store.delete_pick(a))
+        self.assertEqual([r["id"] for r in self.rows()], [b])
+        self.assertFalse(history_store.delete_pick(a))           # 이미 없다
+        self.assertFalse(history_store.delete_pick(0))
+        self.assertFalse(history_store.delete_pick("nope"))
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_delete_sql_is_parameterized_single_row(self):
+        a = history_store.record_pick("AAPL", entry_price=1.0, strategy="value")["pick"]["id"]
+        history_store.delete_pick(a)
+        sql, params = [c for c in self.backend.conn.calls if c[0].startswith("DELETE")][-1]
+        self.assertEqual(params, (a,))
+        self.assertIn("WHERE id = %s", sql)
+        self.assertNotIn("recommended_date", sql)                # 날짜·티커로 지우지 않는다
+
+    def test_delete_failure_rolls_back_and_closes(self):
+        self.backend.fail_with = OSError("could not connect to server")
+        with self.assertRaises(OSError):
+            history_store.delete_pick(1)
+
     def test_connection_failure_surfaces_as_error_not_crash(self):
         self.backend.fail_with = OSError("could not connect to server")
         body = history_store.get_performance(price_fetcher=lambda tickers: {})
@@ -500,6 +561,10 @@ class ApiPostgresFlowTests(PostgresCase):
         self._patch(stock_tools, "get_history", lambda t, p="6mo": make_hist())
         self._patch(api.genai, "Client",
                     lambda: FakeGenai({"market_note": "ok", "top_picks": list(self.PICKS)}))
+        # 성적표·수동 추적의 진입가 조회를 네트워크 없이 고정한다.
+        self._patch(history_store, "_fetch_prices_batch",
+                    lambda tickers: {t: 110.0 for t in tickers})
+        history_store.clear_price_cache()
         self.client = TestClient(api.app)
 
     def _patch(self, target, name, value):
@@ -508,35 +573,79 @@ class ApiPostgresFlowTests(PostgresCase):
         self.addCleanup(p.stop)
         return value
 
-    def test_screen_writes_to_postgres_and_performance_reads_it(self):
+    def test_screen_does_not_write_to_postgres(self):
+        # 자동 기록 제거: 분석만 돌려서는 PostgreSQL에 행이 생기지 않는다.
         resp = self.client.post("/api/screen",
                                 json={"tickers": ["AAPL"], "criteria": "저PER 가치주"})
         self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.backend.conn.rows, {})
+        body = self.client.get("/api/performance").json()
+        self.assertEqual(body["summary"]["total_picks"], 0)
+
+    def test_track_writes_to_postgres_and_performance_reads_it(self):
+        resp = self.client.post("/api/performance/track",
+                                json={"ticker": "AAPL", "entry_price": 100.0,
+                                      "strategy": "value", "mode": "watchlist",
+                                      "quant_score": 88.5, "criteria": "저PER 가치주"})
+        self.assertEqual(resp.status_code, 200)
+        tracked = resp.json()
+        self.assertTrue(tracked["created"])
 
         rows = self.backend.conn.rows
         self.assertEqual(len(rows), 1)                       # SQLite 파일이 아니라 PostgreSQL
         stored = list(rows.values())[0]
         self.assertEqual(stored["ticker"], "AAPL")
-        self.assertEqual(stored["entry_price"], 100.0)       # Gemini의 999가 아니라 서버 종가
+        self.assertEqual(stored["entry_price"], 100.0)
+        self.assertEqual(stored["id"], tracked["pick"]["id"])
 
-        self._patch(history_store, "_fetch_prices_batch", lambda tickers: {"AAPL": 110.0})
-        history_store.clear_price_cache()
         body = self.client.get("/api/performance").json()
         self.assertEqual(body["storage_backend"], "postgres")
         self.assertEqual(body["summary"]["total_picks"], 1)
-        self.assertAlmostEqual(body["picks"][0]["return_pct"], 10.0)
+        self.assertEqual(body["picks"][0]["id"], tracked["pick"]["id"])
+        self.assertAlmostEqual(body["picks"][0]["return_pct"], 10.0)   # 110/100
+
+    def test_track_without_price_uses_latest_close_on_postgres(self):
+        resp = self.client.post("/api/performance/track", json={"ticker": "AAPL"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["pick"]["entry_price"], 110.0)
+        self.assertEqual(list(self.backend.conn.rows.values())[0]["entry_price"], 110.0)
+
+    def test_delete_removes_row_from_postgres(self):
+        a = self.client.post("/api/performance/track",
+                             json={"ticker": "AAPL", "entry_price": 100.0,
+                                   "strategy": "value"}).json()["pick"]["id"]
+        self.client.post("/api/performance/track",
+                         json={"ticker": "MSFT", "entry_price": 200.0, "strategy": "value"})
+        resp = self.client.delete(f"/api/performance/{a}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"ok": True, "deleted_id": a})
+        self.assertEqual(sorted(r["ticker"] for r in self.backend.conn.rows.values()), ["MSFT"])
+        self.assertEqual(self.client.delete(f"/api/performance/{a}").status_code, 404)
 
     def test_screen_survives_postgres_outage(self):
         self.backend.fail_with = OSError("could not connect to server")
         resp = self.client.post("/api/screen",
                                 json={"tickers": ["AAPL"], "criteria": "저PER 가치주"})
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 200)          # 화면 분석은 DB와 무관
         self.assertEqual(len(resp.json()["analysis"]["top_picks"]), 1)
 
         body = self.client.get("/api/performance").json()
         self.assertEqual(body["summary"]["total_picks"], 0)
         self.assertEqual(body["error"], "history_unavailable")
         self.assertEqual(body["storage_backend"], "postgres")
+
+    def test_track_reports_postgres_outage_as_503(self):
+        self.backend.fail_with = OSError("could not connect to server")
+        resp = self.client.post("/api/performance/track",
+                                json={"ticker": "AAPL", "entry_price": 100.0})
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.json()["detail"], "storage_unavailable")
+
+    def test_delete_reports_postgres_outage_as_503(self):
+        self.backend.fail_with = OSError("could not connect to server")
+        resp = self.client.delete("/api/performance/1")
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.json()["detail"], "storage_unavailable")
 
 
 if __name__ == "__main__":

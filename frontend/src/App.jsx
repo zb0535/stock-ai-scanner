@@ -67,6 +67,12 @@ const fmtPct = (v) =>
 const retClass = (v) =>
   v === null || v === undefined ? "flat" : v > 0 ? "up" : v < 0 ? "down" : "flat";
 
+// 서버가 기록하는 추천일은 KST 기준 YYYY-MM-DD다. 브라우저 시간대와 무관하게 같은 날짜를 만든다.
+const kstToday = () =>
+  new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+const upper = (v) => String(v || "").trim().toUpperCase();
+
 const PRESETS = [
   {
     label: "🔥 상승 추세 · 저과열",
@@ -103,6 +109,8 @@ export default function App() {
   const [perf, setPerf] = useState(null);
   const [perfLoading, setPerfLoading] = useState(false);
   const [perfError, setPerfError] = useState("");
+  const [tracking, setTracking] = useState("");   // 추적 요청 중인 티커
+  const [deleting, setDeleting] = useState(null); // 삭제 요청 중인 pick id
 
   const loadPerformance = async () => {
     setPerfLoading(true);
@@ -116,6 +124,75 @@ export default function App() {
     } finally {
       setPerfLoading(false);
     }
+  };
+
+  // 사용자가 고른 픽만 성적표에 기록한다(분석 실행만으로는 기록되지 않는다).
+  const trackPick = async (pick) => {
+    const ticker = upper(pick?.ticker);
+    if (!ticker || tracking) return;
+    setTracking(ticker);
+    setPerfError("");
+    try {
+      // 진입가는 서버가 계산한 최신 종가(all_stocks)를 우선 보낸다.
+      const serverPrice = (result?.all_stocks || [])
+        .find((s) => upper(s.ticker) === ticker)?.price;
+      const entry = serverPrice ?? pick?.price ?? null;
+      const res = await fetch(`${API_BASE}/api/performance/track`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ticker,
+          entry_price: typeof entry === "number" && entry > 0 ? entry : null,
+          strategy: result?.strategy || "",
+          mode: result?.mode || mode,
+          quant_score: pick?.quant_score ?? null,
+          criteria,
+        }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(
+          data.detail === "invalid_ticker"
+            ? "가격을 확인할 수 없는 종목이라 추적할 수 없습니다."
+            : `추적 추가 실패 (${res.status})`
+        );
+      }
+      await loadPerformance();
+    } catch (err) {
+      setPerfError(err.message);
+    } finally {
+      setTracking("");
+    }
+  };
+
+  // 성적표 행 하나만 지운다.
+  const deletePick = async (id) => {
+    if (id === null || id === undefined || deleting !== null) return;
+    setDeleting(id);
+    setPerfError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/performance/${id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(
+          data.detail === "pick_not_found"
+            ? "이미 삭제된 항목입니다."
+            : `삭제 실패 (${res.status})`
+        );
+      }
+      await loadPerformance();
+    } catch (err) {
+      setPerfError(err.message);
+    } finally {
+      setDeleting(null);
+    }
+  };
+
+  // 발굴·추천된 종목을 내 관심 종목 풀에 바로 넣는다(localStorage에 함께 저장된다).
+  const addToWatchlist = (ticker) => {
+    const sym = upper(ticker);
+    if (!sym) return;
+    setTickers((prev) => (prev.includes(sym) ? prev : [...prev, sym]));
   };
 
   const openDetail = async (pick) => {
@@ -209,7 +286,7 @@ export default function App() {
       });
       if (!res.ok) throw new Error(`서버 오류 (${res.status})`);
       setResult(await res.json());
-      loadPerformance(); // 이번 추천이 성적표에 바로 반영되도록
+      // 분석은 이력을 남기지 않는다. 카드의 "📌 추적 추가"를 누를 때만 성적표에 쌓인다.
     } catch (err) {
       setError(err.message);
     } finally {
@@ -232,6 +309,15 @@ export default function App() {
   };
   const perfPicks = perf?.picks || [];
   const lossCount = perfSummary.evaluated_picks - perfSummary.win_count;
+
+  // 오늘(KST)·같은 전략으로 이미 추적 중인지 성적표 응답으로 판단한다.
+  const today = kstToday();
+  const trackedSet = new Set(
+    perfPicks.map((p) => `${p.recommended_date}|${upper(p.ticker)}|${p.strategy || ""}`)
+  );
+  const isTracked = (ticker) =>
+    trackedSet.has(`${today}|${upper(ticker)}|${result?.strategy || ""}`);
+  const inWatchlist = (ticker) => tickers.includes(upper(ticker));
 
   return (
     <div className="shell">
@@ -321,7 +407,7 @@ export default function App() {
             <div>
               <h2 className="score-title">📊 AI 추천 성적표</h2>
               <p className="score-sub">
-                추천한 종목을 진입가 대비 현재가로 추적합니다 · 최근 {perfSummary.total_picks}건
+                직접 추적에 추가한 종목만 진입가 대비 현재가로 평가합니다 · 최근 {perfSummary.total_picks}건
                 {perf?.as_of && ` · 기준 ${perf.as_of.slice(5, 10)} ${perf.as_of.slice(11, 16)}`}
               </p>
             </div>
@@ -363,12 +449,12 @@ export default function App() {
               <table>
                 <thead>
                   <tr>
-                    <th>추천일</th><th>티커</th><th>전략</th><th>진입가</th><th>현재가</th><th>수익률</th><th>보유</th>
+                    <th>추천일</th><th>티커</th><th>전략</th><th>진입가</th><th>현재가</th><th>수익률</th><th>보유</th><th aria-label="삭제" />
                   </tr>
                 </thead>
                 <tbody>
                   {perfPicks.map((p) => (
-                    <tr key={`${p.recommended_date}-${p.ticker}-${p.strategy}`}>
+                    <tr key={p.id ?? `${p.recommended_date}-${p.ticker}-${p.strategy}`}>
                       <td>{p.recommended_date?.slice(5)}</td>
                       <td>
                         <strong>{p.ticker}</strong>
@@ -385,6 +471,18 @@ export default function App() {
                         </span>
                       </td>
                       <td>{p.days_held === null || p.days_held === undefined ? "-" : `${p.days_held}일`}</td>
+                      <td>
+                        <button
+                          type="button"
+                          className="del-btn"
+                          title={`${p.ticker} 추적 삭제`}
+                          aria-label={`${p.ticker} 추적 삭제`}
+                          disabled={deleting === p.id || p.id === null || p.id === undefined}
+                          onClick={() => deletePick(p.id)}
+                        >
+                          🗑️
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -394,7 +492,7 @@ export default function App() {
             <div className="score-empty">
               {perfLoading
                 ? "성적표를 불러오는 중..."
-                : "아직 추적 중인 추천이 없습니다. 위에서 AI 분석을 실행하면 추천 종목이 자동으로 기록됩니다."}
+                : "아직 추적 중인 종목이 없습니다. 위 추천 카드의 📌 추적 추가를 누르면 이곳에 쌓입니다."}
             </div>
           )}
         </section>
@@ -433,6 +531,29 @@ export default function App() {
                       <div className="ticker">{pick.ticker}</div>
                     </div>
                     <div className="price">${pick.price.toLocaleString()}</div>
+                  </div>
+
+                  <div className="card-actions">
+                    <button
+                      type="button"
+                      className={`track-btn ${isTracked(pick.ticker) ? "on" : ""}`}
+                      disabled={isTracked(pick.ticker) || tracking === upper(pick.ticker)}
+                      title="이 종목을 AI 추천 성적표에 기록"
+                      onClick={(e) => { e.stopPropagation(); trackPick(pick); }}
+                    >
+                      {isTracked(pick.ticker)
+                        ? "✅ 추적 중"
+                        : tracking === upper(pick.ticker) ? "추적 중..." : "📌 추적 추가"}
+                    </button>
+                    <button
+                      type="button"
+                      className={`watch-btn ${inWatchlist(pick.ticker) ? "on" : ""}`}
+                      disabled={inWatchlist(pick.ticker)}
+                      title="내 관심 종목 풀에 추가"
+                      onClick={(e) => { e.stopPropagation(); addToWatchlist(pick.ticker); }}
+                    >
+                      {inWatchlist(pick.ticker) ? "✓ 관심 중" : "+ 관심 종목"}
+                    </button>
                   </div>
 
                   <div className="chart-wrap">
@@ -484,7 +605,7 @@ export default function App() {
                 <table>
                   <thead>
                     <tr>
-                      <th>티커</th><th>현재가</th><th>20일선</th><th>60일선</th><th>RSI(14)</th><th>추세</th><th>PER</th>
+                      <th>티커</th><th>현재가</th><th>20일선</th><th>60일선</th><th>RSI(14)</th><th>추세</th><th>PER</th><th aria-label="관심 종목">관심</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -497,6 +618,17 @@ export default function App() {
                         <td>{s.rsi14 ?? "-"}</td>
                         <td>{s.trend}</td>
                         <td>{s.trailing_pe ? s.trailing_pe.toFixed(1) : "-"}</td>
+                        <td>
+                          <button
+                            type="button"
+                            className={`watch-btn mini ${inWatchlist(s.ticker) ? "on" : ""}`}
+                            disabled={inWatchlist(s.ticker)}
+                            title={`${s.ticker} 관심 종목에 추가`}
+                            onClick={() => addToWatchlist(s.ticker)}
+                          >
+                            {inWatchlist(s.ticker) ? "✓ 관심 중" : "+ 관심"}
+                          </button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -585,6 +717,27 @@ export default function App() {
             <div className="modal-head">
               <h2>{detail.ticker} 상세 분석 · 참고선</h2>
               <button type="button" onClick={() => setDetail(null)}>✕</button>
+            </div>
+
+            <div className="detail-actions">
+              <button
+                type="button"
+                className={`track-btn ${isTracked(detail.ticker) ? "on" : ""}`}
+                disabled={isTracked(detail.ticker) || tracking === upper(detail.ticker)}
+                onClick={() => trackPick(detail)}
+              >
+                {isTracked(detail.ticker)
+                  ? "✅ 추적 중"
+                  : tracking === upper(detail.ticker) ? "추적 중..." : "📌 추적 추가"}
+              </button>
+              <button
+                type="button"
+                className={`watch-btn ${inWatchlist(detail.ticker) ? "on" : ""}`}
+                disabled={inWatchlist(detail.ticker)}
+                onClick={() => addToWatchlist(detail.ticker)}
+              >
+                {inWatchlist(detail.ticker) ? "✓ 관심 중" : "+ 관심 종목"}
+              </button>
             </div>
 
             <div className="modal-list">

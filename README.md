@@ -24,13 +24,23 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   기본값은 `"watchlist"`라 기존 클라이언트는 그대로 동작한다. 첫 스캔은 수십 초, 이후 1시간은 캐시.
   종목 목록은 Wikipedia(8초 타임아웃) → 실패 시 내장 503종목 폴백으로 항상 채워진다.
 - Recharts 인터랙티브 차트 및 최근 뉴스 요약
-- **AI 추천 성적표**(`history_store.py`): `/api/screen`이 추천을 돌려줄 때마다 `top_picks`를 SQLite에
-  자동 기록하고, `GET /api/performance`가 현재가와 비교해 **적중률·평균 수익률**을 계산한다.
+- **AI 추천 성적표**(`history_store.py`): 사용자가 **직접 고른 픽만** 추적해 현재가와 비교하는
+  적중률·평균 수익률 표다. `/api/screen`은 이제 이력을 남기지 않는다(분석만 돌려도 성적표가
+  오염되던 자동 기록 제거).
+  - **`POST /api/performance/track`** — 픽 하나를 추적에 추가한다. 본문
+    `{"ticker": "NVDA", "entry_price": 150.96, "strategy": "oversold", "mode": "watchlist",
+    "quant_score": 92.0, "criteria": "..."}`. `entry_price`는 선택이며, 없거나 0 이하면 서버가
+    최신 종가를 채운다(가격을 못 받으면 400 `invalid_ticker`). 응답은
+    `{"ok": true, "created": bool, "pick": {id, ticker, ...}}`(같은 날 같은 티커·전략은 기존 행 반환).
+  - **`DELETE /api/performance/{id}`** — 그 `id` 행 **하나만** 삭제한다.
+    응답 `{"ok": true, "deleted_id": id}`, 없으면 404. 저장소 장애는 503.
+  - `GET /api/performance`의 `picks` 각 항목은 `id`(정수 PK)를 포함한다 — 웹 성적표의 행별 🗑️가 이 값으로 지운다.
   - 저장: `ticker`·`recommended_date`(KST YYYY-MM-DD)·`recommended_at`(ISO)·`entry_price`·`strategy`·
     `mode`·`quant_score`·`criteria`. 진입가는 Gemini가 적은 값이 아니라 서버가 계산한 최신 종가를 쓴다.
   - 같은 날 같은 `(date, ticker, strategy)`는 한 행만 남긴다(첫 진입가·첫 시각 유지, 점수·mode·criteria만 갱신).
   - DB 경로: `HISTORY_DB_PATH` 환경변수 > `data/recommendations.db`(부모 폴더 자동 생성) >
-    만들 수 없으면 `/tmp/stock_scanner_history.db`. DB 쓰기가 실패해도 `/api/screen`은 정상 응답한다.
+    만들 수 없으면 `/tmp/stock_scanner_history.db`. DB 쓰기가 실패해도 `/api/screen`은 정상 응답한다
+    (분석과 저장이 분리됐다 — 저장 실패는 `/api/performance/track`의 503으로만 드러난다).
   - **외부 PostgreSQL(선택)**: `DATABASE_URL`(Neon·Supabase·Render Postgres, `postgres://`/`postgresql://`)이
     설정돼 있으면 SQLite 대신 PostgreSQL에 기록한다. 테이블(`recommendations`)과 인덱스는 첫 사용 시
     자동 생성되며, `(recommended_date, ticker, strategy)` 충돌 시 `ON CONFLICT ... DO UPDATE`로
@@ -44,7 +54,10 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   - 응답: `{"summary": {total_picks, evaluated_picks, win_count, win_rate_pct, avg_return_pct,
     best_pick, worst_pick}, "picks": [...], "as_of", "limit"}`. 이력이 비면 개수 0·비율 `null`.
     픽별로 `entry_price`·`current_price`·`return_pct`·`is_win`(return > 0)·`days_held`가 붙는다.
-  - 웹 UI 상단에 **📊 AI 추천 성적표** 패널(요약 3개 지표 + 추천 이력 표 + 새로고침)이 있다.
+  - 웹 UI 상단에 **📊 AI 추천 성적표** 패널(요약 3개 지표 + 추천 이력 표 + 행별 삭제 + 새로고침)이 있다.
+    추천 카드(TOP 1~3)와 상세 모달에는 **📌 추적 추가 / ✅ 추적 중** 버튼이 있고, 같은 카드에서
+    **+ 관심 종목 / ✓ 관심 중**으로 발굴된 종목을 관심 종목 풀(localStorage)에 바로 담을 수 있다.
+    `전체 N개 종목 원본 지표 비교표`의 각 행에도 `+ 관심` 버튼이 있다.
   - ⚠️ Render 무료 플랜은 영구 디스크가 없어 재배포·재시작 시 이력 파일이 초기화된다.
     위 `DATABASE_URL`(Neon 등 무료 PostgreSQL)을 넣으면 재배포에도 이력이 남는다.
     굳이 파일로 유지하려면 Render Persistent Disk를 붙이고 `HISTORY_DB_PATH=/var/data/recommendations.db`처럼 지정한다.

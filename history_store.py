@@ -1,6 +1,10 @@
 """AI 추천 성적표 — 추천 이력 저장(SQLite 또는 외부 PostgreSQL)과 수익률·적중률 계산.
 
 설계 원칙
+- **사용자가 고른 종목만 기록한다**: `/api/screen`은 이력을 남기지 않고, 클라이언트가
+  `POST /api/performance/track`으로 픽 하나를 지정해 추적을 시작한다. `DELETE
+  /api/performance/{id}`로 행 하나만 지운다. 성적표 조회(`GET /api/performance`)는 픽마다
+  `id`(정수 PK)를 포함해 개별 삭제가 가능하다.
 - 선택적 외부 DB: `DATABASE_URL`(postgres:// 또는 postgresql://)이 설정돼 있으면 PostgreSQL에
   기록한다(Neon·Supabase·Render Postgres 호환). 설정이 없으면 예전처럼 SQLite를 쓴다.
 - 가볍게(로컬 폴백): SQLite 경로는 `HISTORY_DB_PATH` 환경변수로 바꿀 수 있고,
@@ -9,7 +13,7 @@
 - 스크리닝을 망치지 않게: 모든 DB 함수는 예외를 그대로 올리되, `api.py`는 호출부에서
   감싸 경고만 남긴다. 저장이 실패해도 `/api/screen` 응답은 그대로 나간다.
 - 같은 날 중복 금지: `(recommended_date, ticker, strategy)` UNIQUE. 같은 조건으로 하루에
-  여러 번 분석해도 행은 하나이며, 처음 기록한 `entry_price`·`recommended_at`을 유지한다
+  여러 번 추적해도 행은 하나이며, 처음 기록한 `entry_price`·`recommended_at`을 유지한다
   (진입가는 최초 추천 시점의 값이어야 수익률이 왜곡되지 않는다). 점수·mode·criteria만 갱신.
 - 평가는 배치: 현재가는 `yf.download` 한 번(최대 50종목)으로 받아 5분 메모리 캐시한다.
   `t.info`는 절대 부르지 않는다(Yahoo 429/401 차단 회피, 응답 속도).
@@ -115,11 +119,22 @@ SET quant_score = EXCLUDED.quant_score,
 RETURNING (xmax = 0) AS inserted
 """
 
+# 조회·삭제가 함께 쓰는 컬럼 목록. `id`(정수 PK)를 항상 포함해야 클라이언트가 행을 개별 삭제할 수 있다.
+PICK_COLUMNS = ("id, ticker, recommended_date, recommended_at, entry_price, strategy, "
+                "mode, quant_score, criteria")
+
 PG_SELECT = (
-    f"SELECT ticker, recommended_date, recommended_at, entry_price, strategy, "
-    f"       mode, quant_score, criteria "
-    f"FROM {TABLE} ORDER BY recommended_date DESC, id DESC LIMIT %s"
+    f"SELECT {PICK_COLUMNS} FROM {TABLE} "
+    f"ORDER BY recommended_date DESC, id DESC LIMIT %s"
 )
+
+PG_SELECT_ONE = (
+    f"SELECT {PICK_COLUMNS} FROM {TABLE} "
+    f"WHERE recommended_date = %s AND ticker = %s AND strategy = %s LIMIT 1"
+)
+
+# RETURNING id — 지운 행이 없으면 결과가 비어 404 판단에 쓴다.
+PG_DELETE = f"DELETE FROM {TABLE} WHERE id = %s RETURNING id"
 
 # 외부 DB 연결 타임아웃(초). 무료 티어가 잠들었다 깨는 시간을 넉넉히 준다.
 PG_CONNECT_TIMEOUT = 10
@@ -398,7 +413,7 @@ def _record_picks_pg(rows: list[tuple], day: str, skipped: int) -> dict:
             conn.close()
     logger.info("추천 이력(postgres) %s: 신규 %d · 갱신 %d · 제외 %d", day, inserted, updated, skipped)
     return {"inserted": inserted, "updated": updated, "skipped": skipped,
-            "db_path": redact_database_url(), "backend": "postgres"}
+            "db_path": redact_database_url(), "backend": "postgres", "date": day}
 
 
 def record_picks(
@@ -424,7 +439,7 @@ def record_picks(
 
     if not rows:
         return {"inserted": 0, "updated": 0, "skipped": skipped, "db_path": None,
-                "backend": storage_backend(db_path)}
+                "backend": storage_backend(db_path), "date": day}
 
     if storage_backend(db_path) == "postgres":
         return _record_picks_pg(rows, day, skipped)
@@ -456,7 +471,7 @@ def record_picks(
             conn.close()
     logger.info("추천 이력 %s: 신규 %d · 갱신 %d · 제외 %d", day, inserted, updated, skipped)
     return {"inserted": inserted, "updated": updated, "skipped": skipped, "db_path": path,
-            "backend": "sqlite"}
+            "backend": "sqlite", "date": day}
 
 
 def recent_picks(limit: int = DEFAULT_LIMIT, db_path: str | None = None) -> list[dict]:
@@ -471,14 +486,110 @@ def recent_picks(limit: int = DEFAULT_LIMIT, db_path: str | None = None) -> list
     conn = _connect(db_path)
     try:
         cur = conn.execute(
-            f"SELECT ticker, recommended_date, recommended_at, entry_price, strategy, "
-            f"       mode, quant_score, criteria "
-            f"FROM {TABLE} ORDER BY recommended_date DESC, id DESC LIMIT ?",
+            f"SELECT {PICK_COLUMNS} FROM {TABLE} "
+            f"ORDER BY recommended_date DESC, id DESC LIMIT ?",
             (n,),
         )
         return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
+
+
+# --- 수동 추적(개별 추가)·개별 삭제 -------------------------------------------
+
+
+def _lookup_pick(ticker: str, day: str, strategy: str,
+                 db_path: str | None = None) -> dict | None:
+    """`(날짜, 티커, 전략)` 한 행을 `id`까지 붙여 돌려준다(없으면 None)."""
+    if storage_backend(db_path) == "postgres":
+        conn = _pg_connect()
+        try:
+            row = conn.execute(PG_SELECT_ONE, (day, ticker, strategy)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute(
+            f"SELECT {PICK_COLUMNS} FROM {TABLE} "
+            "WHERE recommended_date = ? AND ticker = ? AND strategy = ? LIMIT 1",
+            (day, ticker, strategy),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def record_pick(
+    ticker: str,
+    entry_price: Any = None,
+    strategy: str = "",
+    mode: str = "",
+    criteria: str = "",
+    quant_score: Any = None,
+    recommended_date: str | None = None,
+    recommended_at: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """종목 한 개를 **사용자가 직접** 추적 목록에 넣는다(`POST /api/performance/track`).
+
+    `record_picks`와 같은 테이블·같은 중복 규칙을 쓰므로, 같은 날 같은 `(티커, 전략)`을 다시
+    추적하면 행이 늘지 않고 기존 행(첫 진입가·첫 시각)이 그대로 돌아온다.
+    반환: `{"ok": True, "created": bool, "pick": {id, ticker, ...}, "inserted", "updated"}`
+    """
+    sym = _clean(ticker).upper()
+    if not sym:
+        raise ValueError("ticker_required")
+    out = record_picks(
+        [{"ticker": sym, "entry_price": entry_price, "quant_score": quant_score}],
+        strategy=strategy, mode=mode, criteria=criteria,
+        recommended_date=recommended_date, recommended_at=recommended_at, db_path=db_path,
+    )
+    pick = _lookup_pick(sym, out["date"], _clean(strategy), db_path) if out["inserted"] or out["updated"] else None
+    return {"ok": pick is not None, "created": out["inserted"] > 0, "pick": pick,
+            "inserted": out["inserted"], "updated": out["updated"],
+            "date": out["date"], "backend": out["backend"]}
+
+
+def delete_pick(pick_id: Any, db_path: str | None = None) -> bool:
+    """`id`가 일치하는 행 **하나만** 지운다. 지운 행이 없으면 False(→ 404).
+
+    정수로 해석되지 않거나 1 미만인 값은 DB를 건드리지 않고 False다.
+    """
+    try:
+        pid = int(pick_id)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(pick_id, bool) or pid <= 0:
+        return False
+
+    if storage_backend(db_path) == "postgres":
+        with _WRITE_LOCK:
+            conn = _pg_connect()
+            try:
+                found = conn.execute(PG_DELETE, (pid,)).fetchone() is not None
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        if found:
+            logger.info("추천 이력 삭제(postgres): id=%s", pid)
+        return found
+
+    with _WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            with conn:
+                cur = conn.execute(f"DELETE FROM {TABLE} WHERE id = ?", (pid,))
+                found = cur.rowcount > 0
+        finally:
+            conn.close()
+    if found:
+        logger.info("추천 이력 삭제: id=%s", pid)
+    return found
 
 
 # --- 현재가 배치 조회 --------------------------------------------------------
@@ -616,6 +727,7 @@ def _evaluate(pick: dict, current_price: float | None, today: date) -> dict:
         days_held = None
 
     return {
+        "id": pick.get("id"),
         "ticker": pick.get("ticker"),
         "recommended_date": pick.get("recommended_date"),
         "recommended_at": pick.get("recommended_at"),
