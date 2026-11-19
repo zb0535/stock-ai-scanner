@@ -136,21 +136,22 @@ def get_history(ticker: str, period: str = "6mo"):
 
 
 def _fetch_info(sym: str):
-    """t.info를 조회합니다. 실패(예외·빈 응답·쿨다운) 시 None."""
+    """t.info를 조회합니다. 반환: (info 또는 None, 실패 사유 문자열 또는 None)."""
     if _info_in_cooldown():
-        return None
+        return None, "t.info 쿨다운(연속 실패) 중"
     try:
         info = yf.Ticker(sym).info
     except Exception as exc:
         _note_info_failure()
-        logger.warning("%s: t.info 실패 → %s: %s", sym, type(exc).__name__, str(exc)[:200])
-        return None
+        reason = f"{type(exc).__name__}: {str(exc)[:120]}"
+        logger.warning("%s: t.info 실패 → %s", sym, reason)
+        return None, reason
     if not isinstance(info, dict) or not info:
         _note_info_failure()
         logger.warning("%s: t.info 빈 응답(재무 지표 미수신)", sym)
-        return None
+        return None, "t.info 빈 응답"
     _note_info_success()
-    return info
+    return info, None
 
 
 def _metrics_ttl(payload: dict) -> float:
@@ -186,7 +187,7 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
             trend = "횡보/혼조"
 
     # --- 재무 지표: 실패해도 차트 지표는 그대로 살린다 ---
-    info = _fetch_info(sym)
+    info, info_error = _fetch_info(sym)
     fresh = {key: _to_number((info or {}).get(src)) for key, src in _FIN_FIELDS.items()}
     fresh_ok = any(value is not None for value in fresh.values())
     cached_payload = cached_payload or {}
@@ -226,6 +227,8 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
         payload["financials_note"] = "재무 지표 일시 미수신(Yahoo API 제한) — 직전 조회값 유지, 가격·이평선·RSI는 최신"
     elif not financials_available:
         payload["financials_note"] = "재무 지표 일시 미수신(Yahoo API 제한) — 가격·이평선·RSI만 유효"
+    if info_error and not financials_available:
+        payload["financials_error"] = info_error
     return payload
 
 
