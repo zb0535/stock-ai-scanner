@@ -6,6 +6,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pandas as pd
 import yfinance as yf
 
 import finnhub_client
@@ -120,6 +121,190 @@ def _calc_rsi(close_series, period: int = 14) -> float | None:
     return round(100 - (100 / (1 + rs)), 2)
 
 
+# --- 고급 기술적 지표 -------------------------------------------------------
+# 모두 이미 받아 둔 6개월 일봉(get_history)만으로 계산한다 → 추가 네트워크 호출 0회.
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+MACD_CROSS_LOOKBACK = 3   # 크로스 판정은 최근 3봉 이내
+BB_PERIOD = 20
+BB_STD = 2.0
+VOLUME_WINDOW = 20
+
+# get_stock_metrics 응답에 추가되는 지표 키(기존 키는 그대로 둔다).
+INDICATOR_FIELDS = (
+    "macd", "macd_signal", "macd_hist", "macd_cross", "macd_state",
+    "bb_upper", "bb_lower", "bb_pct_b",
+    "volume_ratio", "drawdown_from_high_pct", "range_position_pct",
+)
+
+
+def _empty_indicators() -> dict:
+    """지표를 계산할 수 없을 때의 기본값. 숫자는 None, 크로스/상태는 문자열로 둔다."""
+    out = {field: None for field in INDICATOR_FIELDS}
+    out["macd_cross"] = "none"
+    return out
+
+
+def _last_number(series_like):
+    """Series의 마지막 값을 JSON 호환 float 또는 None으로 바꿉니다."""
+    try:
+        if series_like is None or len(series_like) == 0:
+            return None
+        return _to_number(series_like.iloc[-1])
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _macd_cross(macd_hist, lookback: int = MACD_CROSS_LOOKBACK) -> str:
+    """최근 lookback봉 안에 MACD가 시그널선을 넘었는지 판정합니다.
+
+    히스토그램 부호가 -/0 → +로 바뀌면 "bullish"(골든크로스), +/0 → -로 바뀌면
+    "bearish"(데드크로스)다. 최근 구간에 크로스가 없으면 "none".
+    (현재 MACD가 시그널 위/아래인지는 macd_state가 따로 알려준다.)
+    """
+    if macd_hist is None or len(macd_hist) < 2:
+        return "none"
+    tail = list(macd_hist.tail(max(2, lookback) + 1))
+    for i in range(len(tail) - 1, 0, -1):
+        prev, cur = tail[i - 1], tail[i]
+        if pd.isna(prev) or pd.isna(cur):
+            continue
+        if prev <= 0 < cur:
+            return "bullish"
+        if prev >= 0 > cur:
+            return "bearish"
+    return "none"
+
+
+def _calc_macd(close_series, fast: int = MACD_FAST, slow: int = MACD_SLOW,
+               signal: int = MACD_SIGNAL) -> dict:
+    """MACD(12,26,9): macd·macd_signal·macd_hist·macd_cross·macd_state."""
+    out = {"macd": None, "macd_signal": None, "macd_hist": None,
+           "macd_cross": "none", "macd_state": None}
+    if close_series is None or len(close_series) < slow + signal:
+        return out
+    try:
+        macd_line = (close_series.ewm(span=fast, adjust=False).mean()
+                     - close_series.ewm(span=slow, adjust=False).mean())
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        hist = macd_line - signal_line
+    except Exception:  # dtype 문제 등 — 지표만 비우고 나머지는 살린다
+        return out
+    macd_last = _last_number(macd_line)
+    signal_last = _last_number(signal_line)
+    hist_last = _last_number(hist)
+    if macd_last is None or signal_last is None or hist_last is None:
+        return out
+    out.update({
+        "macd": round(macd_last, 4),
+        "macd_signal": round(signal_last, 4),
+        "macd_hist": round(hist_last, 4),
+        "macd_cross": _macd_cross(hist),
+        "macd_state": "above" if hist_last > 0 else ("below" if hist_last < 0 else "equal"),
+    })
+    return out
+
+
+def _calc_bollinger(close_series, period: int = BB_PERIOD, num_std: float = BB_STD) -> dict:
+    """볼린저 밴드(20, 2σ): bb_upper·bb_lower·bb_pct_b.
+
+    bb_pct_b = (현재가 - 하단) / (상단 - 하단). 0 미만이면 하단 이탈(과매도 후보),
+    1 초과면 상단 이탈. 밴드 폭이 0이면(가격 완전 고정) None.
+    """
+    out = {"bb_upper": None, "bb_lower": None, "bb_pct_b": None}
+    if close_series is None or len(close_series) < period:
+        return out
+    window = close_series.tail(period)
+    if window.isna().any():
+        return out
+    try:
+        mid = float(window.mean())
+        sd = float(window.std(ddof=0))  # 표준 볼린저 밴드는 모집단 표준편차
+        price = float(close_series.iloc[-1])
+    except (TypeError, ValueError):
+        return out
+    if math.isnan(mid) or math.isnan(sd) or math.isnan(price):
+        return out
+    upper, lower = mid + num_std * sd, mid - num_std * sd
+    span = upper - lower
+    pct_b = None if span <= 0 else (price - lower) / span
+    out.update({
+        "bb_upper": round(upper, 2),
+        "bb_lower": round(lower, 2),
+        "bb_pct_b": None if pct_b is None else round(pct_b, 4),
+    })
+    return out
+
+
+def _calc_volume_ratio(volume_series, window: int = VOLUME_WINDOW):
+    """거래량 급증 배수 = 최근 거래량 / 직전 20거래일 평균 거래량.
+
+    평균에서 당일을 뺀다(당일이 평균을 끌어올려 배수를 희석하는 것을 막는다).
+    거래량이 없거나(NaN) 평균이 0이면 None.
+    """
+    if volume_series is None or len(volume_series) < 2:
+        return None
+    try:
+        tail = volume_series.tail(window + 1).astype("float64")
+    except (TypeError, ValueError):
+        return None
+    last = _to_number(tail.iloc[-1])
+    base = _to_number(tail.iloc[:-1].mean())
+    if last is None or base is None or base <= 0:
+        return None
+    return round(last / base, 2)
+
+
+def _calc_range_position(close_series, high_series=None, low_series=None) -> dict:
+    """6개월 고저 대비 위치.
+
+    drawdown_from_high_pct: 6개월 최고가 대비 현재가 (예: -12.5 = 고점에서 12.5% 아래)
+    range_position_pct: 6개월 최저~최고 구간에서 현재가의 위치 0~100%
+    High/Low 컬럼이 있으면 장중 고저를, 없으면 종가로 계산한다.
+    """
+    out = {"drawdown_from_high_pct": None, "range_position_pct": None}
+    if close_series is None or len(close_series) < 2:
+        return out
+    price = _last_number(close_series)
+    if price is None or price <= 0:
+        return out
+    highs = high_series if high_series is not None and len(high_series) == len(close_series) else close_series
+    lows = low_series if low_series is not None and len(low_series) == len(close_series) else close_series
+    if highs is None or lows is None or len(highs.dropna()) == 0 or len(lows.dropna()) == 0:
+        return out
+    high = _to_number(highs.max())
+    low = _to_number(lows.min())
+    if high is None or low is None or high <= 0 or low <= 0 or high < low:
+        return out
+    out["drawdown_from_high_pct"] = round((price - high) / high * 100.0, 2)
+    if high > low:
+        position = (price - low) / (high - low) * 100.0
+        out["range_position_pct"] = round(min(100.0, max(0.0, position)), 2)
+    return out
+
+
+def compute_advanced_indicators(hist) -> dict:
+    """6개월 일봉으로 MACD·볼린저·거래량 배수·고점 대비·구간 위치를 한 번에 계산합니다.
+
+    네트워크를 타지 않으며, 데이터가 짧거나 비어 있으면 None/"none"으로 채운다.
+    반환 dict의 키는 INDICATOR_FIELDS와 같다.
+    """
+    out = _empty_indicators()
+    if hist is None or getattr(hist, "empty", True) or "Close" not in getattr(hist, "columns", []):
+        return out
+    close = hist["Close"].astype("float64")
+    high = hist["High"].astype("float64") if "High" in hist.columns else None
+    low = hist["Low"].astype("float64") if "Low" in hist.columns else None
+    volume = hist["Volume"].astype("float64") if "Volume" in hist.columns else None
+
+    out.update(_calc_macd(close))
+    out.update(_calc_bollinger(close))
+    out["volume_ratio"] = _calc_volume_ratio(volume)
+    out.update(_calc_range_position(close, high, low))
+    return out
+
+
 def _note_info_failure() -> None:
     global _info_fail_streak, _info_cooldown_until
     with _CACHE_LOCK:
@@ -218,6 +403,7 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     ma20 = round(float(close.rolling(20).mean().iloc[-1]), 2) if len(close) >= 20 else None
     ma60 = round(float(close.rolling(60).mean().iloc[-1]), 2) if len(close) >= 60 else None
     rsi14 = _calc_rsi(close, 14)
+    indicators = compute_advanced_indicators(hist)
 
     trend = "판단불가"
     if ma20 and ma60:
@@ -299,6 +485,8 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
         "rsi14": rsi14,
         "trend": trend,
     }
+    # MACD·볼린저·거래량 배수·고점 대비·구간 위치(추가 필드, 기존 키는 그대로)
+    payload.update(indicators)
     payload.update(financials)
     payload["financials_available"] = financials_available
     if financials_stale:

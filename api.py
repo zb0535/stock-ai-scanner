@@ -11,22 +11,25 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 import stock_tools
+import scoring
 from finnhub_client import status as finnhub_status
 
 MODEL_ID = "gemini-3.5-flash-lite"
 
 SYSTEM_PROMPT = """너는 미국 주식 차트·재무제표 스크리닝 보조 봇이다.
 제공된 데이터에 없는 가격·지표·뉴스를 절대 지어내지 마라.
-선정한 종목마다 차트 추세(이평선·RSI), 재무 지표(PER·매출성장률·영업이익률·부채비율), 그리고 제공된 최근 뉴스 맥락이 있다면 함께 인용하고 리스크도 짚어라.
+종목 데이터는 서버가 계산한 정량 점수 `quant_score`(0~100, 높을수록 조건 적합) 내림차순으로 정렬돼 있고, 각 종목에는 점수 근거인 `signals` 목록이 붙어 있다. `strategy`는 사용자 조건에서 읽은 전략 의도(value=가치, oversold=과매도 반등, momentum=모멘텀, balanced=균형)다.
+선정 근거에는 `quant_score`와 그 근거(`signals`)를 반드시 수치로 인용하고, 함께 제공된 차트 지표(이평선·RSI·MACD·볼린저밴드·거래량 배수·고점 대비 낙폭)와 재무 지표(PER·매출성장률·영업이익률·부채비율), 최근 뉴스 맥락이 있다면 그것도 엮어라. 점수가 높아도 약한 신호(`signals`의 부정 항목, 예: 고PER·과열 RSI·역배열)가 있으면 리스크로 짚어라.
+점수는 참고값이다. 점수가 비슷한 종목은 재무·뉴스로 우열을 가려도 되지만, 점수가 높은 종목을 이유 없이 빼지 마라.
 만약 일부 종목의 재무 지표가 일시적 API 제한으로 비어(`null`) 있더라도, 주가·이동평균·RSI 등 제공된 수치만으로 분석하거나 값이 있는 다른 종목을 우선 추천하고, '전체 정보가 없다'고 뭉뚱그리지 마라. `financials_note`가 붙은 종목은 재무 지표만 일시 미수신일 뿐 차트 수치는 유효하다.
-반드시 아래 JSON 형식으로만 출력하라:
+반드시 아래 JSON 형식으로만 출력하라(다른 키를 추가하지 마라):
 {
   "market_note": "후보군 전반 요약 1~2문장",
   "top_picks": [
     {
       "ticker": "티커",
       "price": 0.0,
-      "reason": "차트+재무+뉴스 기준 추천 근거 (실제 수치 포함)",
+      "reason": "quant_score·signals·차트+재무+뉴스 기준 추천 근거 (실제 수치 포함)",
       "risk": "주의할 점 또는 단점"
     }
   ]
@@ -172,13 +175,21 @@ def _attach_chart(pick: dict) -> dict:
 def screen_stocks(req: ScreenRequest):
     tickers = [t.strip().upper() for t in (req.tickers or stock_tools.get_watchlist()) if t.strip()]
     # 15개 종목을 순차 조회하면 13초 넘게 걸리므로, 최대 6개씩 병렬로 당긴다.
-    # bounded_map이 입력 순서를 유지해 주므로 응답의 종목 순서는 그대로다.
+    # bounded_map이 입력 순서를 유지해 주므로 점수가 같은 종목의 정렬도 흔들리지 않는다.
     rows = stock_tools.bounded_map(_screen_row, tickers)
+
+    # 정량 스코어링: 조건에서 전략을 읽고 quant_score·signals를 붙여 내림차순 정렬한다.
+    # 네트워크 호출은 없다(이미 받은 지표만 사용). 동점은 입력 순서를 유지한다.
+    rows, strategy = scoring.rank_stocks(rows, criteria=req.criteria)
 
     client = genai.Client()
     res = client.models.generate_content(
         model=MODEL_ID,
-        contents=f"조건: {req.criteria}\n\n종목 데이터:\n{json.dumps(rows, ensure_ascii=False)}",
+        contents=(
+            f"조건: {req.criteria}\n"
+            f"strategy: {strategy} ({scoring.STRATEGY_LABELS.get(strategy, strategy)})\n\n"
+            f"종목 데이터(quant_score 내림차순):\n{json.dumps(rows, ensure_ascii=False)}"
+        ),
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0,
@@ -188,10 +199,25 @@ def screen_stocks(req: ScreenRequest):
     raw = re.sub(r"^```json\s*|\s*```$", "", (res.text or "").strip())
     data = json.loads(raw)
 
-    # 추천 종목의 차트·뉴스도 선택된 개수만큼 병렬로 채운다(보통 3개).
-    stock_tools.bounded_map(_attach_chart, data.get("top_picks", []))
+    # 추천 종목에도 같은 quant_score·signals를 붙인다(기존 키는 그대로, 추가만).
+    score_by_ticker = {
+        (row.get("ticker") or "").strip().upper(): row
+        for row in rows if isinstance(row, dict) and row.get("ticker")
+    }
+    picks = [p for p in (data.get("top_picks") or []) if isinstance(p, dict) and p.get("ticker")]
+    data["top_picks"] = picks
+    for pick in picks:
+        row = score_by_ticker.get(str(pick.get("ticker") or "").strip().upper())
+        if not row:
+            continue  # 모델이 후보에 없는 티커를 냈다 → 지어낸 점수를 붙이지 않는다
+        pick.setdefault("quant_score", row.get("quant_score"))
+        pick.setdefault("signals", row.get("signals"))
 
-    return {"analysis": data, "all_stocks": rows}
+    # 추천 종목의 차트·뉴스도 선택된 개수만큼 병렬로 채운다(보통 3개).
+    stock_tools.bounded_map(_attach_chart, picks)
+
+    # strategy는 추가 필드다(기존 클라이언트는 무시해도 동작한다).
+    return {"analysis": data, "all_stocks": rows, "strategy": strategy}
 
 
 @app.get("/api/stock/{ticker}")
