@@ -115,11 +115,15 @@ def _calc_rsi(close_series, period: int = 14) -> float | None:
     delta = close_series.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
-    last_loss = float(loss.iloc[-1])
+    last_loss = _to_number(loss.iloc[-1])
+    last_gain = _to_number(gain.iloc[-1])
+    if last_loss is None or last_gain is None:
+        return None  # 값이 비었거나(NaN) 무한대 → 지표 없음
     if last_loss == 0:
         return 100.0
-    rs = float(gain.iloc[-1]) / last_loss
-    return round(100 - (100 / (1 + rs)), 2)
+    rs = last_gain / last_loss
+    value = 100 - (100 / (1 + rs))
+    return round(value, 2) if math.isfinite(value) else None
 
 
 # --- 고급 기술적 지표 -------------------------------------------------------
@@ -330,11 +334,38 @@ def _info_in_cooldown() -> bool:
         return time.time() < _info_cooldown_until
 
 
+def clean_history(hist):
+    """일봉에서 종가가 없는 행을 걸러 냅니다.
+
+    야후 파이낸스는 한국 종목(.KS/.KQ)의 최신 세션을 **OHLC 전부 NaN, 거래량만 있는**
+    자리표시자 행으로 내려줄 때가 있다(예: 005930.KS 2026-11-19행). 그 행을 그대로 쓰면
+    `close.iloc[-1]`이 NaN이라 현재가·20일선·60일선·RSI가 모두 NaN이 되고, Starlette의
+    JSONResponse는 `allow_nan=False`로 직렬화하므로 NaN 하나만 섞여도 **500 Internal Server Error**가
+    난다(2026-11 한국 종목 500 사고의 원인). 종가가 없는 행은 지표 계산에 쓸 수 없으므로 버린다.
+
+    반환: 종가가 있는 행만 남긴 DataFrame(바뀐 게 없으면 받은 객체 그대로).
+    """
+    if hist is None or getattr(hist, "empty", True):
+        return hist
+    if "Close" not in getattr(hist, "columns", []):
+        return hist
+    try:
+        close = hist["Close"]
+        if not close.isna().any():
+            return hist  # 정상 데이터면 복사하지 않는다
+        cleaned = hist[close.notna()]
+    except Exception as exc:  # dtype 등 예상 밖 문제 — 원본을 그대로 넘기고 호출부가 방어한다
+        logger.warning("일봉 정리 실패 → %s: %s", type(exc).__name__, str(exc)[:120])
+        return hist
+    return cleaned
+
+
 def get_history(ticker: str, period: str = "6mo"):
     """일봉 데이터를 캐시에서 반환합니다(HISTORY_TTL 30분).
 
     조회에 실패하면 만료된 직전 성공값이라도 돌려주고, 그것도 없으면 빈 DataFrame을
     돌려줍니다. 반환된 DataFrame은 읽기 전용으로만 쓰세요.
+    종가가 비어 있는 행(야후의 한국 종목 자리표시자 행)은 `clean_history`로 걸러 캐시한다.
 
     캐시 읽기·쓰기는 _CACHE_LOCK으로 보호하므로 bounded_map으로 동시에 불러도 안전하다.
     """
@@ -346,7 +377,7 @@ def get_history(ticker: str, period: str = "6mo"):
     with _CACHE_LOCK:
         cached = _HISTORY_CACHE.get(key)
     if cached and now - cached[0] < HISTORY_TTL:
-        return cached[1]
+        return clean_history(cached[1])
 
     try:
         hist = yf.Ticker(sym).history(period=period)
@@ -354,12 +385,13 @@ def get_history(ticker: str, period: str = "6mo"):
         logger.warning("%s: history(%s) 실패 → %s: %s", sym, period, type(exc).__name__, str(exc)[:200])
         hist = None
 
+    hist = clean_history(hist)
     if hist is not None and not getattr(hist, "empty", True):
         with _CACHE_LOCK:
             _HISTORY_CACHE[key] = (now, hist)
         return hist
     if cached:  # 만료됐지만 이번 조회도 실패 → 직전 성공값 사용
-        return cached[1]
+        return clean_history(cached[1])
     return hist
 
 
@@ -400,14 +432,20 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
         return {"ticker": sym, "error": "주가 데이터를 찾을 수 없습니다."}
 
     close = hist["Close"]
-    price = round(float(close.iloc[-1]), 2)
-    ma20 = round(float(close.rolling(20).mean().iloc[-1]), 2) if len(close) >= 20 else None
-    ma60 = round(float(close.rolling(60).mean().iloc[-1]), 2) if len(close) >= 60 else None
+    # 종가가 비어 있는 행은 get_history가 이미 걸러 내지만, 지표는 한 번 더 방어한다
+    # (NaN이 응답에 남으면 JSON 직렬화 단계에서 500이 된다).
+    price = _to_number(round(float(close.iloc[-1]), 2)) if len(close) else None
+    if price is None:
+        if cached_payload and cached_payload.get("price") is not None:
+            return dict(cached_payload)
+        return {"ticker": sym, "error": "주가 데이터를 찾을 수 없습니다."}
+    ma20 = _to_number(round(float(close.rolling(20).mean().iloc[-1]), 2)) if len(close) >= 20 else None
+    ma60 = _to_number(round(float(close.rolling(60).mean().iloc[-1]), 2)) if len(close) >= 60 else None
     rsi14 = _calc_rsi(close, 14)
     indicators = compute_advanced_indicators(hist)
 
     trend = "판단불가"
-    if ma20 and ma60:
+    if ma20 is not None and ma60 is not None:
         if price > ma20 > ma60:
             trend = "상승 추세(정배열: 현재가>20일선>60일선)"
         elif price < ma20 < ma60:

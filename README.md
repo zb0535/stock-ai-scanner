@@ -111,11 +111,20 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   `SEC_EDGAR_FALLBACK=0`, `FINNHUB_FALLBACK=0` 환경변수로 각각 끌 수 있다.
 - `GET /` 헬스 응답에 배포 커밋(`build`)과 Finnhub 키 설정·마지막 오류(`finnhub`),
   저장소 종류(`storage_backend`)를 노출한다. 키 본문은 나오지 않고 설정 여부·이름·길이만 보인다.
+  `errors_recent`에는 최근 처리되지 않은 예외 10건(`error_id`·`path`·`type`·`message`)이 남는다.
+- **NaN 안전(2026-11 사고 수정)**: 야후가 한국 종목 일봉의 마지막 행을 OHLC 전부 NaN인
+  자리표시자 행으로 내려줄 때가 있다. 그대로 쓰면 현재가·이평선·RSI가 NaN이 되고, JSON은
+  NaN을 표현하지 못해 `/api/screen`이 평문 500이 됐다. 지금은 ① `get_history`가 종가 없는
+  행을 걸러 내고 ② 응답 경계(`SafeJSONResponse`)가 NaN/inf를 `null`로 정화하며 ③ 처리되지
+  않은 예외는 `{"detail":"internal_error","error_id":"..."}` JSON 500으로 돌려준다.
+- **AI 폴백**: Gemini 호출·응답 파싱이 2회 모두 실패해도 500이 아니라 200으로,
+  서버 정량 점수(`quant_score`·`signals`)만으로 만든 요약을 돌려준다. 이때 응답의
+  `analysis_source`가 `fallback`, `analysis_note`에 사유가 담긴다(정상은 `gemini`·빈 문자열).
 
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200 검증, 309개)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백 검증, 328개)
 
 ## 환경변수
 | 이름 | 설명 |

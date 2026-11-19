@@ -5,11 +5,13 @@ import os
 import re
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 import pandas as pd
 import yfinance as yf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
@@ -69,7 +71,51 @@ async def lifespan(_app: FastAPI):
         kospi200_scanner.stop_prewarm()
 
 
-app = FastAPI(title="한국·미국 주식 AI 스크리너 API", lifespan=lifespan)
+def _json_safe(value):
+    """응답·프롬프트로 나가기 직전의 값을 JSON 호환으로 정화합니다.
+
+    NaN·inf는 JSON 표준에 없고, Starlette은 `allow_nan=False`로 직렬화하므로 하나만
+    섞여도 응답 전체가 500이 된다. 넘파이 스칼라·pandas Timestamp도 그대로는 직렬화되지
+    않으므로 여기서 float·ISO 문자열로 바꿔 준다.
+
+    dict·list는 재귀하여 복사본을 만들고(입력은 바꾸지 않는다), 그 밖의 값은 그대로 둔다.
+    """
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (bool, str, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    item = getattr(value, "item", None)  # 넘파이 스칼라
+    if callable(item):
+        try:
+            return _json_safe(item())
+        except (TypeError, ValueError):
+            return None
+    isoformat = getattr(value, "isoformat", None)  # Timestamp·date
+    if callable(isoformat):
+        try:
+            return isoformat()
+        except (TypeError, ValueError):
+            return str(value)
+    return value
+
+
+class SafeJSONResponse(JSONResponse):
+    """NaN·inf가 섞여도 500으로 죽지 않는 JSON 응답.
+
+    근본 수정(종가 빈 행 제거)이 실패해도 API가 평문 500으로 무너지지 않게 하는 마지막
+    방어선이다. NaN·inf는 `null`로 나가고, 로그는 남기지 않는다(요청마다 시끄러워지지 않게).
+    """
+
+    def render(self, content) -> bytes:
+        return super().render(_json_safe(content))
+
+
+app = FastAPI(title="한국·미국 주식 AI 스크리너 API", lifespan=lifespan,
+              default_response_class=SafeJSONResponse)
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,6 +123,50 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --- 처리되지 않은 예외 기록 --------------------------------------------------
+# 예전에는 500이 나면 Render 로그를 뒤지지 않고는 이유를 알 수 없었다. 이제는
+# `error_id`가 로그·응답에 찍히고 최근 오류는 `GET /`(`errors_recent`)에서 바로 보인다.
+_ERRORS_LOCK = threading.Lock()
+_ERRORS_RECENT: list[dict] = []
+_ERRORS_MAX = 10
+
+
+def _record_error(error_id: str, path: str, exc: Exception, note: str = "") -> None:
+    entry = {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "error_id": error_id,
+        "path": path,
+        "type": type(exc).__name__,
+        "message": (str(exc) or "")[:300],
+    }
+    if note:
+        entry["note"] = note
+    with _ERRORS_LOCK:
+        _ERRORS_RECENT.insert(0, entry)
+        del _ERRORS_RECENT[_ERRORS_MAX:]
+
+
+def recent_errors() -> list[dict]:
+    """최근 처리되지 않은 예외(최신 순, 최대 ERRORS_MAX개)의 사본."""
+    with _ERRORS_LOCK:
+        return [dict(item) for item in _ERRORS_RECENT]
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """500을 평문 대신 JSON으로 돌리고 구조화 로그를 남긴다.
+
+    응답: `{"detail": "internal_error", "error_id": "..."}` — 로그의 같은 error_id와
+    짝지어 원인을 추적한다(내부 예외 내용은 클라이언트에 노출하지 않는다).
+    """
+    error_id = uuid.uuid4().hex[:8]
+    logger.exception("처리되지 않은 예외 [%s] %s %s → %s: %s", error_id, request.method,
+                     request.url.path, type(exc).__name__, str(exc)[:300])
+    _record_error(error_id, f"{request.method} {request.url.path}", exc)
+    return SafeJSONResponse(status_code=500,
+                            content={"detail": "internal_error", "error_id": error_id})
 
 
 class ScreenRequest(BaseModel):
@@ -172,7 +262,8 @@ def health():
             "finnhub": finnhub_status(),
             "storage_backend": history_store.storage_backend(),
             "sp500_cache": sp500_scanner.cache_status(),
-            "kospi200_cache": kospi200_scanner.cache_status()}
+            "kospi200_cache": kospi200_scanner.cache_status(),
+            "errors_recent": recent_errors()}
 
 
 @app.api_route("/api/watchlist", methods=["GET", "HEAD"])
@@ -251,15 +342,33 @@ def search_stocks(q: str = ""):
 
 
 def _screen_row(ticker: str) -> dict:
-    """한 종목의 차트·재무 지표와 최근 뉴스를 묶어 한 행으로 만듭니다."""
-    metrics = stock_tools.get_stock_metrics(ticker)
-    metrics["news"] = _get_recent_news(ticker, limit=2)
-    return metrics
+    """한 종목의 차트·재무 지표와 최근 뉴스를 묶어 한 행으로 만듭니다.
+
+    티커 하나의 사고가 전체 스크리닝을 500으로 만들지 않도록, 지표·뉴스
+    조회의 예외는 이 행에서 흡수하고 `error` 행으로 돌려준다(나머지 종목은 그대로 본다).
+    """
+    try:
+        metrics = stock_tools.get_stock_metrics(ticker)
+    except Exception as exc:
+        logger.warning("%s: 지표 조회 실패 → %s: %s", ticker, type(exc).__name__, str(exc)[:200])
+        metrics = {"ticker": ticker, "error": "주가 데이터를 찾을 수 없습니다."}
+    if not isinstance(metrics, dict):  # 계약을 어기는 응답도 한 행만 망가지게
+        metrics = {"ticker": ticker, "error": "주가 데이터를 찾을 수 없습니다."}
+    try:
+        metrics["news"] = _get_recent_news(ticker, limit=2)
+    except Exception as exc:
+        logger.warning("%s: 뉴스 조회 실패 → %s: %s", ticker, type(exc).__name__, str(exc)[:120])
+        metrics["news"] = []
+    return _json_safe(metrics)
 
 
 def _attach_chart(pick: dict) -> dict:
     """추천 종목 하나에 6개월 차트(가격·20일·60일선)와 뉴스를 붙입니다."""
-    hist = stock_tools.get_history(pick["ticker"], "6mo")
+    try:
+        hist = stock_tools.get_history(pick["ticker"], "6mo")
+    except Exception as exc:  # 차트 하나 때문에 전체 응답이 죽지 않게
+        logger.warning("%s: 차트 조회 실패 → %s: %s", pick.get("ticker"), type(exc).__name__, str(exc)[:120])
+        hist = None
     close = pd.Series(dtype=float) if hist is None or hist.empty else hist["Close"]
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
@@ -273,8 +382,51 @@ def _attach_chart(pick: dict) -> dict:
         }
         for idx, r in recent.iterrows()
     ]
-    pick["news"] = _get_recent_news(pick["ticker"], limit=3)
+    try:
+        pick["news"] = _get_recent_news(pick["ticker"], limit=3)
+    except Exception:
+        pick["news"] = []
     return pick
+
+
+def _parse_analysis(text: str) -> dict:
+    """Gemini 응답 텍스트를 JSON dict로 해석한다(펜스·앞뒤 잡문 허용)."""
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip())
+    if not raw:
+        raise ValueError("빈 응답")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # 모델이 설명을 붙여 보낸 경우 첫 JSON 객체만 뽑아 다시 시도한다.
+        match = re.search(r"\{.*\}", raw, re.S)
+        if not match:
+            raise
+        data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        raise ValueError(f"JSON 객체가 아님: {type(data).__name__}")
+    return data
+
+
+def _fallback_analysis(rows: list[dict], note: str) -> dict:
+    """Gemini를 쓸 수 없을 때 서버 정량 점수만으로 만드는 분석(200 유지).
+
+    점수·점수 근거(signals)는 모두 서버가 계산한 값이라 지어낸 내용이 없다.
+    """
+    picks = []
+    for row in rows:
+        if len(picks) >= 3:
+            break
+        if not isinstance(row, dict) or row.get("error") or row.get("price") is None:
+            continue
+        signals = row.get("signals") or []
+        picks.append({
+            "ticker": row.get("ticker"),
+            "price": row.get("price"),
+            "reason": (f"서버 정량 점수 quant_score {row.get('quant_score')} — "
+                       + (", ".join(str(s) for s in signals[:5]) if signals else "제공된 지표 기준")),
+            "risk": "AI 해설 미제공(모델 호출 실패) — 서버가 계산한 점수·신호만 반영",
+        })
+    return {"market_note": note, "top_picks": picks}
 
 
 @app.post("/api/screen")
@@ -308,12 +460,12 @@ def screen_stocks(req: ScreenRequest):
     # 15개 종목을 순차 조회하면 13초 넘게 걸리므로, 최대 6개씩 병렬로 당긴다.
     # bounded_map이 입력 순서를 유지해 주므로 점수가 같은 종목의 정렬도 흔들리지 않는다.
     rows = stock_tools.bounded_map(_screen_row, tickers)
+    rows = [_json_safe(row) for row in rows]  # NaN·inf가 프롬프트·응답으로 나가지 않게
 
     # 정량 스코어링: 조건에서 전략을 읽고 quant_score·signals를 붙여 내림차순 정렬한다.
     # 네트워크 호출은 없다(이미 받은 지표만 사용). 동점은 입력 순서를 유지한다.
     rows, strategy = scoring.rank_stocks(rows, criteria=req.criteria)
 
-    client = genai.Client()
     universe_note = ""
     if mode == "sp500":
         universe_note = (f"발굴 유니버스: S&P 500 {universe_scanned}종목 중 기술적 사전 스캔 상위 "
@@ -321,22 +473,42 @@ def screen_stocks(req: ScreenRequest):
     elif mode == "kospi200":
         universe_note = (f"발굴 유니버스: 코스피 200 {universe_scanned}종목 중 기술적 사전 스캔 상위 "
                          f"{len(tickers)}종목(관심 종목 목록이 아니다). 가격은 원화(₩)다.\n")
-    res = client.models.generate_content(
-        model=MODEL_ID,
-        contents=(
-            universe_note
-            + f"조건: {req.criteria}\n"
-            f"strategy: {strategy} ({scoring.STRATEGY_LABELS.get(strategy, strategy)})\n\n"
-            f"종목 데이터(quant_score 내림차순):\n{json.dumps(rows, ensure_ascii=False)}"
-        ),
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0,
-        ),
+    prompt = (
+        universe_note
+        + f"조건: {req.criteria}\n"
+        f"strategy: {strategy} ({scoring.STRATEGY_LABELS.get(strategy, strategy)})\n\n"
+        f"종목 데이터(quant_score 내림차순):\n{json.dumps(rows, ensure_ascii=False, default=str)}"
     )
 
-    raw = re.sub(r"^```json\s*|\s*```$", "", (res.text or "").strip())
-    data = json.loads(raw)
+    # AI 분석은 2회까지 시도하고, 끝내 실패해도 500 대신 서버 점수 기반 요약을 돌려준다.
+    # (Gemini 쿼터·장애·모델 응답 형식 오류가 사용자 화면을 500으로 만들지 않게)
+    data = None
+    analysis_source = "gemini"
+    analysis_note = ""
+    for attempt in (1, 2):
+        try:
+            client = genai.Client()
+            res = client.models.generate_content(
+                model=MODEL_ID,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0,
+                ),
+            )
+            data = _parse_analysis(res.text)
+            break
+        except Exception as exc:
+            logger.warning("Gemini 분석 실패(%d/2) → %s: %s", attempt, type(exc).__name__, str(exc)[:200])
+            if attempt == 2:
+                analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
+                _record_error(uuid.uuid4().hex[:8], "POST /api/screen (gemini)", exc,
+                              note="폴백 분석으로 응답")
+            else:
+                time.sleep(0.5)
+    if data is None:
+        data = _fallback_analysis(rows, analysis_note)
+        analysis_source = "fallback"
 
     # 추천 종목에도 같은 quant_score·signals를 붙인다(기존 키는 그대로, 추가만).
     score_by_ticker = {
@@ -363,9 +535,11 @@ def screen_stocks(req: ScreenRequest):
     # 성적표를 오염시켰으므로, 클라이언트가 카드의 "📌 추적 추가"로 고른 픽만
     # `POST /api/performance/track`에서 기록한다. 응답 모양은 그대로다.
 
-    # strategy·mode·universe_scanned는 추가 필드다(기존 클라이언트는 무시해도 동작한다).
-    return {"analysis": data, "all_stocks": rows, "strategy": strategy,
-            "mode": mode, "universe_scanned": universe_scanned}
+    # strategy·mode·universe_scanned·analysis_source는 추가 필드다(기존 클라이언트는 무시해도 동작한다).
+    # analysis_source: "gemini"(정상) | "fallback"(모델 호출 실패 → 서버 점수 기반 요약)
+    return _json_safe({"analysis": data, "all_stocks": rows, "strategy": strategy,
+                       "mode": mode, "universe_scanned": universe_scanned,
+                       "analysis_source": analysis_source, "analysis_note": analysis_note})
 
 
 @app.get("/api/performance")
@@ -491,5 +665,5 @@ def get_stock_detail(ticker: str):
         except Exception:
             name = None
 
-    return {"ticker": sym, "name": name, "currency": currency,
-            "levels": levels, "quarters": quarters}
+    return _json_safe({"ticker": sym, "name": name, "currency": currency,
+                       "levels": levels, "quarters": quarters})

@@ -411,7 +411,8 @@ class ScreenModeTests(unittest.TestCase):
         self.assertIsNone(body["universe_scanned"])
         self.assertEqual([r["ticker"] for r in body["all_stocks"]], ["AAPL", "MSFT"])
         self.assertEqual(self.discovery_calls, [])
-        self.assertEqual(sorted(body), ["all_stocks", "analysis", "mode", "strategy", "universe_scanned"])
+        self.assertEqual(sorted(body), ["all_stocks", "analysis", "analysis_note", "analysis_source",
+                                        "mode", "strategy", "universe_scanned"])
 
     def test_unknown_mode_falls_back_to_watchlist(self):
         body = TestClient(api.app).post(
