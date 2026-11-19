@@ -33,6 +33,8 @@ from urllib.parse import urlsplit, urlunsplit
 import pandas as pd
 import yfinance as yf
 
+import naver_finance
+
 logger = logging.getLogger("history_store")
 
 # 한국 증시/사용자 기준 날짜. tzdata 없는 환경에서도 동작하도록 고정 오프셋을 쓴다.
@@ -729,6 +731,8 @@ def _evaluate(pick: dict, current_price: float | None, today: date) -> dict:
     return {
         "id": pick.get("id"),
         "ticker": pick.get("ticker"),
+        "name": naver_finance.static_display_name(pick.get("ticker")),
+        "currency": naver_finance.currency_for(pick.get("ticker")),
         "recommended_date": pick.get("recommended_date"),
         "recommended_at": pick.get("recommended_at"),
         "entry_price": None if entry is None else round(entry, 4),
@@ -751,6 +755,8 @@ def _summary(rows: list[dict]) -> dict:
     def _brief(row):
         return {
             "ticker": row["ticker"],
+            "name": row.get("name"),
+            "currency": row.get("currency"),
             "recommended_date": row["recommended_date"],
             "entry_price": row["entry_price"],
             "current_price": row["current_price"],

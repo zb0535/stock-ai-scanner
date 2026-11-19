@@ -56,10 +56,27 @@ const STRATEGY_LABELS = {
   balanced: "균형",
 };
 
-const fmtPrice = (v) =>
-  v === null || v === undefined
-    ? "-"
-    : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+const fmtPrice = (v, currency = "USD") => {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return "-";
+  if (currency === "KRW") return `₩${Math.round(Number(v)).toLocaleString("ko-KR")}`;
+  return `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+};
+
+// 통화: 서버가 주는 currency를 우선하고, 예전 응답은 티커 접미사로 추론한다.
+const currencyOf = (row) => {
+  const cur = String(row?.currency || "").toUpperCase();
+  if (cur === "KRW" || cur === "USD") return cur;
+  const sym = upper(row?.ticker);
+  return sym.endsWith(".KS") || sym.endsWith(".KQ") ? "KRW" : "USD";
+};
+
+// 한국 종목의 한국어 이름 배지(삼성전자). 미국 종목의 영문명은 표시하지 않는다.
+function KrName({ row }) {
+  const name = row?.name;
+  if (!name || name === row?.ticker) return null;
+  if (currencyOf(row) !== "KRW") return null;
+  return <span className="kr-name">{name}</span>;
+}
 
 const fmtPct = (v) =>
   v === null || v === undefined ? "-" : `${v > 0 ? "+" : ""}${v.toFixed(2)}%`;
@@ -102,6 +119,11 @@ export default function App() {
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
   const [sp500, setSp500] = useState([]);
+
+  // 관심 종목에 이름·코드로 바로 추가(삼성전자·카카오·005930 → /api/resolve-ticker)
+  const [addQuery, setAddQuery] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [addMsg, setAddMsg] = useState("");
 
   const [detail, setDetail] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -193,6 +215,29 @@ export default function App() {
     const sym = upper(ticker);
     if (!sym) return;
     setTickers((prev) => (prev.includes(sym) ? prev : [...prev, sym]));
+  };
+
+  const addByQuery = async (e) => {
+    e.preventDefault();
+    const q = addQuery.trim();
+    if (!q || adding) return;
+    setAdding(true);
+    setAddMsg("");
+    try {
+      const res = await fetch(`${API_BASE}/api/resolve-ticker?q=${encodeURIComponent(q)}`);
+      if (!res.ok) {
+        setAddMsg(`'${q}' 종목을 찾지 못했습니다.`);
+        return;
+      }
+      const data = await res.json();
+      addToWatchlist(data.ticker);
+      setAddQuery("");
+      setAddMsg(`${data.name || data.ticker} → ${data.ticker} 추가됨`);
+    } catch {
+      setAddMsg("종목을 찾지 못했습니다. 잠시 후 다시 시도해 주세요.");
+    } finally {
+      setAdding(false);
+    }
   };
 
   const openDetail = async (pick) => {
@@ -324,7 +369,7 @@ export default function App() {
       <div className="page">
         <header className="header">
           <div className="badge">AI QUANT SCREENER</div>
-          <h1>미국 주식 차트 · 재무 AI 스크리너</h1>
+          <h1>한국·미국 주식 차트 · 재무 AI 스크리너</h1>
           <p>이동평균선(20·60일) · RSI · 재무제표 · 최신 뉴스를 종합해 선별합니다</p>
         </header>
 
@@ -348,6 +393,15 @@ export default function App() {
             >
               🌐 S&P 500 자동 발굴
             </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "kospi200"}
+              className={`mode-btn ${mode === "kospi200" ? "active" : ""}`}
+              onClick={() => { setMode("kospi200"); setError(""); }}
+            >
+              🇰🇷 코스피 200 발굴
+            </button>
           </div>
 
           {mode === "sp500" ? (
@@ -357,6 +411,12 @@ export default function App() {
               서버가 50분마다 미리 계산해 두기 때문에 보통 몇 초 만에 응답합니다.
               (서버가 막 켜져 캐시가 아직 비었을 때만 첫 계산에 1~2분 걸립니다.)
             </div>
+          ) : mode === "kospi200" ? (
+            <div className="mode-note">
+              코스피 200 약 200종목을 같은 방식으로 먼저 훑어 상위 15개만 뽑고, 그 종목에만
+              재무·뉴스를 붙여 AI가 최종 선정합니다. 재무 지표는 네이버 금융(연간 재무제표)에서
+              보완하고 가격은 원화(₩)로 표시합니다. 서버가 50분마다 미리 계산해 둡니다.
+            </div>
           ) : (
             <>
               <div className="panel-head">
@@ -365,6 +425,18 @@ export default function App() {
                   🔍 종목 검색 · 선택
                 </button>
               </div>
+              <form className="kr-add" onSubmit={addByQuery}>
+                <input
+                  value={addQuery}
+                  onChange={(e) => { setAddQuery(e.target.value); setAddMsg(""); }}
+                  placeholder="종목명·코드로 추가 (삼성전자, 카카오, 005930, AAPL)"
+                  aria-label="종목명 또는 코드로 관심 종목 추가"
+                />
+                <button type="submit" disabled={adding || !addQuery.trim()}>
+                  {adding ? "찾는 중..." : "+ 추가"}
+                </button>
+              </form>
+              {addMsg && <div className="kr-add-msg">{addMsg}</div>}
               <div className="chips">
                 {tickers.map((t) => (
                   <span className="chip" key={t}>
@@ -396,7 +468,13 @@ export default function App() {
               placeholder="스크리닝 조건을 입력하세요..."
             />
             <button type="submit" disabled={loading}>
-              {loading ? (mode === "sp500" ? "S&P 500 발굴 중..." : "분석 중...") : "✨ AI 분석 실행"}
+              {loading
+                ? mode === "kospi200"
+                  ? "코스피 200 발굴 중..."
+                  : mode === "sp500"
+                    ? "S&P 500 발굴 중..."
+                    : "분석 중..."
+                : "✨ AI 분석 실행"}
             </button>
           </form>
         </section>
@@ -459,11 +537,13 @@ export default function App() {
                       <td>{p.recommended_date?.slice(5)}</td>
                       <td>
                         <strong>{p.ticker}</strong>
+                        <KrName row={p} />
                         {p.mode === "sp500" && <span className="mini-tag">S&amp;P</span>}
+                        {p.mode === "kospi200" && <span className="mini-tag kr">코스피200</span>}
                       </td>
                       <td>{STRATEGY_LABELS[p.strategy] || p.strategy || "-"}</td>
-                      <td>{fmtPrice(p.entry_price)}</td>
-                      <td>{fmtPrice(p.current_price)}</td>
+                      <td>{fmtPrice(p.entry_price, currencyOf(p))}</td>
+                      <td>{fmtPrice(p.current_price, currencyOf(p))}</td>
                       <td>
                         <span className={`ret ${retClass(p.return_pct)}`}>
                           {p.return_pct === null || p.return_pct === undefined
@@ -518,6 +598,12 @@ export default function App() {
                 🌐 S&P 500 {result.universe_scanned}종목 자동 발굴 → 상위 {result.all_stocks.length}종목 분석
               </div>
             )}
+            {result.mode === "kospi200" && (
+              <div className="scan-badge kr">
+                🇰🇷 코스피 200 {result.universe_scanned}종목 자동 발굴 → 상위 {result.all_stocks.length}종목 분석
+                · 가격은 원화(₩)
+              </div>
+            )}
             <div className="summary">
               <span className="summary-tag">MARKET INSIGHT</span>
               <p>{result.analysis.market_note}</p>
@@ -529,9 +615,11 @@ export default function App() {
                   <div className="card-top">
                     <div>
                       <span className="rank">TOP {i + 1}</span>
-                      <div className="ticker">{pick.ticker}</div>
+                      <div className="ticker">
+                        {pick.ticker} <KrName row={pick} />
+                      </div>
                     </div>
-                    <div className="price">${pick.price.toLocaleString()}</div>
+                    <div className="price">{fmtPrice(pick.price, currencyOf(pick))}</div>
                   </div>
 
                   <div className="card-actions">
@@ -612,10 +700,10 @@ export default function App() {
                   <tbody>
                     {result.all_stocks.map((s) => (
                       <tr key={s.ticker}>
-                        <td><strong>{s.ticker}</strong></td>
-                        <td>${s.price}</td>
-                        <td>${s.ma20 ?? "-"}</td>
-                        <td>${s.ma60 ?? "-"}</td>
+                        <td><strong>{s.ticker}</strong> <KrName row={s} /></td>
+                        <td>{fmtPrice(s.price, currencyOf(s))}</td>
+                        <td>{fmtPrice(s.ma20, currencyOf(s))}</td>
+                        <td>{fmtPrice(s.ma60, currencyOf(s))}</td>
                         <td>{s.rsi14 ?? "-"}</td>
                         <td>{s.trend}</td>
                         <td>{s.trailing_pe ? s.trailing_pe.toFixed(1) : "-"}</td>
@@ -652,7 +740,7 @@ export default function App() {
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="티커 또는 영문 회사명 검색 (예: Tesla, IONQ, Samsung)"
+                placeholder="티커·회사명 검색 (예: Tesla, IONQ, 삼성전자, 005930)"
                 autoFocus
               />
             </div>
@@ -716,7 +804,9 @@ export default function App() {
         <div className="modal-backdrop" onClick={() => setDetail(null)}>
           <div className="modal detail-modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
-              <h2>{detail.ticker} 상세 분석 · 참고선</h2>
+              <h2>
+                {detail.name ? `${detail.name} (${detail.ticker})` : detail.ticker} 상세 분석 · 참고선
+              </h2>
               <button type="button" onClick={() => setDetail(null)}>✕</button>
             </div>
 
@@ -746,10 +836,10 @@ export default function App() {
 
               {detail.levels?.current && (
                 <div className="level-grid">
-                  <div className="lvl"><span>현재가</span><strong>${detail.levels.current}</strong></div>
-                  <div className="lvl red"><span>저항(60일 고점)</span><strong>${detail.levels.resistance_60d}</strong></div>
-                  <div className="lvl yellow"><span>20일선</span><strong>${detail.levels.ma20}</strong></div>
-                  <div className="lvl green"><span>지지(60일 저점)</span><strong>${detail.levels.support_60d}</strong></div>
+                  <div className="lvl"><span>현재가</span><strong>{fmtPrice(detail.levels.current, currencyOf(detail))}</strong></div>
+                  <div className="lvl red"><span>저항(60일 고점)</span><strong>{fmtPrice(detail.levels.resistance_60d, currencyOf(detail))}</strong></div>
+                  <div className="lvl yellow"><span>20일선</span><strong>{fmtPrice(detail.levels.ma20, currencyOf(detail))}</strong></div>
+                  <div className="lvl green"><span>지지(60일 저점)</span><strong>{fmtPrice(detail.levels.support_60d, currencyOf(detail))}</strong></div>
                 </div>
               )}
 
@@ -774,7 +864,9 @@ export default function App() {
 
               {detail.quarters?.length > 0 && (
                 <div className="q-table">
-                  <strong>📊 최근 4분기 실적 (단위: 백만 달러 $M)</strong>
+                  <strong>
+                    📊 최근 4분기 실적 (단위: {currencyOf(detail) === "KRW" ? "백만 원 ₩M" : "백만 달러 $M"})
+                  </strong>
                   <table>
                     <thead>
                       <tr><th>분기</th><th>매출</th><th>영업이익</th><th>순이익</th></tr>

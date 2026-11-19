@@ -10,6 +10,7 @@ import pandas as pd
 import yfinance as yf
 
 import finnhub_client
+import naver_finance
 import sec_edgar
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -421,11 +422,25 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     cached_payload = cached_payload or {}
     previous = {key: _to_number(cached_payload.get(key)) for key in _FIN_FIELDS}
 
+    # --- 네이버 금융 폴백(한국 종목 전용) ---
+    # yfinance는 `.KS`/`.KQ` 시세·차트는 주지만 Render 같은 데이터센터 IP에서는 `t.info`가
+    # 막히거나 비고(삼성전자 trailingPE=None), 종목명도 영문이다. 한국 종목이면 네이버 금융에서
+    # PER·영업이익률·부채비율·매출증가율과 한국어 이름을 받아 쓴다(6시간 캐시).
+    is_korean = naver_finance.is_korean_ticker(sym)
+    naver_fin: dict = {}
+    if is_korean:
+        try:
+            naver_fin = naver_finance.get_fundamentals(sym) or {}
+        except Exception as exc:  # 폴백 실패가 차트·시세를 망가뜨리지 않게
+            logger.warning("%s: 네이버 금융 폴백 실패 → %s: %s", sym, type(exc).__name__, str(exc)[:120])
+            naver_fin = {}
+
     # --- SEC EDGAR 폴백 ---
     # Yahoo t.info가 막히거나(429/401) 값을 비우면 SEC 공시(XBRL)에서 계산해 채운다.
     # current_price는 이미 차트에서 받은 값을 재사용하므로 추가 시세 호출이 없다.
+    # 한국 종목은 SEC 공시(XBRL)에 재무가 없으므로 건너뛴다(네이버가 그 자리를 맡는다).
     sec_financials: dict = {}
-    if SEC_FALLBACK_ENABLED and price and any(fresh[key] is None for key in _SEC_FIELDS):
+    if SEC_FALLBACK_ENABLED and not is_korean and price and any(fresh[key] is None for key in _SEC_FIELDS):
         try:
             sec_financials = sec_edgar.get_financial_metrics(sym, price) or {}
         except Exception as exc:  # 폴백 실패가 차트·시세를 망가뜨리지 않게
@@ -438,9 +453,10 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     finnhub_financials: dict = {}
     still_missing = any(
         fresh[key] is None and sec_financials.get(key) is None
+        and naver_fin.get(key) is None
         for key in _FINNHUB_TRIGGER_FIELDS
     )
-    if FINNHUB_FALLBACK_ENABLED and still_missing and finnhub_client.is_enabled():
+    if FINNHUB_FALLBACK_ENABLED and not is_korean and still_missing and finnhub_client.is_enabled():
         try:
             finnhub_financials = finnhub_client.get_financial_metrics(sym) or {}
         except Exception as exc:  # 폴백 실패가 차트·시세를 망가뜨리지 않게
@@ -448,9 +464,19 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
             finnhub_financials = {}
 
     def _fill(key: str):
-        """yfinance 최신값 > SEC EDGAR 계산값 > Finnhub 값 > 직전 캐시값 순으로 쓴다."""
+        """한국 종목은 네이버 > yfinance, 그 밖은 yfinance > SEC EDGAR > Finnhub > 직전 캐시.
+
+        한국 종목에서 네이버를 앞세우는 이유: yfinance의 한국 종목 재무는 기간이 어긋나
+        영업이익률·매출증가율이 국내 공시와 크게 벌어지는 경우가 있다(삼성전자 영업이익률
+        46% vs 연간 보고서 13%). 현지 공시(네이버 연간 재무제표)를 우선하고, 없을 때만
+        Yahoo 값을 쓴다.
+        """
+        if is_korean and naver_fin.get(key) is not None:
+            return naver_fin[key]
         if fresh[key] is not None:
             return fresh[key]
+        if naver_fin.get(key) is not None:
+            return naver_fin[key]
         if sec_financials.get(key) is not None:
             return sec_financials[key]
         if finnhub_financials.get(key) is not None:
@@ -463,22 +489,29 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     finnhub_filled = [key for key in _FIN_FIELDS
                       if fresh[key] is None and sec_financials.get(key) is None
                       and finnhub_financials.get(key) is not None]
+    naver_used = [key for key in _FIN_FIELDS if naver_fin.get(key) is not None]
     cache_filled = any(
         fresh[key] is None and sec_financials.get(key) is None
-        and finnhub_financials.get(key) is None and previous[key] is not None
+        and finnhub_financials.get(key) is None and naver_fin.get(key) is None
+        and previous[key] is not None
         for key in _FIN_FIELDS
     )
     financials_available = any(value is not None for value in financials.values())
-    # t.info가 죽었는데 SEC·Finnhub도 못 채우고 직전 캐시만 남은 경우에만 stale로 표시한다.
-    financials_stale = bool(cache_filled and not fresh_ok and not sec_filled and not finnhub_filled)
+    # t.info가 죽었는데 네이버·SEC·Finnhub도 못 채우고 직전 캐시만 남은 경우에만 stale로 표시한다.
+    financials_stale = bool(cache_filled and not fresh_ok and not sec_filled
+                            and not finnhub_filled and not naver_used)
 
     name = None
     if info:
         name = info.get("shortName") or info.get("longName")
+    if is_korean:
+        # 한국 종목은 영어 shortName(SamsungElec)보다 네이버의 한글 종목명을 쓴다.
+        name = naver_fin.get("name") or naver_finance.static_display_name(sym) or name
     name = name or cached_payload.get("name") or sym
     payload = {
         "ticker": sym,
         "name": name,
+        "currency": naver_finance.currency_for(sym),
         "price": price,
         "ma20": ma20,
         "ma60": ma60,
@@ -492,6 +525,10 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     if financials_stale:
         payload["financials_stale"] = True
         payload["financials_note"] = "재무 지표 일시 미수신(Yahoo API 제한) — 직전 조회값 유지, 가격·이평선·RSI는 최신"
+    elif naver_used and is_korean:
+        payload["financials_note"] = ("재무 지표는 네이버 금융(연간 재무제표) 기준 — 한국 종목은 국내 공시 값을 우선한다"
+                                      if fresh_ok else
+                                      "재무 지표는 네이버 금융(연간 재무제표) 기준 — Yahoo API 제한 시 자동 대체, 가격·이평선·RSI는 최신")
     elif sec_filled and finnhub_filled and not fresh_ok:
         payload["financials_note"] = "재무 지표는 SEC EDGAR 공시(XBRL)·Finnhub 기준으로 보완 — Yahoo API 제한 시 자동 대체, 가격·이평선·RSI는 최신"
     elif sec_filled and finnhub_filled:
@@ -508,7 +545,10 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
         payload["financials_note"] = "재무 지표 일시 미수신(Yahoo API 제한) — 가격·이평선·RSI만 유효"
     if financials_available:
         # 어느 출처에서 채웠는지 남긴다(프론트엔드는 이 키를 몰라도 동작한다).
-        if finnhub_filled:
+        if naver_used:
+            # 한국 종목: 재무 지표는 네이버 금융 연간 재무제표에서 왔다(SEC·Finnhub는 호출하지 않는다).
+            source = "yfinance+naver" if fresh_ok else "naver"
+        elif finnhub_filled:
             if not fresh_ok and not sec_filled:
                 source = "finnhub"
             elif sec_filled and not fresh_ok:

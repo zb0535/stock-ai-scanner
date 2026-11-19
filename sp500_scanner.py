@@ -309,9 +309,21 @@ def _row_from_frame(symbol: str, frame) -> dict | None:
 def _scan_universe(tickers: list[str] | None = None) -> dict:
     """500종목을 청크로 훑어 지표 스냅샷을 만든다(네트워크는 yf.download만)."""
     symbols = list(tickers) if tickers is not None else get_sp500_tickers()
+    return scan_rows(symbols)
+
+
+def scan_rows(symbols: list[str], label: str = "프리 스캔") -> dict:
+    """종목 목록 → 지표 행. **S&P 500·코스피 200 스크리너가 함께 쓰는 공용 1차 스캔.**
+
+    `CHUNK_SIZE`(100)개씩 `yf.download`로 받아 지표만 계산하고 청크 DataFrame은 즉시 버린다.
+    청크마다 `gc.collect()`를 불러 Render 512MB에서 RSS가 튀지 않게 한다. 개별 종목 실패는
+    건너뛰고 마지막에 집계만 남긴다.
+
+    반환: `{"rows", "universe", "skipped"}`
+    """
     rows: list[dict] = []
     skipped: list[str] = []
-    for chunk in _chunks(symbols):
+    for chunk in _chunks(list(symbols)):
         batch = _download_batch(chunk)
         for sym in chunk:
             row = _row_from_frame(sym, _sub_frame(batch, sym))
@@ -321,9 +333,18 @@ def _scan_universe(tickers: list[str] | None = None) -> dict:
                 rows.append(row)
         del batch
         gc.collect()  # 청크 DataFrame을 바로 버려 RSS를 낮게 유지한다
-    logger.info("프리 스캔: %d/%d 종목 지표 산출(건너뜀 %d)",
-                len(rows), len(symbols), len(skipped))
+    logger.info("%s: %d/%d 종목 지표 산출(건너뜀 %d)",
+                label, len(rows), len(symbols), len(skipped))
     return {"rows": rows, "universe": len(symbols), "skipped": len(skipped)}
+
+
+def is_scanning() -> bool:
+    """다른 스레드가 S&P 500 프리 스캔을 돌리고 있는지.
+
+    코스피 200 예열이 같은 순간에 200종목을 또 받으면 Render 512MB에서 메모리 피크가
+    겹치므로, 코스피 쪽은 이 값이 False가 될 때까지 잠깐 기다렸다가 시작한다.
+    """
+    return _SCAN_LOCK.locked()
 
 
 # --- 스냅샷 캐시 -------------------------------------------------------------
