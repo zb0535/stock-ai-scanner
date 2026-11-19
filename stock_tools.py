@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import yfinance as yf
 
+import finnhub_client
 import sec_edgar
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -51,9 +52,16 @@ _FIN_FIELDS = {
 # SEC EDGAR가 대신 채울 수 있는 항목(선행 PER은 공시 데이터로 계산할 수 없다).
 _SEC_FIELDS = ("trailing_pe", "revenue_growth", "operating_margins", "debt_to_equity")
 
+# Finnhub(3순위)를 호출할지 판단하는 핵심 항목. 하나라도 Yahoo·SEC 모두에서 비면 호출한다.
+# (SEC가 이미 다 채운 미국 종목은 Finnhub 무료 쿼터를 쓰지 않는다.)
+_FINNHUB_TRIGGER_FIELDS = ("trailing_pe", "revenue_growth", "operating_margins", "debt_to_equity")
+
 # t.info가 막힌 서버(Render 등)에서도 재무 지표를 유지하기 위한 SEC EDGAR 폴백 스위치.
 # SEC_EDGAR_FALLBACK=0 으로 끌 수 있다.
 SEC_FALLBACK_ENABLED = os.environ.get("SEC_EDGAR_FALLBACK", "1") not in ("0", "false", "False")
+
+# 3순위 Finnhub 폴백 스위치. FINNHUB_FALLBACK=0 또는 FINNHUB_API_KEY 미설정 시 꺼진다.
+FINNHUB_FALLBACK_ENABLED = os.environ.get("FINNHUB_FALLBACK", "1") not in ("0", "false", "False")
 
 # t.info가 연속으로 실패하면 잠시 호출을 멈춘다(429 폭풍 방지).
 _INFO_FAIL_THRESHOLD = 5
@@ -238,24 +246,45 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
             logger.warning("%s: SEC EDGAR 폴백 실패 → %s: %s", sym, type(exc).__name__, str(exc)[:120])
             sec_financials = {}
 
+    # --- Finnhub 폴백(3순위) ---
+    # Yahoo도 SEC도 채우지 못한 핵심 지표가 남았을 때만 호출한다(예: us-gaap 태그가 없는
+    # 외국 ADR TSM). 이미 SEC가 다 채운 미국 종목은 Finnhub 무료 쿼터를 쓰지 않는다.
+    finnhub_financials: dict = {}
+    still_missing = any(
+        fresh[key] is None and sec_financials.get(key) is None
+        for key in _FINNHUB_TRIGGER_FIELDS
+    )
+    if FINNHUB_FALLBACK_ENABLED and still_missing and finnhub_client.is_enabled():
+        try:
+            finnhub_financials = finnhub_client.get_financial_metrics(sym) or {}
+        except Exception as exc:  # 폴백 실패가 차트·시세를 망가뜨리지 않게
+            logger.warning("%s: Finnhub 폴백 실패 → %s: %s", sym, type(exc).__name__, str(exc)[:120])
+            finnhub_financials = {}
+
     def _fill(key: str):
-        """yfinance 최신값 > SEC EDGAR 계산값 > 직전 캐시값 순으로 쓴다."""
+        """yfinance 최신값 > SEC EDGAR 계산값 > Finnhub 값 > 직전 캐시값 순으로 쓴다."""
         if fresh[key] is not None:
             return fresh[key]
         if sec_financials.get(key) is not None:
             return sec_financials[key]
+        if finnhub_financials.get(key) is not None:
+            return finnhub_financials[key]
         return previous[key]
 
     financials = {key: _fill(key) for key in _FIN_FIELDS}
     sec_filled = [key for key in _SEC_FIELDS
                   if fresh[key] is None and sec_financials.get(key) is not None]
+    finnhub_filled = [key for key in _FIN_FIELDS
+                      if fresh[key] is None and sec_financials.get(key) is None
+                      and finnhub_financials.get(key) is not None]
     cache_filled = any(
-        fresh[key] is None and sec_financials.get(key) is None and previous[key] is not None
+        fresh[key] is None and sec_financials.get(key) is None
+        and finnhub_financials.get(key) is None and previous[key] is not None
         for key in _FIN_FIELDS
     )
     financials_available = any(value is not None for value in financials.values())
-    # t.info가 죽었는데 SEC도 못 채우고 직전 캐시만 남은 경우에만 stale로 표시한다.
-    financials_stale = bool(cache_filled and not fresh_ok and not sec_filled)
+    # t.info가 죽었는데 SEC·Finnhub도 못 채우고 직전 캐시만 남은 경우에만 stale로 표시한다.
+    financials_stale = bool(cache_filled and not fresh_ok and not sec_filled and not finnhub_filled)
 
     name = None
     if info:
@@ -275,15 +304,34 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     if financials_stale:
         payload["financials_stale"] = True
         payload["financials_note"] = "재무 지표 일시 미수신(Yahoo API 제한) — 직전 조회값 유지, 가격·이평선·RSI는 최신"
+    elif sec_filled and finnhub_filled and not fresh_ok:
+        payload["financials_note"] = "재무 지표는 SEC EDGAR 공시(XBRL)·Finnhub 기준으로 보완 — Yahoo API 제한 시 자동 대체, 가격·이평선·RSI는 최신"
+    elif sec_filled and finnhub_filled:
+        payload["financials_note"] = "일부 재무 지표는 SEC EDGAR 공시(XBRL)·Finnhub에서 보완"
     elif sec_filled and not fresh_ok:
         payload["financials_note"] = "재무 지표는 SEC EDGAR 공시(XBRL) 기준으로 보완 — Yahoo API 제한 시 자동 대체, 가격·이평선·RSI는 최신"
     elif sec_filled:
         payload["financials_note"] = "일부 재무 지표는 SEC EDGAR 공시(XBRL)에서 보완"
+    elif finnhub_filled and not fresh_ok:
+        payload["financials_note"] = "재무 지표는 Finnhub 데이터로 보완 — Yahoo·SEC 공시에 값이 없어 자동 대체, 가격·이평선·RSI는 최신"
+    elif finnhub_filled:
+        payload["financials_note"] = "일부 재무 지표는 Finnhub 데이터에서 보완"
     elif not financials_available:
         payload["financials_note"] = "재무 지표 일시 미수신(Yahoo API 제한) — 가격·이평선·RSI만 유효"
     if financials_available:
         # 어느 출처에서 채웠는지 남긴다(프론트엔드는 이 키를 몰라도 동작한다).
-        payload["financials_source"] = "sec_edgar" if (sec_filled and not fresh_ok) else "yfinance"
+        if finnhub_filled:
+            if not fresh_ok and not sec_filled:
+                source = "finnhub"
+            elif sec_filled and not fresh_ok:
+                source = "sec_edgar+finnhub"
+            elif sec_filled:
+                source = "yfinance+sec_edgar+finnhub"
+            else:
+                source = "yfinance+finnhub"
+        else:
+            source = "sec_edgar" if (sec_filled and not fresh_ok) else "yfinance"
+        payload["financials_source"] = source
     if info_error and not financials_available:
         payload["financials_error"] = info_error
     return payload
