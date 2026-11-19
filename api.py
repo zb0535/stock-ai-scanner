@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import threading
 import time
@@ -84,8 +85,12 @@ def _get_recent_news(ticker: str, limit: int = 3) -> list[str]:
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
-    """헬스 체크. UptimeRobot 무료 모니터는 HEAD로 찔러오므로 HEAD에도 200을 준다."""
-    return {"status": "ok"}
+    """헬스 체크. UptimeRobot 무료 모니터는 HEAD로 찔러오므로 HEAD에도 200을 준다.
+
+    `build`는 Render가 주는 배포 커밋(RENDER_GIT_COMMIT) 앞 7자다. 어느 커밋이
+    실제로 떠 있는지 바로 확인할 수 있어 배포 검증에 쓴다(로컬 실행 시 "local").
+    """
+    return {"status": "ok", "build": (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "local"}
 
 
 @app.api_route("/api/watchlist", methods=["GET", "HEAD"])
