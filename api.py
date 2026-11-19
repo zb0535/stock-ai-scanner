@@ -5,6 +5,8 @@ import os
 import re
 import threading
 import time
+from contextlib import asynccontextmanager
+
 import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
@@ -44,7 +46,24 @@ SYSTEM_PROMPT = """너는 미국 주식 차트·재무제표 스크리닝 보조
   ]
 }"""
 
-app = FastAPI(title="미국 주식 AI 스크리너 API")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """기동/종료 훅 — S&P 500 스냅샷을 백그라운드에서 미리 채워 둔다.
+
+    기동 직후 바로 스캔하지 않고 8초 쉬어 Render 헬스체크(`GET /`)가 먼저 200을 받게 하고,
+    이후 50분마다 다시 채워 TTL(70분)이 만료되기 전에 갈아끼운다. 예열은 데몬 스레드라
+    실패해도 서버는 계속 동작하고, 직전 스냅샷을 그대로 서빙한다.
+    `SP500_PREWARM=0`이면 예열을 끈다(단위 테스트·로컬 실행).
+    """
+    sp500_scanner.start_prewarm()
+    try:
+        yield
+    finally:
+        sp500_scanner.stop_prewarm()
+
+
+app = FastAPI(title="미국 주식 AI 스크리너 API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -131,10 +150,13 @@ def health():
     `build`는 Render가 주는 배포 커밋(RENDER_GIT_COMMIT) 앞 7자다. 어느 커밋이
     실제로 떠 있는지 바로 확인할 수 있어 배포 검증에 쓴다(로컬 실행 시 "local").
     `finnhub`은 키 설정 여부·마지막 실패 사유만 노출한다(키 본문은 응답에 없다).
+    `sp500_cache`는 S&P 500 프리 스캔 스냅샷 상태(예열 여부·종목 수·나이)다. 이 응답은
+    스캔 중에도 즉시 돌아온다 — 락은 dict 복사 순간만 잡는다.
     """
     return {"status": "ok", "build": (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "local",
             "finnhub": finnhub_status(),
-            "storage_backend": history_store.storage_backend()}
+            "storage_backend": history_store.storage_backend(),
+            "sp500_cache": sp500_scanner.cache_status()}
 
 
 @app.api_route("/api/watchlist", methods=["GET", "HEAD"])

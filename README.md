@@ -18,10 +18,17 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   관심 종목 대신 **S&P 500 약 500종목을 기술적으로 먼저 훑어** 조건(전략)에 맞는 상위 15개를 자동
   발굴한다. 6개월 일봉을 100종목씩 `yf.download`로 배치 수신해 이평선·RSI·MACD·볼린저·거래량·고점
   대비 낙폭만으로 점수를 내고(프리 스캔에서는 `t.info`·SEC·Finnhub·뉴스를 부르지 않는다), 선정된
-  15개에만 기존 3단 재무 파이프라인 + 뉴스 + Gemini를 적용한다. 스캔 스냅샷은 메모리에 1시간
+  15개에만 기존 3단 재무 파이프라인 + 뉴스 + Gemini를 적용한다. 스캔 스냅샷은 메모리에 70분
   캐시(스레드 안전)되어 반복 조회는 즉시 응답한다. 응답은 기존과 같은 `analysis`·`all_stocks`·
   `strategy`에 `mode`(`watchlist`|"sp500")·`universe_scanned`(스캔한 종목 수)가 더해진다.
-  기본값은 `"watchlist"`라 기존 클라이언트는 그대로 동작한다. 첫 스캔은 수십 초, 이후 1시간은 캐시.
+  기본값은 `"watchlist"`라 기존 클라이언트는 그대로 동작한다.
+  - **백그라운드 예열(50분 주기)**: 서버가 뜨면 8초 뒤 첫 스캔을 백그라운드 데몬 스레드로 돌리고
+    이후 50분마다 갱신한다(TTL 70분보다 짧아 캐시가 만료된 채 사용자 요청을 맞지 않는다).
+    사용자는 보통 2분이 아니라 몇 초 만에 응답을 받는다. 예열은 사용자 스캔과 같은 `_SCAN_LOCK`을
+    써서 겹쳐도 500종목을 두 번 받지 않고, 실패하면 경고만 남기고 직전 스냅샷을 그대로 서빙한다.
+    `SP500_PREWARM=0`으로 끈다(단위 테스트·로컬 실행). 상태는 `GET /`의 `sp500_cache`
+    (`warm`·`fresh`·`tickers`·`age_sec`·`ttl_sec`·`prewarm_enabled`·`prewarm_running`·
+    `prewarm_last_ok_sec`)로 확인한다 — 스캔 중에도 즉시 응답한다.
   종목 목록은 Wikipedia(8초 타임아웃) → 실패 시 내장 503종목 폴백으로 항상 채워진다.
 - Recharts 인터랙티브 차트 및 최근 뉴스 요약
 - **AI 추천 성적표**(`history_store.py`): 사용자가 **직접 고른 픽만** 추적해 현재가와 비교하는
@@ -85,3 +92,4 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `DATABASE_URL` | 외부 PostgreSQL 접속 문자열(선택). 없으면 SQLite(`data/recommendations.db`) |
 | `HISTORY_DB_PATH` | SQLite 파일 경로(선택, `DATABASE_URL`이 없을 때만) |
 | `FINNHUB_API_KEY` / `FINN_API_KEY` | Finnhub 재무 보완(선택) |
+| `SP500_PREWARM` | S&P 500 스냅샷 백그라운드 예열(기본 켜짐). `0`이면 끔(단위 테스트·로컬 실행) |

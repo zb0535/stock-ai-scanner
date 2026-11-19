@@ -4,14 +4,18 @@
 ---------
 1. 청크 배치 다운로드 — 250종목이면 100/100/50 세 번, 파라미터(6mo·1d·group_by=ticker) 고정
 2. 누락·NaN·짧은 이력 종목 허용 — 있는 종목만 남고 예외 없음, 다운로드 전면 실패도 견딤
-3. 1시간 스냅샷 캐시 — 두 번째 조회는 다운로드 0회, 만료 뒤에는 재스캔, 실패 시 직전 스냅샷 유지
+3. 70분 스냅샷 캐시 — 두 번째 조회는 다운로드 0회, 만료 뒤에는 재스캔, 실패 시 직전 스냅샷 유지
 4. 전략별 상위 선정 — 과매도/모멘텀/가치(프리 스캔 프록시)마다 1등이 다르고 top_n으로 자름
 5. `/api/screen` — `mode="sp500"`은 발굴된 15종목으로 파이프라인을 돌리고, 기존 `watchlist`는 그대로
+6. 백그라운드 예열 — 기동 후 자동 예열·`SP500_PREWARM=0` 비활성·중복 스캔 방지·실패 시 스냅샷 유지,
+   `GET /`의 `sp500_cache` 요약이 스캔 중에도 즉시 응답
 
 실행: python -m unittest discover -s tests -v
 """
 import json
+import os
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -445,6 +449,235 @@ class Sp500ListTests(ScannerTestBase):
         self.assertEqual(resp.status_code, 200)
         self.assertGreater(len(body["results"]), 400)
         self.assertEqual(set(body["results"][0]), {"symbol", "name", "exchange"})
+
+
+# --- 6. 백그라운드 예열 ------------------------------------------------------
+
+def wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    """`predicate()`가 참이 될 때까지 짧게 기다린다(스레드 테스트용)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
+class PrewarmTests(ScannerTestBase):
+    """예열 스레드: 기동 후 자동 예열·플래그 비활성·중복 스캔 방지·실패 견딤."""
+
+    def setUp(self):
+        super().setUp()
+        sp500_scanner.stop_prewarm()
+        self._env = patch.dict(os.environ, {sp500_scanner.PREWARM_ENV: "1"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def tearDown(self):
+        sp500_scanner.stop_prewarm()
+        super().tearDown()
+
+    def test_prewarm_enabled_reads_the_env_flag(self):
+        self.assertTrue(sp500_scanner.prewarm_enabled())  # 미설정·빈 값·1은 켜짐
+        for raw in ("0", "false", "FALSE", "no", "off"):
+            with patch.dict(os.environ, {sp500_scanner.PREWARM_ENV: raw}):
+                self.assertFalse(sp500_scanner.prewarm_enabled(), raw)
+        for raw in ("1", "true", "on", ""):
+            with patch.dict(os.environ, {sp500_scanner.PREWARM_ENV: raw}):
+                self.assertTrue(sp500_scanner.prewarm_enabled(), raw)
+
+    def test_background_thread_warms_the_snapshot_after_the_first_delay(self):
+        fake = self.scan_with({"AAA": uptrend(), "BBB": washed_out()}, ["AAA", "BBB"])
+        self.assertFalse(sp500_scanner.cache_status()["warm"])
+
+        started = sp500_scanner.start_prewarm(first_delay=0.01, interval=3600)
+
+        self.assertTrue(started)
+        self.assertTrue(wait_until(lambda: sp500_scanner.cache_status()["warm"]))
+        status = sp500_scanner.cache_status()
+        self.assertEqual(status["tickers"], 2)
+        self.assertTrue(status["fresh"])
+        self.assertGreaterEqual(status["age_sec"], 0)
+        self.assertIsNotNone(status["prewarm_last_ok_sec"])
+        self.assertEqual(len(fake.calls), 1)  # 예열이 500종목 스캔을 한 번 돌렸다
+
+    def test_start_is_idempotent_and_stop_ends_the_thread(self):
+        self.scan_with({"AAA": uptrend()}, ["AAA"])
+        self.assertTrue(sp500_scanner.start_prewarm(first_delay=3600, interval=3600))
+        self.assertFalse(sp500_scanner.start_prewarm(first_delay=3600, interval=3600))
+        self.assertTrue(sp500_scanner.cache_status()["prewarm_running"])
+
+        sp500_scanner.stop_prewarm()
+
+        self.assertFalse(sp500_scanner.cache_status()["prewarm_running"])
+        self.assertIsNone(sp500_scanner._PREWARM["thread"])
+
+    def test_flag_zero_disables_prewarming_without_scanning(self):
+        fake = self.scan_with({"AAA": uptrend()}, ["AAA"])
+        with patch.dict(os.environ, {sp500_scanner.PREWARM_ENV: "0"}):
+            started = sp500_scanner.start_prewarm(first_delay=0.01, interval=3600)
+            time.sleep(0.15)
+            status = sp500_scanner.cache_status()
+
+        self.assertFalse(started)
+        self.assertFalse(status["prewarm_enabled"])
+        self.assertFalse(status["prewarm_running"])
+        self.assertFalse(status["warm"])
+        self.assertEqual(fake.calls, [])
+
+    def test_force_flag_starts_even_when_disabled(self):
+        self.scan_with({"AAA": uptrend()}, ["AAA"])
+        with patch.dict(os.environ, {sp500_scanner.PREWARM_ENV: "0"}):
+            started = sp500_scanner.start_prewarm(first_delay=3600, interval=3600, force=True)
+        self.assertTrue(started)
+        self.assertTrue(sp500_scanner.cache_status()["prewarm_running"])
+
+    def test_prewarm_skips_a_snapshot_that_is_still_fresh(self):
+        fake = self.scan_with({"AAA": uptrend()}, ["AAA"])
+        sp500_scanner.prescan(force_refresh=True)
+        calls = len(fake.calls)
+
+        result = sp500_scanner.prewarm_once()
+
+        self.assertFalse(result["scanned"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(fake.calls), calls)  # 다운로드 추가 0회
+
+    def test_prewarm_refreshes_before_the_ttl_expires(self):
+        """예열 주기(50분)가 TTL(70분)보다 짧아, 사용자가 만료된 캐시를 맞지 않는다."""
+        fake = self.scan_with({"AAA": uptrend()}, ["AAA"])
+        sp500_scanner.prescan(force_refresh=True)
+        self.assertLess(sp500_scanner.PREWARM_INTERVAL, sp500_scanner.PRESCAN_TTL)
+        sp500_scanner._SNAPSHOT["ts"] = time.time() - (sp500_scanner.PREWARM_REFRESH_AGE + 60)
+
+        result = sp500_scanner.prewarm_once()
+
+        self.assertTrue(result["scanned"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(fake.calls), 2)
+        self.assertLess(sp500_scanner.snapshot_age(), 5)
+
+    def test_prewarm_failure_keeps_the_previous_snapshot(self):
+        self.scan_with({"AAA": uptrend()}, ["AAA"])
+        sp500_scanner.prescan(force_refresh=True)
+        sp500_scanner._SNAPSHOT["ts"] = time.time() - (sp500_scanner.PREWARM_REFRESH_AGE + 60)
+        sp500_scanner.yf.download = FakeDownload({}, fail=True)
+
+        result = sp500_scanner.prewarm_once()
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["stale"])
+        self.assertEqual(sp500_scanner.cache_status()["tickers"], 1)
+        self.assertEqual([r["ticker"] for r in sp500_scanner.prescan()["rows"]], ["AAA"])
+
+    def test_user_scan_and_prewarm_overlap_runs_a_single_scan(self):
+        """사용자 스캔이 도는 중에 예열이 겹치면, `_SCAN_LOCK` 뒤 재검사로 두 번 받지 않는다."""
+        calls = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_scan(tickers=None):
+            calls.append(1)
+            started.set()
+            release.wait(5)
+            return {"rows": [{"ticker": "AAA"}], "universe": 1, "skipped": 0}
+
+        self.patch(sp500_scanner, "_scan_universe", slow_scan)
+        user = threading.Thread(target=sp500_scanner.prescan, kwargs={"force_refresh": True},
+                                daemon=True)
+        user.start()
+        self.assertTrue(started.wait(2))
+
+        outcome = {}
+        warmer = threading.Thread(target=lambda: outcome.update(sp500_scanner.prewarm_once()),
+                                  daemon=True)
+        warmer.start()
+        time.sleep(0.05)
+        release.set()
+        user.join(5)
+        warmer.join(5)
+
+        self.assertEqual(len(calls), 1)  # 500종목을 두 번 받지 않았다
+        self.assertFalse(outcome["scanned"])
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(sp500_scanner.cache_status()["tickers"], 1)
+
+
+@unittest.skipIf(TestClient is None, "fastapi.testclient 사용에 httpx가 필요합니다")
+class HealthCacheStatusTests(ScannerTestBase):
+    """`GET /`의 `sp500_cache` 요약 — 스캔 중에도 막히지 않는다."""
+
+    def setUp(self):
+        super().setUp()
+        sp500_scanner.stop_prewarm()
+        self._env = patch.dict(os.environ, {sp500_scanner.PREWARM_ENV: "1"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def tearDown(self):
+        sp500_scanner.stop_prewarm()
+        super().tearDown()
+
+    def test_health_reports_an_empty_cache(self):
+        cache = TestClient(api.app).get("/").json()["sp500_cache"]
+        self.assertFalse(cache["warm"])
+        self.assertIsNone(cache["age_sec"])
+        self.assertEqual(cache["tickers"], 0)
+        self.assertTrue(cache["prewarm_enabled"])
+        self.assertEqual(cache["ttl_sec"], sp500_scanner.PRESCAN_TTL)
+
+    def test_health_reports_warm_cache_with_tickers_and_age(self):
+        self.scan_with({"AAA": uptrend(), "BBB": washed_out()}, ["AAA", "BBB"])
+        sp500_scanner.prescan(force_refresh=True)
+
+        cache = TestClient(api.app).get("/").json()["sp500_cache"]
+
+        self.assertTrue(cache["warm"])
+        self.assertTrue(cache["fresh"])
+        self.assertEqual(cache["tickers"], 2)
+        self.assertIsInstance(cache["age_sec"], int)
+        self.assertGreaterEqual(cache["age_sec"], 0)
+
+    def test_health_answers_immediately_while_a_scan_is_running(self):
+        self.scan_with({"AAA": uptrend()}, ["AAA"])
+        sp500_scanner.prescan(force_refresh=True)
+        release = threading.Event()
+        started = threading.Event()
+
+        def blocking_scan(tickers=None):
+            started.set()
+            release.wait(5)
+            return {"rows": [{"ticker": "BBB"}], "universe": 1, "skipped": 0}
+
+        self.patch(sp500_scanner, "_scan_universe", blocking_scan)
+        scan = threading.Thread(target=sp500_scanner.prescan, kwargs={"force_refresh": True},
+                                daemon=True)
+        scan.start()
+        self.assertTrue(started.wait(2))
+        try:
+            began = time.time()
+            body = TestClient(api.app).get("/").json()
+            elapsed = time.time() - began
+        finally:
+            release.set()
+            scan.join(5)
+
+        self.assertLess(elapsed, 1.0)  # 스캔(수 분)이 끝나기를 기다리지 않았다
+        self.assertTrue(body["sp500_cache"]["warm"])
+        self.assertEqual(body["sp500_cache"]["tickers"], 1)  # 직전 스냅샷을 그대로 보고
+
+    def test_lifespan_starts_and_stops_the_prewarmer(self):
+        with patch.object(sp500_scanner, "PREWARM_FIRST_DELAY", 3600):  # 테스트 중 실제 스캔 금지
+            with TestClient(api.app) as client:
+                self.assertTrue(client.get("/").json()["sp500_cache"]["prewarm_running"])
+            self.assertFalse(sp500_scanner.cache_status()["prewarm_running"])
+
+    def test_lifespan_respects_the_disable_flag(self):
+        with patch.dict(os.environ, {sp500_scanner.PREWARM_ENV: "0"}):
+            with TestClient(api.app) as client:
+                cache = client.get("/").json()["sp500_cache"]
+                self.assertFalse(cache["prewarm_running"])
+                self.assertFalse(cache["prewarm_enabled"])
 
 
 if __name__ == "__main__":
