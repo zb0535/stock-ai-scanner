@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -309,9 +310,9 @@ def track_performance(req: TrackRequest):
         raise HTTPException(status_code=400, detail="invalid_ticker")
 
     entry = req.entry_price
-    if entry is not None and entry == entry:  # NaN이면 서버가 채운다
-        entry = float(entry)
-    if entry is None or entry <= 0:
+    if entry is not None and (not math.isfinite(entry) or entry <= 0):
+        entry = None  # NaN·inf·0·음수는 "값 없음"으로 보고 서버가 채운다
+    if entry is None:
         try:
             price = history_store.latest_prices([ticker]).get(ticker)
         except Exception as exc:  # 가격 조회가 죽어도 400으로 깔끔하게 끝낸다

@@ -556,6 +556,18 @@ class TrackApiTests(StubPricesMixin, TempDB):
                 body = self.track(ticker="MSFT", entry_price=bad, strategy=f"s{bad}").json()
                 self.assertEqual(body["pick"]["entry_price"], 410.0)
 
+    def test_track_treats_nan_or_inf_price_as_missing(self):
+        # NaN·Infinity는 표준 JSON이 아니라 원문으로 보낸다(json 모듈은 받아준다).
+        for raw in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(price=raw):
+                resp = self.client.post(
+                    "/api/performance/track",
+                    content=f'{{"ticker": "MSFT", "entry_price": {raw}, "strategy": "{raw}"}}',
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.json()["pick"]["entry_price"], 410.0)
+
     def test_track_unknown_ticker_is_400(self):
         self.stub_prices({})                        # 어떤 티커도 가격이 없다
         resp = self.track(ticker="ZZZZ", strategy="value")
