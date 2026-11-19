@@ -73,6 +73,7 @@ export default function App() {
   const [searchResults, setSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [criteria, setCriteria] = useState(PRESETS[0].text);
+  const [mode, setMode] = useState("watchlist");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
@@ -155,14 +156,16 @@ export default function App() {
 
   const handleAnalyze = async (e) => {
     e.preventDefault();
-    if (tickers.length === 0) return setError("종목을 1개 이상 선택해 주세요.");
+    if (mode === "watchlist" && tickers.length === 0) return setError("종목을 1개 이상 선택해 주세요.");
     setLoading(true);
     setError("");
     try {
+      const body = { criteria, mode };
+      if (mode === "watchlist") body.tickers = tickers;
       const res = await fetch(`${API_BASE}/api/screen`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ criteria, tickers }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error(`서버 오류 (${res.status})`);
       setResult(await res.json());
@@ -189,20 +192,51 @@ export default function App() {
         </header>
 
         <section className="panel">
-          <div className="panel-head">
-            <span>관심 종목 풀 ({tickers.length}개 선택됨)</span>
-            <button type="button" className="picker-btn" onClick={() => setModalOpen(true)}>
-              🔍 종목 검색 · 선택
+          <div className="mode-switch" role="tablist" aria-label="스크리닝 모드">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "watchlist"}
+              className={`mode-btn ${mode === "watchlist" ? "active" : ""}`}
+              onClick={() => { setMode("watchlist"); setError(""); }}
+            >
+              📋 내 관심 종목
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "sp500"}
+              className={`mode-btn ${mode === "sp500" ? "active" : ""}`}
+              onClick={() => { setMode("sp500"); setError(""); }}
+            >
+              🌐 S&P 500 자동 발굴
             </button>
           </div>
-          <div className="chips">
-            {tickers.map((t) => (
-              <span className="chip" key={t}>
-                {t}
-                <button type="button" onClick={() => toggleTicker(t)}>×</button>
-              </span>
-            ))}
-          </div>
+
+          {mode === "sp500" ? (
+            <div className="mode-note">
+              S&P 500 약 500종목을 6개월 차트(이평선·RSI·MACD·볼린저·거래량)로 먼저 훑어 조건에
+              맞는 상위 15개만 뽑고, 그 종목에만 재무·뉴스를 붙여 AI가 최종 선정합니다.
+              첫 조회는 30~60초, 이후 1시간은 캐시로 빠르게 응답합니다.
+            </div>
+          ) : (
+            <>
+              <div className="panel-head">
+                <span>관심 종목 풀 ({tickers.length}개 선택됨)</span>
+                <button type="button" className="picker-btn" onClick={() => setModalOpen(true)}>
+                  🔍 종목 검색 · 선택
+                </button>
+              </div>
+              <div className="chips">
+                {tickers.map((t) => (
+                  <span className="chip" key={t}>
+                    {t}
+                    <button type="button" onClick={() => toggleTicker(t)}>×</button>
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
 
           <div className="presets">
             {PRESETS.map((p) => (
@@ -224,7 +258,7 @@ export default function App() {
               placeholder="스크리닝 조건을 입력하세요..."
             />
             <button type="submit" disabled={loading}>
-              {loading ? "분석 중..." : "✨ AI 분석 실행"}
+              {loading ? (mode === "sp500" ? "S&P 500 발굴 중..." : "분석 중...") : "✨ AI 분석 실행"}
             </button>
           </form>
         </section>
@@ -246,6 +280,11 @@ export default function App() {
 
         {result && !loading && (
           <>
+            {result.mode === "sp500" && (
+              <div className="scan-badge">
+                🌐 S&P 500 {result.universe_scanned}종목 자동 발굴 → 상위 {result.all_stocks.length}종목 분석
+              </div>
+            )}
             <div className="summary">
               <span className="summary-tag">MARKET INSIGHT</span>
               <p>{result.analysis.market_note}</p>

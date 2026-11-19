@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import threading
@@ -12,9 +13,15 @@ from google import genai
 from google.genai import types
 import stock_tools
 import scoring
+import sp500_scanner
 from finnhub_client import status as finnhub_status
 
+logger = logging.getLogger("api")
+
 MODEL_ID = "gemini-3.5-flash-lite"
+
+# S&P 500 자동 발굴에서 Gemini로 넘길 후보 수.
+DISCOVERY_TOP_N = sp500_scanner.TOP_N
 
 SYSTEM_PROMPT = """너는 미국 주식 차트·재무제표 스크리닝 보조 봇이다.
 제공된 데이터에 없는 가격·지표·뉴스를 절대 지어내지 마라.
@@ -46,8 +53,17 @@ app.add_middleware(
 
 
 class ScreenRequest(BaseModel):
+    """스크리닝 요청.
+
+    `mode`는 추가 필드다(기본 "watchlist").
+    - "watchlist": `tickers`(없으면 기본 관심 종목 15개) 안에서 고른다. 기존 동작 그대로.
+    - "sp500": S&P 500 약 500종목을 기술적으로 먼저 훑어 조건에 맞는 상위 15개를 자동
+      발굴한 뒤, 그 15개에만 기존 3단 재무 파이프라인 + 뉴스 + Gemini를 적용한다.
+    """
+
     criteria: str
     tickers: list[str] | None = None
+    mode: str = "watchlist"
 
 
 # --- 뉴스 캐시: 종목별 30분 (429/401 방지) -----------------------------------
@@ -103,26 +119,15 @@ def health():
 def get_watchlist():
     return {"tickers": stock_tools.get_watchlist()}
 
-_SP500_CACHE = None
-
-
 @app.get("/api/sp500")
 def get_sp500():
-    global _SP500_CACHE
-    if _SP500_CACHE is None:
-        try:
-            df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-            _SP500_CACHE = [
-                {
-                    "symbol": str(r["Symbol"]).replace(".", "-"),
-                    "name": str(r["Security"]),
-                    "exchange": str(r["GICS Sector"]),
-                }
-                for _, r in df.iterrows()
-            ]
-        except Exception:
-            _SP500_CACHE = []
-    return {"results": _SP500_CACHE}
+    """S&P 500 목록(웹 종목 선택 모달용).
+
+    목록 로딩은 `sp500_scanner`가 맡는다 — Wikipedia 조회에 8초 타임아웃을 걸고, 실패하면
+    내장 폴백 목록(503개)을 쓰므로 이 엔드포인트가 빈 목록으로 떨어지지 않는다.
+    응답 형태(`{"results": [{symbol, name, exchange}]}`)는 기존과 같다.
+    """
+    return {"results": sp500_scanner.get_sp500_table()["rows"]}
 
 @app.get("/api/search")
 def search_stocks(q: str = ""):
@@ -173,7 +178,29 @@ def _attach_chart(pick: dict) -> dict:
 
 @app.post("/api/screen")
 def screen_stocks(req: ScreenRequest):
-    tickers = [t.strip().upper() for t in (req.tickers or stock_tools.get_watchlist()) if t.strip()]
+    mode = (req.mode or "watchlist").strip().lower()
+    if mode not in ("watchlist", "sp500"):
+        mode = "watchlist"  # 모르는 값은 기존 동작으로 되돌린다(클라이언트 호환)
+
+    universe_scanned = None
+    if mode == "sp500":
+        started = time.time()
+        discovery = sp500_scanner.select_candidates(req.criteria, top_n=DISCOVERY_TOP_N)
+        tickers = discovery["tickers"]
+        universe_scanned = discovery["universe_scanned"]
+        logger.info(
+            "S&P 500 발굴: 전략=%s 유니버스=%d 산출=%d 상위=%d 캐시=%s %.1fs %s",
+            discovery["strategy"], discovery["universe_scanned"], discovery["scanned"],
+            len(tickers), discovery["cached"], time.time() - started, ",".join(tickers),
+        )
+        if not tickers:
+            # 프리 스캔이 완전히 비었을 때(모든 다운로드 실패)는 관심 종목으로 안전하게 되돌린다.
+            logger.warning("S&P 500 발굴 결과 없음 → 관심 종목으로 대체")
+            tickers = [t.strip().upper() for t in (req.tickers or stock_tools.get_watchlist())
+                       if t.strip()]
+            universe_scanned = 0
+    else:
+        tickers = [t.strip().upper() for t in (req.tickers or stock_tools.get_watchlist()) if t.strip()]
     # 15개 종목을 순차 조회하면 13초 넘게 걸리므로, 최대 6개씩 병렬로 당긴다.
     # bounded_map이 입력 순서를 유지해 주므로 점수가 같은 종목의 정렬도 흔들리지 않는다.
     rows = stock_tools.bounded_map(_screen_row, tickers)
@@ -186,7 +213,9 @@ def screen_stocks(req: ScreenRequest):
     res = client.models.generate_content(
         model=MODEL_ID,
         contents=(
-            f"조건: {req.criteria}\n"
+            (f"발굴 유니버스: S&P 500 {universe_scanned}종목 중 기술적 사전 스캔 상위 "
+             f"{len(tickers)}종목(관심 종목 목록이 아니다)\n" if mode == "sp500" else "")
+            + f"조건: {req.criteria}\n"
             f"strategy: {strategy} ({scoring.STRATEGY_LABELS.get(strategy, strategy)})\n\n"
             f"종목 데이터(quant_score 내림차순):\n{json.dumps(rows, ensure_ascii=False)}"
         ),
@@ -216,8 +245,9 @@ def screen_stocks(req: ScreenRequest):
     # 추천 종목의 차트·뉴스도 선택된 개수만큼 병렬로 채운다(보통 3개).
     stock_tools.bounded_map(_attach_chart, picks)
 
-    # strategy는 추가 필드다(기존 클라이언트는 무시해도 동작한다).
-    return {"analysis": data, "all_stocks": rows, "strategy": strategy}
+    # strategy·mode·universe_scanned는 추가 필드다(기존 클라이언트는 무시해도 동작한다).
+    return {"analysis": data, "all_stocks": rows, "strategy": strategy,
+            "mode": mode, "universe_scanned": universe_scanned}
 
 
 @app.get("/api/stock/{ticker}")

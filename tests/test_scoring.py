@@ -550,7 +550,9 @@ class ScreenIntegrationTests(unittest.TestCase):
         body = TestClient(api.app).post(
             "/api/screen", json={"criteria": "모멘텀 돌파", "tickers": ["MID"]}).json()
 
-        self.assertEqual(sorted(body), ["all_stocks", "analysis", "strategy"])
+        self.assertEqual(sorted(body),
+                         ["all_stocks", "analysis", "mode", "strategy", "universe_scanned"])
+        self.assertEqual(body["mode"], "watchlist")  # 기본값은 기존과 같은 관심 종목 모드
         self.assertEqual(body["analysis"]["market_note"], "요약")
         pick = body["analysis"]["top_picks"][0]
         self.assertEqual(len(pick["chart"]), 60)

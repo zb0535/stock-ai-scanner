@@ -103,6 +103,27 @@ def score_stock(stock: dict, strategy: str = "balanced") -> tuple[float, list[st
     return scorer.score(), scorer.signals()
 
 
+def score_prescan(stock: dict, strategy: str = "balanced") -> tuple[float, list[str]]:
+    """재무 지표가 아직 없는 **프리 스캔**(S&P 500 500종목)용 `(quant_score, signals)`.
+
+    `value`만 다르게 채점한다. 가치 전략의 핵심 근거인 PER·성장률·이익률은 500종목
+    전부에 대해 받아 올 수 없기 때문이다(그 호출이 스캔을 수 분으로 늘린다). 대신
+    '실적이 무너지지 않은 종목의 적당한 조정'을 기술적으로 대신 본다:
+    - 고점 대비 -8~-25% 조정은 매수 기회, -45% 이하 붕괴는 리스크로 감점
+    - RSI 30 안팎의 식음에 가점, 65 이상 과열은 진입 위치가 나쁘다고 감점
+    - 60일선에서 -10% 이내(추세 유지)에 가점, -20% 이상 이탈은 감점
+    다른 전략(oversold/momentum/balanced)은 `score_stock`과 동일하다.
+    """
+    strategy = strategy if strategy in STRATEGIES else "balanced"
+    if not isinstance(stock, dict):
+        return 50.0, []
+    if strategy != "value":
+        return score_stock(stock, strategy)
+    scorer = _Scorer()
+    _score_value_prescan(scorer, stock)
+    return scorer.score(), scorer.signals()
+
+
 def rank_stocks(stocks: list[dict], criteria: str | None = None,
                 strategy: str | None = None) -> tuple[list[dict], str]:
     """후보 종목에 quant_score·signals를 붙이고 점수 내림차순으로 정렬해 돌려줍니다.
@@ -242,6 +263,76 @@ def _score_value(s: _Scorer, stock: dict) -> None:
     drawdown = _number(stock.get("drawdown_from_high_pct"))
     if drawdown is not None and drawdown <= -20:
         s.add(3, f"고점{_pct(drawdown, 1)}%")
+
+
+def _score_value_prescan(s: _Scorer, stock: dict) -> None:
+    """가치 전략의 프리 스캔 점수: '품질 있는 조정'을 기술 지표로 대신 본다."""
+    drawdown = _number(stock.get("drawdown_from_high_pct"))
+    if drawdown is not None:
+        if drawdown <= -45:
+            s.add(-12, f"고점{_pct(drawdown, 0)}% 붕괴위험")
+        elif drawdown <= -25:
+            s.add(6, f"고점{_pct(drawdown, 0)}% 조정")
+        elif drawdown <= -8:
+            s.add(14, f"고점{_pct(drawdown, 0)}% 눌림")
+        elif drawdown <= -3:
+            s.add(4, f"고점{_pct(drawdown, 0)}%")
+        else:
+            s.add(-6, "고점근접(조정없음)")
+
+    rsi = _number(stock.get("rsi14"))
+    if rsi is not None:
+        if rsi < 20:
+            s.add(-4, f"RSI{rsi:.1f} 급락")
+        elif rsi < 30:
+            s.add(8, f"RSI{rsi:.1f} 저점")
+        elif rsi < 45:
+            s.add(12, f"RSI{rsi:.1f} 조정")
+        elif rsi < 55:
+            s.add(6, f"RSI{rsi:.1f} 중립")
+        elif rsi < 65:
+            s.add(2, f"RSI{rsi:.1f}")
+        else:
+            s.add(-6, f"RSI{rsi:.1f} 과열")
+
+    position = _number(stock.get("range_position_pct"))
+    if position is not None:
+        if position < 10:
+            s.add(-4, f"저점권({_pct(position)}%)")
+        elif position < 50:
+            s.add(8, f"구간하단({_pct(position)}%)")
+        elif position < 70:
+            s.add(2)
+        elif position >= 85:
+            s.add(-6, f"고점권({_pct(position)}%)")
+
+    price = _number(stock.get("price"))
+    ma60 = _number(stock.get("ma60"))
+    if price and ma60 and ma60 > 0:
+        gap = (price - ma60) / ma60 * 100.0
+        if gap >= 20:
+            s.add(-3, f"60일선+{_pct(gap)}%")
+        elif gap >= 0:
+            s.add(4, f"60일선+{_pct(gap)}%")
+        elif gap >= -10:
+            s.add(6, f"60일선{_pct(gap)}% 근접")
+        elif gap >= -20:
+            s.add(0, f"60일선{_pct(gap)}%")
+        else:
+            s.add(-8, f"60일선{_pct(gap)}% 이탈")
+
+    cross = str(stock.get("macd_cross") or "none").lower()
+    if cross == "bullish":
+        s.add(5, "MACD골든크로스")
+    elif cross == "bearish":
+        s.add(-3, "MACD데드크로스")
+
+    volume_ratio = _number(stock.get("volume_ratio"))
+    if volume_ratio is not None:
+        if 1.0 <= volume_ratio < 2.0:
+            s.add(3, f"거래량{volume_ratio:.1f}x")
+        elif volume_ratio < 0.6:
+            s.add(-3, f"거래량{volume_ratio:.1f}x 부진")
 
 
 def _score_oversold(s: _Scorer, stock: dict) -> None:
