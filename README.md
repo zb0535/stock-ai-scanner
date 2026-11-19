@@ -124,7 +124,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     넣어 두고(`prime_history`, 스냅샷 수명 70분), 발굴된 15종목의 지표·차트가 **재다운로드 0회**로
     끝난다. 종목 병렬도는 6 → 8(`MAX_FETCH_WORKERS`).
   - **Gemini**: `gemini-3.5-flash-lite`(빠른 lite 모델) 그대로, 시도당 25초 상한
-    (`GEMINI_TIMEOUT_MS`) + 최대 3회(503 과부하만 짧게 재시도). 사고(thinking)는 꺼 둔다(`GEMINI_THINKING_BUDGET=0`) —
+    (`GEMINI_TIMEOUT_MS`, 기본 30000ms) + 최대 3회(503 과부하만 짧게 재시도). 사고(thinking)는 꺼 둔다(`GEMINI_THINKING_BUDGET=0`) —
     켜져 있으면 15종목 배치가 25초를 넘겨 504로 폴백되던 것을 확인했다. 타임아웃은 재시도하지
     않고 바로 정량 점수 폴백으로 간다(대기가 두 배가 되지 않게).
   - 응답의 `timings`(ms)에 단계별 소요 시간이 담긴다 — `discovery_ms`(발굴·프리 스캔) ·
@@ -158,6 +158,6 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `SP500_PREWARM` | S&P 500 스냅샷 백그라운드 예열(기본 켜짐). `0`이면 끔(단위 테스트·로컬 실행). 켜져 있지 않으면 코스피 200 예열도 함께 꺼진다 |
 | `KOSPI200_PREWARM` | 코스피 200 스냅샷 백그라운드 예열(기본 켜짐). `0`이면 이 시장만 끔 |
 | `PREWARM_ENABLED` | 백그라운드 예열 전체 스위치(기본 켜짐). `0`이면 S&P 500·코스피 200 모두 예열하지 않음 |
-| `GEMINI_TIMEOUT_MS` | Gemini 호출 한 번의 상한(기본 25000ms). 넘으면 정량 점수 폴백으로 응답 |
+| `GEMINI_TIMEOUT_MS` | Gemini 호출 한 번의 상한(기본 30000ms). 넘으면 정량 점수 폴백으로 응답 |
 | `GEMINI_THINKING_BUDGET` | Gemini 사고 토큰 예산(기본 `0`=끔, 빠름). `-1`이면 모델 자동 |
 | `SEC_EDGAR_FALLBACK` / `FINNHUB_FALLBACK` | Yahoo `t.info` 대체 경로 스위치(기본 켜짐). `0`이면 끔 |

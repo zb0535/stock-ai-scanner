@@ -30,7 +30,7 @@ MODEL_ID = "gemini-3.5-flash-lite"
 
 # Gemini 호출 상한(밀리초). 모델이 느리거나 503을 받았을 때 재시도로 수십 초를
 # 버리지 않도록, 시도당 상한을 짧게 잡고 그 안에서만 재시도한다(실패하면 점수 기반 폴백).
-GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "25000"))
+GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "30000"))
 # 503(모델 과부하)은 1~2초에 빨리 실패하므로 한 번은 더 시도할 값이 있다(총 3회, 최악 +약 2초).
 GEMINI_MAX_ATTEMPTS = 3
 # gemini-3 계열 flash는 기본적으로 '생각(thinking)'을 켜고 답한다. 이 분석은 주어진 수치를
