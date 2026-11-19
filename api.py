@@ -28,6 +28,11 @@ logger = logging.getLogger("api")
 
 MODEL_ID = "gemini-3.5-flash-lite"
 
+# Gemini 호출 상한(밀리초). 모델이 느리거나 503을 받았을 때 2회 재시도로 수십 초를
+# 버리지 않도록, 시도당 상한을 짧게 잡고 그 안에서만 재시도한다(실패하면 점수 기반 폴백).
+GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "25000"))
+GEMINI_MAX_ATTEMPTS = 2
+
 # S&P 500 자동 발굴에서 Gemini로 넘길 후보 수.
 DISCOVERY_TOP_N = sp500_scanner.TOP_N
 
@@ -231,20 +236,20 @@ def _get_recent_news(ticker: str, limit: int = 3) -> list[str]:
         except Exception:
             titles = []
     if not titles:
-        try:
-            items = yf.Ticker(sym).news or []
-            for item in items[:_NEWS_FETCH_LIMIT]:
-                if not isinstance(item, dict):
-                    continue
-                title = item.get("title") or (item.get("content") or {}).get("title")
-                if title:
-                    titles.append(title)
-        except Exception:
-            titles = []
+        # Yahoo 뉴스는 벽시계 타임아웃(5초)+전역 회로 차단기를 거친다 — 막힌 서버에서는
+        # 두 번 실패 뒤 30분 동안 아예 호출하지 않아 뉴스가 배치를 느리게 만들지 않는다.
+        titles = stock_tools.fetch_yahoo_news(sym, limit=_NEWS_FETCH_LIMIT)
 
     with _NEWS_LOCK:
         _NEWS_CACHE[sym] = (now, _NEWS_TTL if titles else _NEWS_TTL_EMPTY, titles)
     return list(titles[:limit])
+
+
+def _yahoo_guard() -> dict:
+    """`GET /`용 Yahoo 호출 가드 상태 — t.info·뉴스 전역 우회와 프리 적재된 일봉 캐시."""
+    return {"info": stock_tools.info_breaker_status(),
+            "news": stock_tools.news_breaker_status(),
+            "history_cache": stock_tools.history_cache_status()}
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -255,14 +260,16 @@ def health():
     실제로 떠 있는지 바로 확인할 수 있어 배포 검증에 쓴다(로컬 실행 시 "local").
     `finnhub`은 키 설정 여부·마지막 실패 사유만 노출한다(키 본문은 응답에 없다).
     `sp500_cache`는 S&P 500 프리 스캔 스냅샷 상태(예열 여부·종목 수·나이)이고,
-    `kospi200_cache`는 코스피 200 스냅샷 상태다. 이 응답은 스캔 중에도 즉시 돌아온다 —
-    락은 dict 복사 순간만 잡는다.
+    `kospi200_cache`는 코스피 200 스냅샷 상태다. `yahoo_guard`는 Yahoo t.info·뉴스의
+    전역 우회 상태와 프리 스캔이 미리 적재한 일봉 캐시 개수다. 이 응답은 스캔 중에도 즉시
+    돌아온다 — 락은 dict 복사 순간만 잡는다.
     """
     return {"status": "ok", "build": (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "local",
             "finnhub": finnhub_status(),
             "storage_backend": history_store.storage_backend(),
             "sp500_cache": sp500_scanner.cache_status(),
             "kospi200_cache": kospi200_scanner.cache_status(),
+            "yahoo_guard": _yahoo_guard(),
             "errors_recent": recent_errors()}
 
 
@@ -429,11 +436,33 @@ def _fallback_analysis(rows: list[dict], note: str) -> dict:
     return {"market_note": note, "top_picks": picks}
 
 
+def _gemini_client():
+    """Gemini 클라이언트 — 요청당 타임아웃을 고정한다(느린 모델 하나가 배치를 잡아먹지 않게).
+
+    google-genai가 `http_options`를 모르는 예전 버전이면 그냥 기본 클라이언트를 쓴다
+    (해설이 조금 느려질 뿐, 스크리닝은 그대로 돈다).
+    """
+    try:
+        return genai.Client(http_options=types.HttpOptions(
+            timeout=GEMINI_TIMEOUT_MS,
+            retry_options=types.HttpRetryOptions(attempts=1),  # 재시도는 우리 루프가 맡는다
+        ))
+    except TypeError:  # 구버전 google-genai
+        return genai.Client()
+
+
 @app.post("/api/screen")
 def screen_stocks(req: ScreenRequest):
     mode = (req.mode or "watchlist").strip().lower()
     if mode not in ("watchlist", "sp500", "kospi200"):
         mode = "watchlist"  # 모르는 값은 기존 동작으로 되돌린다(클라이언트 호환)
+
+    # 단계별 소요 시간(ms). 응답의 `timings`와 로그에 남겨 어느 단계가 느린지 바로 보이게 한다.
+    timings: dict[str, int] = {}
+    _t0 = time.perf_counter()
+
+    def _mark(name: str, since: float) -> None:
+        timings[name] = int((time.perf_counter() - since) * 1000)
 
     universe_scanned = None
     if mode in ("sp500", "kospi200"):
@@ -443,6 +472,7 @@ def screen_stocks(req: ScreenRequest):
         discovery = scanner.select_candidates(req.criteria, top_n=DISCOVERY_TOP_N)
         tickers = discovery["tickers"]
         universe_scanned = discovery["universe_scanned"]
+        _mark("discovery_ms", _t0)
         logger.info(
             "%s 발굴: 전략=%s 유니버스=%d 산출=%d 상위=%d 캐시=%s %.1fs %s",
             universe_label, discovery["strategy"], discovery["universe_scanned"],
@@ -450,16 +480,19 @@ def screen_stocks(req: ScreenRequest):
             time.time() - started, ",".join(tickers),
         )
         if not tickers:
-            # 프리 스캔이 완전히 비었을 때(모든 다운로드 실패)는 관심 종목으로 안전하게 되돌린다.
+            # 프리 스캔이 잠깐 비었을 때(모든 다운로드 실패)는 관심 종목으로 안전하게 되돌린다.
             logger.warning("%s 발굴 결과 없음 → 관심 종목으로 대체", universe_label)
             tickers = [t.strip().upper() for t in (req.tickers or stock_tools.get_watchlist())
                        if t.strip()]
             universe_scanned = 0
     else:
         tickers = [t.strip().upper() for t in (req.tickers or stock_tools.get_watchlist()) if t.strip()]
-    # 15개 종목을 순차 조회하면 13초 넘게 걸리므로, 최대 6개씩 병렬로 당긴다.
-    # bounded_map이 입력 순서를 유지해 주므로 점수가 같은 종목의 정렬도 흔들리지 않는다.
+
+    # 15개 종목을 최대 8개씩 병렬로 당긴다. bounded_map이 입력 순서를 유지해 주므로
+    # 점수가 같은 종목의 정렬도 흔들리지 않는다.
+    _t = time.perf_counter()
     rows = stock_tools.bounded_map(_screen_row, tickers)
+    _mark("rows_ms", _t)
     rows = [_json_safe(row) for row in rows]  # NaN·inf가 프롬프트·응답으로 나가지 않게
 
     # 정량 스코어링: 조건에서 전략을 읽고 quant_score·signals를 붙여 내림차순 정렬한다.
@@ -485,9 +518,10 @@ def screen_stocks(req: ScreenRequest):
     data = None
     analysis_source = "gemini"
     analysis_note = ""
-    for attempt in (1, 2):
+    _t = time.perf_counter()
+    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
         try:
-            client = genai.Client()
+            client = _gemini_client()
             res = client.models.generate_content(
                 model=MODEL_ID,
                 contents=prompt,
@@ -499,13 +533,15 @@ def screen_stocks(req: ScreenRequest):
             data = _parse_analysis(res.text)
             break
         except Exception as exc:
-            logger.warning("Gemini 분석 실패(%d/2) → %s: %s", attempt, type(exc).__name__, str(exc)[:200])
-            if attempt == 2:
+            logger.warning("Gemini 분석 실패(%d/%d) → %s: %s", attempt, GEMINI_MAX_ATTEMPTS,
+                           type(exc).__name__, str(exc)[:200])
+            if attempt == GEMINI_MAX_ATTEMPTS:
                 analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
                 _record_error(uuid.uuid4().hex[:8], "POST /api/screen (gemini)", exc,
                               note="폴백 분석으로 응답")
             else:
                 time.sleep(0.5)
+    _mark("gemini_ms", _t)
     if data is None:
         data = _fallback_analysis(rows, analysis_note)
         analysis_source = "fallback"
@@ -529,17 +565,24 @@ def screen_stocks(req: ScreenRequest):
                 pick.setdefault(field, row[field])
 
     # 추천 종목의 차트·뉴스도 선택된 개수만큼 병렬로 채운다(보통 3개).
+    # 발굴(sp500/kospi200) 모드에서는 6개월 일봉이 프리 스캔으로 이미 캐시에 있어 네트워크가 없다.
+    _t = time.perf_counter()
     stock_tools.bounded_map(_attach_chart, picks)
+    _mark("charts_ms", _t)
+    timings["total_ms"] = int((time.perf_counter() - _t0) * 1000)
 
     # ⚠️ 여기서는 이력을 남기지 않는다(2026-11 변경). 자동 기록은 사용자가 분석만 돌려도
     # 성적표를 오염시켰으므로, 클라이언트가 카드의 "📌 추적 추가"로 고른 픽만
     # `POST /api/performance/track`에서 기록한다. 응답 모양은 그대로다.
 
-    # strategy·mode·universe_scanned·analysis_source는 추가 필드다(기존 클라이언트는 무시해도 동작한다).
+    # strategy·mode·universe_scanned·analysis_source·timings는 추가 필드다(기존 클라이언트는 무시해도 동작한다).
     # analysis_source: "gemini"(정상) | "fallback"(모델 호출 실패 → 서버 점수 기반 요약)
+    # timings: 단계별 소요 시간(ms) — discovery_ms·rows_ms·gemini_ms·charts_ms·total_ms
+    logger.info("스크리닝 완료 mode=%s 종목=%d 상위=%d %s", mode, len(tickers), len(picks), timings)
     return _json_safe({"analysis": data, "all_stocks": rows, "strategy": strategy,
                        "mode": mode, "universe_scanned": universe_scanned,
-                       "analysis_source": analysis_source, "analysis_note": analysis_note})
+                       "analysis_source": analysis_source, "analysis_note": analysis_note,
+                       "timings": timings})
 
 
 @app.get("/api/performance")

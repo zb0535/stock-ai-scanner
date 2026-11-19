@@ -16,7 +16,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   - 네이버 재무는 **국내 공시 단위**를 따른다: 영업이익률은 %를 소수(0.1307)로, 부채비율은
     % 그대로, 매출증가율은 **확정 연도끼리**(추정 컨센서스 제외) 계산한다. 한국 종목은 이 값을
     Yahoo보다 우선한다(Yahoo의 한국 재무는 기간이 어긋나 영업이익률이 46%처럼 튀는 경우가 있다).
-    `financials_source`가 `naver`/`yfinance+naver`면 그 경로로 채운 행이다.
+    `financials_source`가 `naver`면 그 경로로 채운 행이다(한국 종목은 Yahoo `t.info`를 부르지 않는다).
   - 네이버 호출은 캐시한다(해석 24시간 · 재무 6시간 · 구성종목 6시간 · 실패 15분).
   - 기존 키는 그대로라 미국 종목·기존 클라이언트는 수정 없이 동작한다.
 - **코스피 200 자동 발굴 모드**(`kospi200_scanner.py`): `POST /api/screen`에
@@ -111,6 +111,24 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   응답의 `financials_source`가 `sec_edgar`, `finnhub`, `sec_edgar+finnhub` 등이면
   그 경로로 보완된 행이다.
   `SEC_EDGAR_FALLBACK=0`, `FINNHUB_FALLBACK=0` 환경변수로 각각 끌 수 있다.
+- **응답 지연 방어(2026-11 최적화)**: `/api/screen`이 30~108초 걸리던 원인은 ① Render 같은
+  데이터센터 IP에서 Yahoo `t.info`가 429/401로 막히는데도 종목마다 30초씩 기다린 것, ② 이미
+  받아 둔 6개월 일봉을 15종목이 다시 받은 것이었다. 지금은 이렇게 막는다.
+  - **한국 종목은 Yahoo `t.info`를 아예 부르지 않는다**(`.KS`/`.KQ` → 네이버 금융 직행).
+  - **전역 회로 차단기**: `t.info`가 429/401/crumb/타임아웃으로 **2회 연속** 실패하면 종목과
+    무관하게 **30분 동안 전역으로** `t.info`를 건너뛰고 곧바로 SEC EDGAR → Finnhub로 간다
+    (빈 응답은 그 종목 문제일 수 있어 3회까지 본다). 뉴스도 같은 규칙으로 우회한다.
+  - **벽시계 타임아웃**: `t.info` 6초 · 뉴스 5초 · 6개월 일봉 8초. yfinance는 요청마다만
+    타임아웃이 있어 한 호출이 수십 초를 잡아먹을 수 있었다.
+  - **프리 스캔 일봉 재사용**: `yf.download`로 500/201종목을 받을 때 그 일봉을 히스토리 캐시에
+    넣어 두고(`prime_history`, 스냅샷 수명 70분), 발굴된 15종목의 지표·차트가 **재다운로드 0회**로
+    끝난다. 종목 병렬도는 6 → 8(`MAX_FETCH_WORKERS`).
+  - **Gemini**: `gemini-3.5-flash-lite`(빠른 lite 모델) 그대로, 시도당 25초 상한
+    (`GEMINI_TIMEOUT_MS`) + 최대 2회. 실패하면 500 대신 정량 점수 폴백.
+  - 응답의 `timings`(ms)에 단계별 소요 시간이 담긴다 — `discovery_ms`(발굴·프리 스캔) ·
+    `rows_ms`(15종목 지표+뉴스) · `gemini_ms` · `charts_ms` · `total_ms`.
+  - `GET /`의 `yahoo_guard`에 `t.info`/뉴스 우회 상태(`blocked`·`remaining_sec`·`fail_streak`)와
+    프리 적재된 일봉 캐시 개수가 나온다(병목이 다시 생기면 여기서 바로 보인다).
 - `GET /` 헬스 응답에 배포 커밋(`build`)과 Finnhub 키 설정·마지막 오류(`finnhub`),
   저장소 종류(`storage_backend`)를 노출한다. 키 본문은 나오지 않고 설정 여부·이름·길이만 보인다.
   `errors_recent`에는 최근 처리되지 않은 예외 10건(`error_id`·`path`·`type`·`message`)이 남는다.
@@ -126,7 +144,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백 검증, 328개)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드 검증, 353개)
 
 ## 환경변수
 | 이름 | 설명 |
@@ -138,3 +156,5 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `SP500_PREWARM` | S&P 500 스냅샷 백그라운드 예열(기본 켜짐). `0`이면 끔(단위 테스트·로컬 실행). 켜져 있지 않으면 코스피 200 예열도 함께 꺼진다 |
 | `KOSPI200_PREWARM` | 코스피 200 스냅샷 백그라운드 예열(기본 켜짐). `0`이면 이 시장만 끔 |
 | `PREWARM_ENABLED` | 백그라운드 예열 전체 스위치(기본 켜짐). `0`이면 S&P 500·코스피 200 모두 예열하지 않음 |
+| `GEMINI_TIMEOUT_MS` | Gemini 호출 한 번의 상한(기본 25000ms). 넘으면 정량 점수 폴백으로 응답 |
+| `SEC_EDGAR_FALLBACK` / `FINNHUB_FALLBACK` | Yahoo `t.info` 대체 경로 스위치(기본 켜짐). `0`이면 끔 |

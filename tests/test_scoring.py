@@ -493,7 +493,7 @@ class ScreenIntegrationTests(unittest.TestCase):
             {"ticker": "CHEAP", "price": 50.0, "reason": "싸다", "risk": "변동성"},
             {"ticker": "GHOST", "price": 1.0, "reason": "없는 종목", "risk": "-"},
         ]})
-        self.patch_attr(api.genai, "Client", lambda: fake)
+        self.patch_attr(api.genai, "Client", lambda **_: fake)
 
         resp = TestClient(api.app).post(
             "/api/screen", json={"criteria": "저PER 가치주", "tickers": ["PRICEY", "CHEAP", "MID"]})
@@ -532,7 +532,7 @@ class ScreenIntegrationTests(unittest.TestCase):
         }
         self.patch_attr(stock_tools, "get_stock_metrics", oversold_rows.__getitem__)
         self.patch_attr(api.genai, "Client",
-                        lambda: FakeGenai({"market_note": "ok", "top_picks": []}))
+                        lambda **_: FakeGenai({"market_note": "ok", "top_picks": []}))
 
         body = TestClient(api.app).post(
             "/api/screen", json={"criteria": "단기 눌림목 반등", "tickers": ["HOT", "WASHED"]}).json()
@@ -544,7 +544,7 @@ class ScreenIntegrationTests(unittest.TestCase):
 
     def test_response_keeps_analysis_and_all_stocks_contracts(self):
         self.patch_attr(stock_tools, "get_stock_metrics", self._rows)
-        self.patch_attr(api.genai, "Client", lambda: FakeGenai(
+        self.patch_attr(api.genai, "Client", lambda **_: FakeGenai(
             {"market_note": "요약", "top_picks": [{"ticker": "MID", "price": 120.0,
                                                   "reason": "근거", "risk": "위험"}]}))
         body = TestClient(api.app).post(
@@ -552,7 +552,7 @@ class ScreenIntegrationTests(unittest.TestCase):
 
         self.assertEqual(sorted(body),
                          ["all_stocks", "analysis", "analysis_note", "analysis_source",
-                          "mode", "strategy", "universe_scanned"])
+                          "mode", "strategy", "timings", "universe_scanned"])
         self.assertEqual(body["analysis_source"], "gemini")  # 정상 경로는 모델 해설
         self.assertEqual(body["analysis_note"], "")
         self.assertEqual(body["mode"], "watchlist")  # 기본값은 기존과 같은 관심 종목 모드

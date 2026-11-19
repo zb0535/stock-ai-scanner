@@ -560,7 +560,7 @@ class ApiPostgresFlowTests(PostgresCase):
         self._patch(api, "_get_recent_news", lambda t, limit=3: [f"{t} news"])
         self._patch(stock_tools, "get_history", lambda t, p="6mo": make_hist())
         self._patch(api.genai, "Client",
-                    lambda: FakeGenai({"market_note": "ok", "top_picks": list(self.PICKS)}))
+                    lambda **_: FakeGenai({"market_note": "ok", "top_picks": list(self.PICKS)}))
         # 성적표·수동 추적의 진입가 조회를 네트워크 없이 고정한다.
         self._patch(history_store, "_fetch_prices_batch",
                     lambda tickers: {t: 110.0 for t in tickers})

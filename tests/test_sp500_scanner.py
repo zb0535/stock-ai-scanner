@@ -360,7 +360,7 @@ class ScreenModeTests(unittest.TestCase):
         self.patch_attr(api.sp500_scanner, "select_candidates", self._fake_discovery)
         self.fake_ai = FakeGenai({"market_note": "요약", "top_picks": [
             {"ticker": self.DISCOVERED[0], "price": 120.0, "reason": "근거", "risk": "위험"}]})
-        self.patch_attr(api.genai, "Client", lambda: self.fake_ai)
+        self.patch_attr(api.genai, "Client", lambda **_: self.fake_ai)
 
     def tearDown(self):
         for p in self._patches:
@@ -412,7 +412,7 @@ class ScreenModeTests(unittest.TestCase):
         self.assertEqual([r["ticker"] for r in body["all_stocks"]], ["AAPL", "MSFT"])
         self.assertEqual(self.discovery_calls, [])
         self.assertEqual(sorted(body), ["all_stocks", "analysis", "analysis_note", "analysis_source",
-                                        "mode", "strategy", "universe_scanned"])
+                                        "mode", "strategy", "timings", "universe_scanned"])
 
     def test_unknown_mode_falls_back_to_watchlist(self):
         body = TestClient(api.app).post(

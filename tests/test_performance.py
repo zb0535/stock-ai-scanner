@@ -428,7 +428,7 @@ class ScreenIntegrationTests(TempDB):
         self._patch(api, "_get_recent_news", lambda t, limit=3: [f"{t} news"])
         self._patch(stock_tools, "get_history", lambda t, p="6mo": make_hist())
         self._patch(api.genai, "Client",
-                    lambda: FakeGenai({"market_note": "ok", "top_picks": list(self.PICKS)}))
+                    lambda **_: FakeGenai({"market_note": "ok", "top_picks": list(self.PICKS)}))
         self.client = TestClient(api.app)
 
     def _patch(self, target, name, value):
@@ -490,7 +490,7 @@ class ScreenIntegrationTests(TempDB):
 
     def test_screen_with_no_picks_records_nothing(self):
         self._patch(api.genai, "Client",
-                    lambda: FakeGenai({"market_note": "none", "top_picks": []}))
+                    lambda **_: FakeGenai({"market_note": "none", "top_picks": []}))
         resp = self._screen()
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(self.picks(), [])

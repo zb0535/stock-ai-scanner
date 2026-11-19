@@ -52,6 +52,10 @@ CHUNK_SIZE = 100            # 한 번에 받는 종목 수 (메모리 상한)
 TOP_N = 15                  # Gemini에 넘길 후보 수
 MIN_BARS = 35               # 이보다 짧은 이력은 지표가 비어 후보에서 제외
 DOWNLOAD_TIMEOUT = 25       # 청크 하나의 yfinance 타임아웃(초)
+# 프리 스캔이 받은 6개월 일봉을 히스토리 캐시에 넣어 둘 때의 유지 시간 —
+# 스냅샷(PRESCAN_TTL 70분)과 같게 둔다. 그러면 스냅샷이 살아 있는 동안
+# `get_stock_metrics`·`_attach_chart`는 같은 일봉을 **다시 받지 않는다**.
+HISTORY_PRIME_TTL = PRESCAN_TTL
 
 # 스캔 결과에 남기는 지표 키(재무 지표는 프리 스캔에 없다).
 TECH_FIELDS = (
@@ -261,8 +265,13 @@ def _sub_frame(batch, symbol: str):
         return None
 
 
-def _row_from_frame(symbol: str, frame) -> dict | None:
-    """한 종목 프레임 → 지표 dict. 데이터가 짧거나 NaN뿐이면 None."""
+def _clean_frame(frame):
+    """배치 프레임을 숫자로 바꾸고 종가가 없는 행을 버린다(지표 계산·히스토리 캐시 공용).
+
+    야후는 한국 종목(.KS/.KQ)의 최신 세션을 OHLC가 전부 NaN인 자리표시자 행으로 내려 줄 때가
+    있어(2026-11 500 사고의 원인), 그 행은 여기서 한 번에 걸러진다. 짧은 이력(<MIN_BARS)도
+    지표가 비므로 None.
+    """
     if frame is None or getattr(frame, "empty", True):
         return None
     needed = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in frame.columns]
@@ -272,6 +281,13 @@ def _row_from_frame(symbol: str, frame) -> dict | None:
         return None
     frame = frame.dropna(subset=["Close"])
     if len(frame) < MIN_BARS:
+        return None
+    return frame
+
+
+def _row_from_frame(symbol: str, frame) -> dict | None:
+    """한 종목 프레임 → 지표 dict. 데이터가 짧거나 NaN뿐이면 None."""
+    if frame is None or getattr(frame, "empty", True):
         return None
     close = frame["Close"].astype("float64")
     price = float(close.iloc[-1])
@@ -319,22 +335,30 @@ def scan_rows(symbols: list[str], label: str = "프리 스캔") -> dict:
     청크마다 `gc.collect()`를 불러 Render 512MB에서 RSS가 튀지 않게 한다. 개별 종목 실패는
     건너뛰고 마지막에 집계만 남긴다.
 
+    받아 둔 6개월 일봉은 `stock_tools.prime_history`로 히스토리 캐시에 넣어 둔다 —
+    다음 단계(15종목 `get_stock_metrics`·`_attach_chart`)가 같은 일봉을 다시 받으러
+    Yahoo를 부르던 낭비(종목당 수 초)를 없앤다. 캐시에는 차트에 쓰는 기둥만 담는다.
+
     반환: `{"rows", "universe", "skipped"}`
     """
     rows: list[dict] = []
     skipped: list[str] = []
+    primed = 0
     for chunk in _chunks(list(symbols)):
         batch = _download_batch(chunk)
         for sym in chunk:
-            row = _row_from_frame(sym, _sub_frame(batch, sym))
+            frame = _clean_frame(_sub_frame(batch, sym))
+            row = _row_from_frame(sym, frame)
             if row is None:
                 skipped.append(sym)
-            else:
-                rows.append(row)
+                continue
+            rows.append(row)
+            if stock_tools.prime_history(sym, frame, "6mo", ttl=HISTORY_PRIME_TTL):
+                primed += 1
         del batch
         gc.collect()  # 청크 DataFrame을 바로 버려 RSS를 낮게 유지한다
-    logger.info("%s: %d/%d 종목 지표 산출(건너뜀 %d)",
-                label, len(rows), len(symbols), len(skipped))
+    logger.info("%s: %d/%d 종목 지표 산출(건너뜀 %d, 일봉 캐시 적재 %d)",
+                label, len(rows), len(symbols), len(skipped), primed)
     return {"rows": rows, "universe": len(symbols), "skipped": len(skipped)}
 
 

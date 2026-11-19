@@ -309,12 +309,20 @@ class NaverParserTests(KoreanBase):
 
 class CurrencyTests(KoreanBase):
     def test_stock_tools_prefers_naver_for_korean_stock(self):
-        self.patch(stock_tools.yf, "Ticker", lambda sym: type("T", (), {
-            "info": property(lambda self: {"shortName": "SamsungElec", "trailingPE": None,
-                                           "revenueGrowth": 1.268, "operatingMargins": 0.4613,
-                                           "debtToEquity": 2.799}),
-            "history": lambda self, period="6mo": hist(np.linspace(100, 120, 130)),
-        })())
+        calls = {"info": 0}
+
+        class KrTicker:
+            """한국 종목 대역 — `t.info`는 불리면 기록하고 실패한다(불러서는 안 된다)."""
+
+            @property
+            def info(self):
+                calls["info"] += 1
+                raise AssertionError("한국 종목은 Yahoo t.info를 부르면 안 된다")
+
+            def history(self, period="6mo"):
+                return hist(np.linspace(100, 120, 130))
+
+        self.patch(stock_tools.yf, "Ticker", lambda sym: KrTicker())
         self.patch(stock_tools.naver_finance, "get_fundamentals", lambda sym: {
             "name": "삼성전자", "trailing_pe": 30.07, "forward_pe": 4.33,
             "revenue_growth": 0.1088, "operating_margins": 0.1307, "debt_to_equity": 29.94,
@@ -326,13 +334,14 @@ class CurrencyTests(KoreanBase):
 
         m = stock_tools.get_stock_metrics("005930.KS")
 
+        self.assertEqual(calls["info"], 0)                 # Yahoo t.info 호출 0회(지연의 주범 제거)
         self.assertEqual(m["currency"], "KRW")
         self.assertEqual(m["name"], "삼성전자")
         self.assertEqual(m["trailing_pe"], 30.07)
         self.assertEqual(m["operating_margins"], 0.1307)   # Yahoo 46%가 아니라 국내 공시 13%
         self.assertEqual(m["debt_to_equity"], 29.94)
-        self.assertEqual(m["financials_source"], "yfinance+naver")
-        self.assertEqual(sec_calls, [])                    # 한국 종목은 SEC를 부르지 않는다
+        self.assertEqual(m["financials_source"], "naver")  # 한국 종목 재무 출처는 네이버 금융
+        self.assertEqual(sec_calls, [])                     # 한국 종목은 SEC를 부르지 않는다
         self.assertTrue(m["financials_available"])
 
     def test_us_stock_keeps_usd_and_yfinance_source(self):
@@ -491,7 +500,7 @@ class Kospi200ApiTests(KoreanBase):
         self.patch(api.kospi200_scanner, "select_candidates", self._fake_discovery)
         self.fake_ai = FakeGenai({"market_note": "요약", "top_picks": [
             {"ticker": self.DISCOVERED[0], "price": 196900.0, "reason": "근거", "risk": "위험"}]})
-        self.patch(api.genai, "Client", lambda: self.fake_ai)
+        self.patch(api.genai, "Client", lambda **_: self.fake_ai)
 
     @staticmethod
     def _row(ticker):

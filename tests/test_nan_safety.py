@@ -226,7 +226,7 @@ class ScreenNanIntegrationTests(BaseCase):
 
     def setUp(self):
         super().setUp()
-        self.patch(api.genai, "Client", lambda: FakeGenai(
+        self.patch(api.genai, "Client", lambda **_: FakeGenai(
             {"market_note": "요약", "top_picks": [
                 {"ticker": "005930.KS", "price": 150.0, "reason": "근거", "risk": "위험"}]}))
         self.patch(api, "_get_recent_news", lambda ticker, limit=3: [])
@@ -277,7 +277,7 @@ class GeminiFallbackTests(BaseCase):
         self.patch(stock_tools, "get_history", lambda *a, **k: make_hist())
 
     def test_gemini_failure_returns_fallback_analysis(self):
-        self.patch(api.genai, "Client", lambda: RaisingGenai())
+        self.patch(api.genai, "Client", lambda **_: RaisingGenai())
         resp = TestClient(api.app).post(
             "/api/screen", json={"criteria": "저PER 가치주", "tickers": ["AAPL", "MSFT"]})
         self.assertEqual(resp.status_code, 200, resp.text)
@@ -292,14 +292,14 @@ class GeminiFallbackTests(BaseCase):
         self.assertTrue(any("gemini" in e["path"] for e in api.recent_errors()))
 
     def test_gemini_garbage_text_falls_back(self):
-        self.patch(api.genai, "Client", lambda: GarbageGenai())
+        self.patch(api.genai, "Client", lambda **_: GarbageGenai())
         resp = TestClient(api.app).post(
             "/api/screen", json={"criteria": "저PER 가치주", "tickers": ["AAPL"]})
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(resp.json()["analysis_source"], "fallback")
 
     def test_gemini_ok_marks_source(self):
-        self.patch(api.genai, "Client", lambda: FakeGenai(
+        self.patch(api.genai, "Client", lambda **_: FakeGenai(
             {"market_note": "요약", "top_picks": []}))
         resp = TestClient(api.app).post(
             "/api/screen", json={"criteria": "저PER 가치주", "tickers": ["AAPL"]})

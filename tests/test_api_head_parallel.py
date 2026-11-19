@@ -171,7 +171,7 @@ class ParallelScreenTests(BaseCase):
         state, fake_metrics, fake_news = self._instrumented_fakes(self.TICKERS, call_log)
         self.patch_attr(stock_tools, "get_stock_metrics", fake_metrics)
         self.patch_attr(api, "_get_recent_news", fake_news)
-        self.patch_attr(api.genai, "Client", lambda: FakeGenai({"market_note": "ok", "top_picks": []}))
+        self.patch_attr(api.genai, "Client", lambda **_: FakeGenai({"market_note": "ok", "top_picks": []}))
 
         client = TestClient(api.app)
         resp = client.post("/api/screen", json={"criteria": "저PER 가치주", "tickers": self.TICKERS})
@@ -195,7 +195,7 @@ class ParallelScreenTests(BaseCase):
         self.patch_attr(stock_tools, "get_stock_metrics", lambda t: {"ticker": t, "price": 1.0})
         self.patch_attr(api, "_get_recent_news", lambda t, limit=3: [f"{t} news"])
         self.patch_attr(stock_tools, "get_history", lambda t, p="6mo": make_hist())
-        self.patch_attr(api.genai, "Client", lambda: FakeGenai({"market_note": "ok", "top_picks": picks}))
+        self.patch_attr(api.genai, "Client", lambda **_: FakeGenai({"market_note": "ok", "top_picks": picks}))
 
         resp = TestClient(api.app).post("/api/screen", json={"criteria": "저PER 가치주", "tickers": ["AAPL"]})
 

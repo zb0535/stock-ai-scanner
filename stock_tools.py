@@ -33,13 +33,15 @@ STALE_TTL = 300         # 5분: 재무 지표를 직전 성공값으로 보전 �
 PARTIAL_TTL = 60        # 60초: 재무 지표가 비어 있는 결과 (제한이 풀리면 바로 재조회)
 
 # 여러 종목을 동시에 조회할 때의 최대 병렬도. Yahoo가 짧은 시간에 동시 요청을 많이
-# 받으면 429(rate limited)로 막으므로 5~6개로 묶어 둔다.
-MAX_FETCH_WORKERS = 6
+# 받으면 429(rate limited)로 막으므로 8개까지만 묶어 둔다(예전 6 → 지연의 절반이 병렬도였다).
+MAX_FETCH_WORKERS = 8
 
 # ticker -> (저장 시각, 결과 dict)
 _METRICS_CACHE: dict[str, tuple[float, dict]] = {}
-# "ticker:period" -> (저장 시각, 일봉 DataFrame)
-_HISTORY_CACHE: dict[str, tuple[float, object]] = {}
+# "ticker:period" -> (저장 시각, 일봉 DataFrame, 유지 시간)
+# 유지 시간을 항목마다 두는 이유: 프리 스캔(yf.download)이 미리 받아 둔 일봉은 스냅샷 수명(70분)만큼
+# 살아 있어야 다음 사용자 요청이 같은 6개월 일봉을 다시 받지 않는다.
+_HISTORY_CACHE: dict[str, tuple[float, object, float]] = {}
 _CACHE_LOCK = threading.Lock()
 
 # t.info에서 뽑아 쓰는 핵심 재무 지표 (응답 키 -> yfinance info 키)
@@ -65,11 +67,31 @@ SEC_FALLBACK_ENABLED = os.environ.get("SEC_EDGAR_FALLBACK", "1") not in ("0", "f
 # 3순위 Finnhub 폴백 스위치. FINNHUB_FALLBACK=0 또는 FINNHUB_API_KEY 미설정 시 꺼진다.
 FINNHUB_FALLBACK_ENABLED = os.environ.get("FINNHUB_FALLBACK", "1") not in ("0", "false", "False")
 
-# t.info가 연속으로 실패하면 잠시 호출을 멈춘다(429 폭풍 방지).
-_INFO_FAIL_THRESHOLD = 5
-_INFO_COOLDOWN_SECONDS = 300
+# --- Yahoo 호출 가드(전역 회로 차단기) --------------------------------------
+# 왜 필요한가: Render 같은 데이터센터 IP에서는 yfinance `t.info`가 429/401(Invalid Crumb)로
+# 막히는데, 그 실패는 **한 번에 30초씩** 걸린다(quoteSummary + additional + complementary를
+# 각각 30초 타임아웃으로 시도). 15종목 배치면 30~80초가 통째로 '헛수고 대기'로 날아갔다.
+# 그래서 (1) 한 호출에 벽시계 타임아웃을 걸고, (2) 차단성 실패가 **두 번 연속**이면 종목과
+# 무관하게 **전역으로** 30분 동안 Yahoo t.info를 건너뛰고 바로 SEC EDGAR → Finnhub로 간다.
+# (한국 종목은 애초에 t.info를 부르지 않는다 — 네이버 금융이 1순위다.)
+YAHOO_INFO_TIMEOUT = 6.0        # t.info 한 번에 허용하는 최대 대기(초) — 이걸로는 차단을 못 뚫는다
+YAHOO_NEWS_TIMEOUT = 5.0        # 종목 뉴스 한 번에 허용하는 최대 대기(초)
+HISTORY_TIMEOUT = 8.0           # 일봉(차트) 조회 상한(초) — yfinance 기본 10초보다 조금 짧게
+YAHOO_HISTORY_TIMEOUT = HISTORY_TIMEOUT
+
+_INFO_FAIL_THRESHOLD = 2        # 429/401/crumb/타임아웃 같은 '차단성' 실패 2회 → 전역 우회
+_INFO_OTHER_FAIL_THRESHOLD = 3  # 빈 응답 등 종목 문제일 수 있는 실패는 3회
+_INFO_COOLDOWN_SECONDS = 1800   # 전역 우회 유지 시간(30분)
+_NEWS_FAIL_THRESHOLD = 2        # 뉴스도 같은 규칙(차단성 실패 2회 → 30분 우회)
+_NEWS_OTHER_FAIL_THRESHOLD = 3
+_NEWS_COOLDOWN_SECONDS = 1800
+
 _info_fail_streak = 0
 _info_cooldown_until = 0.0
+_info_last_error = ""
+_news_fail_streak = 0
+_news_cooldown_until = 0.0
+_news_last_error = ""
 
 
 def get_watchlist() -> list[str]:
@@ -310,16 +332,61 @@ def compute_advanced_indicators(hist) -> dict:
     return out
 
 
-def _note_info_failure() -> None:
-    global _info_fail_streak, _info_cooldown_until
+# --- 벽시계 타임아웃 ---------------------------------------------------------
+# yfinance는 HTTP 타임아웃이 요청마다 걸려 있을 뿐(t.info는 요청 3~4개, 각 30초), 전체 호출의
+# 상한이 없다. 그래서 별도 스레드에서 돌리고 결과를 timeout초까지만 기다린다.
+# 시간이 지나면 그 호출은 '버린다' — 서버 응답은 그대로 진행하고, 남은 스레드는
+# 브레이커가 막아 더 이상 늘지 않는다. 스레드는 데몬이라 프로세스 종료를 볼잡지도 않는다.
+class CallTimeout(Exception):
+    """정해진 시간 안에 호출이 끝나지 않음."""
+
+
+def call_with_timeout(fn, timeout: float):
+    """fn()을 제한 시간 안에서 실행하고 결과를 돌려줍니다(넘기면 CallTimeout)."""
+    limit = max(0.1, float(timeout))
+    box: dict = {}
+    done = threading.Event()
+
+    def _run():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # 호출한 쪽으로 그대로 전달한다
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, name="yahoo-call", daemon=True).start()
+    if not done.wait(limit):
+        raise CallTimeout(f"{limit:.1f}초 안에 응답 없음")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+# 차단(레이트 리밋·crumb·인증) 신호. 이런 실패는 종목과 무관하게 서버 IP 문제다.
+_BLOCK_HINTS = ("429", "401", "403", "crumb", "too many requests", "rate limit",
+                "ratelimit", "unauthorized", "forbidden")
+
+
+def _looks_blocked(reason: str) -> bool:
+    """실패 사유가 'Yahoo가 이 서버를 막았다'는 신호인지 판단합니다."""
+    text = str(reason or "").lower()
+    return any(hint in text for hint in _BLOCK_HINTS)
+
+
+def _note_info_failure(kind: str = "other", reason: str = "") -> None:
+    """t.info 실패를 기록하고, 임계치를 넘으면 전역 우회(30분)를 켭니다."""
+    global _info_fail_streak, _info_cooldown_until, _info_last_error
+    threshold = _INFO_FAIL_THRESHOLD if kind == "block" else _INFO_OTHER_FAIL_THRESHOLD
     with _CACHE_LOCK:
         _info_fail_streak += 1
-        if _info_fail_streak >= _INFO_FAIL_THRESHOLD:
+        _info_last_error = str(reason or "")[:160]
+        if _info_fail_streak >= threshold:
             _info_cooldown_until = time.time() + _INFO_COOLDOWN_SECONDS
             _info_fail_streak = 0
             logger.warning(
-                "t.info 연속 실패 %d회 → %d초 동안 재호출을 건너뜁니다.",
-                _INFO_FAIL_THRESHOLD, _INFO_COOLDOWN_SECONDS,
+                "t.info 연속 실패 %d회(%s) → %d초 동안 전역으로 Yahoo t.info를 건너뜁니다.",
+                threshold, _info_last_error or kind, _INFO_COOLDOWN_SECONDS,
             )
 
 
@@ -332,6 +399,70 @@ def _note_info_success() -> None:
 def _info_in_cooldown() -> bool:
     with _CACHE_LOCK:
         return time.time() < _info_cooldown_until
+
+
+def _info_cooldown_left() -> int:
+    with _CACHE_LOCK:
+        return max(0, int(_info_cooldown_until - time.time()))
+
+
+def info_breaker_status() -> dict:
+    """Yahoo t.info 전역 차단 상태(`GET /`의 `yahoo_guard`)."""
+    with _CACHE_LOCK:
+        left = max(0, int(_info_cooldown_until - time.time()))
+        return {"blocked": left > 0, "remaining_sec": left, "fail_streak": _info_fail_streak,
+                "threshold": _INFO_FAIL_THRESHOLD, "cooldown_sec": _INFO_COOLDOWN_SECONDS,
+                "last_error": _info_last_error}
+
+
+def reset_info_breaker() -> None:
+    """테스트·수동 초기화용 — t.info 차단 상태를 초기화한다."""
+    global _info_fail_streak, _info_cooldown_until, _info_last_error
+    with _CACHE_LOCK:
+        _info_fail_streak = 0
+        _info_cooldown_until = 0.0
+        _info_last_error = ""
+
+
+def _note_news_failure(kind: str = "other", reason: str = "") -> None:
+    """Yahoo 뉴스 실패 기록 — 뉴스도 같은 429/타임아웃 문에 막히므로 전역으로 우회한다."""
+    global _news_fail_streak, _news_cooldown_until, _news_last_error
+    threshold = _NEWS_FAIL_THRESHOLD if kind == "block" else _NEWS_OTHER_FAIL_THRESHOLD
+    with _CACHE_LOCK:
+        _news_fail_streak += 1
+        _news_last_error = str(reason or "")[:160]
+        if _news_fail_streak >= threshold:
+            _news_cooldown_until = time.time() + _NEWS_COOLDOWN_SECONDS
+            _news_fail_streak = 0
+            logger.warning("Yahoo 뉴스 연속 실패 %d회(%s) → %d초 동안 건너뜁니다.",
+                           threshold, _news_last_error, _NEWS_COOLDOWN_SECONDS)
+
+
+def _note_news_success() -> None:
+    global _news_fail_streak
+    with _CACHE_LOCK:
+        _news_fail_streak = 0
+
+
+def _news_in_cooldown() -> bool:
+    with _CACHE_LOCK:
+        return time.time() < _news_cooldown_until
+
+
+def news_breaker_status() -> dict:
+    with _CACHE_LOCK:
+        left = max(0, int(_news_cooldown_until - time.time()))
+        return {"blocked": left > 0, "remaining_sec": left, "fail_streak": _news_fail_streak,
+                "threshold": _NEWS_FAIL_THRESHOLD, "cooldown_sec": _NEWS_COOLDOWN_SECONDS,
+                "last_error": _news_last_error}
+
+
+def reset_news_breaker() -> None:
+    global _news_fail_streak, _news_cooldown_until, _news_last_error
+    with _CACHE_LOCK:
+        _news_fail_streak = 0
+        _news_cooldown_until = 0.0
+        _news_last_error = ""
 
 
 def clean_history(hist):
@@ -360,12 +491,21 @@ def clean_history(hist):
     return cleaned
 
 
+def _history_ttl(entry) -> float:
+    """캐시 항목의 유지 시간(예전 2-튜플 형식도 받아 준다)."""
+    return float(entry[2]) if len(entry) > 2 else HISTORY_TTL
+
+
 def get_history(ticker: str, period: str = "6mo"):
-    """일봉 데이터를 캐시에서 반환합니다(HISTORY_TTL 30분).
+    """일봉 데이터를 캐시에서 반환합니다(HISTORY_TTL 30분, 프리 스캔분은 더 길게).
 
     조회에 실패하면 만료된 직전 성공값이라도 돌려주고, 그것도 없으면 빈 DataFrame을
     돌려줍니다. 반환된 DataFrame은 읽기 전용으로만 쓰세요.
     종가가 비어 있는 행(야후의 한국 종목 자리표시자 행)은 `clean_history`로 걸러 캐시한다.
+
+    프리 스캔(`sp500_scanner.scan_rows`)이 `yf.download`로 이미 받아 둔 6개월 일봉은
+    `prime_history`로 여기에 미리 넣어 둔다. 그러면 sp500·kospi200 발굴 뒤 15종목의
+    차트 지표·차트 부착(`_attach_chart`)이 **네트워크 0회**로 끝난다.
 
     캐시 읽기·쓰기는 _CACHE_LOCK으로 보호하므로 bounded_map으로 동시에 불러도 안전하다.
     """
@@ -376,11 +516,15 @@ def get_history(ticker: str, period: str = "6mo"):
     now = time.time()
     with _CACHE_LOCK:
         cached = _HISTORY_CACHE.get(key)
-    if cached and now - cached[0] < HISTORY_TTL:
+    if cached and now - cached[0] < _history_ttl(cached):
         return clean_history(cached[1])
 
     try:
-        hist = yf.Ticker(sym).history(period=period)
+        hist = call_with_timeout(lambda: yf.Ticker(sym).history(period=period), YAHOO_HISTORY_TIMEOUT)
+    except CallTimeout:
+        logger.warning("%s: history(%s) 타임아웃(%.0f초) → 직전 값 사용", sym, period,
+                       YAHOO_HISTORY_TIMEOUT)
+        hist = None
     except Exception as exc:  # 429/401/네트워크 오류 모두 여기서 흡수
         logger.warning("%s: history(%s) 실패 → %s: %s", sym, period, type(exc).__name__, str(exc)[:200])
         hist = None
@@ -388,31 +532,116 @@ def get_history(ticker: str, period: str = "6mo"):
     hist = clean_history(hist)
     if hist is not None and not getattr(hist, "empty", True):
         with _CACHE_LOCK:
-            _HISTORY_CACHE[key] = (now, hist)
+            _HISTORY_CACHE[key] = (now, hist, HISTORY_TTL)
         return hist
     if cached:  # 만료됐지만 이번 조회도 실패 → 직전 성공값 사용
         return clean_history(cached[1])
     return hist
 
 
-def _fetch_info(sym: str):
-    """t.info를 조회합니다. 반환: (info 또는 None, 실패 사유 문자열 또는 None)."""
-    if _info_in_cooldown():
-        return None, "t.info 쿨다운(연속 실패) 중"
+# 차트에 필요한 기둥만 남긴다(Open은 어디에도 안 쓴다 — 500종목 일봉 메모리를 아긴다).
+_HISTORY_KEEP_COLUMNS = ("High", "Low", "Close", "Volume")
+
+
+def prime_history(ticker: str, hist, period: str = "6mo", ttl: float | None = None) -> bool:
+    """프리 스캔이 이미 받아 둔 일봉을 히스토리 캐시에 미리 넣는다(네트워크 0회 재사용).
+
+    `sp500_scanner.scan_rows`가 `yf.download`로 500종목 일봉을 이미 받아 놓고도 버리고
+    있었기 때문에, 발굴된 15종목의 `get_stock_metrics`·`_attach_chart`가 같은 6개월 일봉을
+    다시 받느라 시간을 썼다. 여기에 넣어 두면 그 재다운로드가 사라진다.
+
+    ttl 기본값은 스냅샷과 같은 `HISTORY_TTL`(30분)이고, 프리 스캔은 스냅샷 수명(70분)을 넘긴다.
+    반환: 실제로 캐시에 넣었으면 True(빈 프레임·종가 없음은 False).
+    """
+    sym = (ticker or "").strip().upper()
+    if not sym or hist is None or getattr(hist, "empty", True):
+        return False
     try:
-        info = yf.Ticker(sym).info
+        columns = [c for c in _HISTORY_KEEP_COLUMNS if c in hist.columns]
+        if "Close" not in columns:
+            return False
+        slim = hist[columns].copy()
+        slim = slim[slim["Close"].notna()]
+        if slim.empty:
+            return False
+        slim["Close"] = slim["Close"].astype("float64")
+    except Exception as exc:  # pandas dtype 등 예상 밖 문제 — 프리 스캔을 죽이지 않는다
+        logger.warning("%s: 일봉 캐시 적재 실패 → %s: %s", sym, type(exc).__name__, str(exc)[:120])
+        return False
+    with _CACHE_LOCK:
+        _HISTORY_CACHE[f"{sym}:{period}"] = (time.time(), slim, HISTORY_TTL if ttl is None else float(ttl))
+    return True
+
+
+def history_cache_status() -> dict:
+    """히스토리 캐시 상태(개수·프리 스캔 적재분) — `GET /` 진단용."""
+    now = time.time()
+    with _CACHE_LOCK:
+        entries = list(_HISTORY_CACHE.values())
+    alive = [e for e in entries if now - e[0] < _history_ttl(e)]
+    return {"entries": len(alive), "stale_entries": len(entries) - len(alive)}
+
+
+def clear_history_cache() -> None:
+    with _CACHE_LOCK:
+        _HISTORY_CACHE.clear()
+
+
+def _fetch_info(sym: str):
+    """t.info를 조회합니다(벽시계 타임아웃 + 전역 회로 차단기).
+
+    반환: (info 또는 None, 실패 사유 문자열 또는 None).
+    차단성 실패(429/401/crumb/타임아웃)가 두 번 연속이면 `_info_cooldown_until`이 켜져
+    이후 호출은 곧바로 실패로 돌아간다 — 종목마다 30초씩 기다리는 일이 없다.
+    """
+    if _info_in_cooldown():
+        return None, f"t.info 전역 우회 중({_info_cooldown_left()}초 남음)"
+    try:
+        info = call_with_timeout(lambda: yf.Ticker(sym).info, YAHOO_INFO_TIMEOUT)
+    except CallTimeout:
+        _note_info_failure("block", "timeout")
+        logger.warning("%s: t.info 타임아웃(%.1f초)", sym, YAHOO_INFO_TIMEOUT)
+        return None, f"t.info 타임아웃({YAHOO_INFO_TIMEOUT:.0f}초)"
     except Exception as exc:
-        _note_info_failure()
         reason = f"{type(exc).__name__}: {str(exc)[:120]}"
+        _note_info_failure("block" if _looks_blocked(reason) else "other", reason)
         logger.warning("%s: t.info 실패 → %s", sym, reason)
         return None, reason
     if not isinstance(info, dict) or not info:
-        _note_info_failure()
+        _note_info_failure("other", "빈 응답")
         logger.warning("%s: t.info 빈 응답(재무 지표 미수신)", sym)
         return None, "t.info 빈 응답"
     _note_info_success()
     return info, None
 
+
+def fetch_yahoo_news(sym: str, limit: int = 5) -> list[str]:
+    """Yahoo 종목 뉴스 제목(벽시계 타임아웃 + 전역 회로 차단기).
+
+    뉴스는 없어도 스크리닝은 성립하므로, 막히면 빈 목록을 돌려주고 30분 동안
+    전역으로 건너뛴다(뉴스 하나 때문에 배치가 30초씩 느려지지 않게).
+    """
+    sym = (sym or "").strip().upper()
+    if not sym or _news_in_cooldown():
+        return []
+    try:
+        items = call_with_timeout(lambda: yf.Ticker(sym).news, YAHOO_NEWS_TIMEOUT) or []
+    except CallTimeout:
+        _note_news_failure("block", "timeout")
+        return []
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {str(exc)[:120]}"
+        _note_news_failure("block" if _looks_blocked(reason) else "other", reason)
+        return []
+    _note_news_success()
+    titles: list[str] = []
+    for item in items[:max(1, limit)]:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title") or (item.get("content") or {}).get("title")
+        if title:
+            titles.append(title)
+    return titles
 
 def _metrics_ttl(payload: dict) -> float:
     """결과 성격에 따라 캐시 유지 시간을 정합니다."""
@@ -454,7 +683,14 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
             trend = "횡보/혼조"
 
     # --- 재무 지표: 실패해도 차트 지표는 그대로 살린다 ---
-    info, info_error = _fetch_info(sym)
+    # 한국 종목(.KS/.KQ)은 Yahoo `t.info`를 **아예 부르지 않는다**. Render 같은 데이터센터
+    # IP에서 t.info가 막혀 종목마다 30초씩 기다린 뒤에야 네이버로 넘어가던 것이
+    # 30~100초 지연의 주범이었다. 한국 종목 재무는 1순위가 네이버 금융이다(§아래 `_fill`).
+    is_korean = naver_finance.is_korean_ticker(sym)
+    if is_korean:
+        info, info_error = None, "한국 종목: Yahoo t.info 생략(네이버 금융 우선)"
+    else:
+        info, info_error = _fetch_info(sym)
     fresh = {key: _to_number((info or {}).get(src)) for key, src in _FIN_FIELDS.items()}
     fresh_ok = any(value is not None for value in fresh.values())
     cached_payload = cached_payload or {}
@@ -464,7 +700,6 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     # yfinance는 `.KS`/`.KQ` 시세·차트는 주지만 Render 같은 데이터센터 IP에서는 `t.info`가
     # 막히거나 비고(삼성전자 trailingPE=None), 종목명도 영문이다. 한국 종목이면 네이버 금융에서
     # PER·영업이익률·부채비율·매출증가율과 한국어 이름을 받아 쓴다(6시간 캐시).
-    is_korean = naver_finance.is_korean_ticker(sym)
     naver_fin: dict = {}
     if is_korean:
         try:
@@ -564,9 +799,7 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
         payload["financials_stale"] = True
         payload["financials_note"] = "재무 지표 일시 미수신(Yahoo API 제한) — 직전 조회값 유지, 가격·이평선·RSI는 최신"
     elif naver_used and is_korean:
-        payload["financials_note"] = ("재무 지표는 네이버 금융(연간 재무제표) 기준 — 한국 종목은 국내 공시 값을 우선한다"
-                                      if fresh_ok else
-                                      "재무 지표는 네이버 금융(연간 재무제표) 기준 — Yahoo API 제한 시 자동 대체, 가격·이평선·RSI는 최신")
+        payload["financials_note"] = "재무 지표는 네이버 금융(연간 재무제표) 기준 — 한국 종목은 국내 공시 값을 우선한다"
     elif sec_filled and finnhub_filled and not fresh_ok:
         payload["financials_note"] = "재무 지표는 SEC EDGAR 공시(XBRL)·Finnhub 기준으로 보완 — Yahoo API 제한 시 자동 대체, 가격·이평선·RSI는 최신"
     elif sec_filled and finnhub_filled:
