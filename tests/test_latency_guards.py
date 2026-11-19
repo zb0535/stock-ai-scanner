@@ -435,8 +435,44 @@ class GeminiGuardTests(unittest.TestCase):
         models_called = [c["model"] for c in calls]
         self.assertEqual(models_called, [m for m, _ in api._gemini_model_plan()])   # 모든 모델 시도
         self.assertIsNone(body["analysis_model"])
-        self.assertEqual(body["analysis_source"], "fallback")
-        self.assertEqual(calls[0]["config"].thinking_config.thinking_budget, 0)
+
+    def test_invalid_argument_retries_same_model_without_thinking(self):
+        """400(사고 예산 거부)이면 같은 모델을 사고 설정 없이 다시 보낸다."""
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:  # pragma: no cover
+            self.skipTest("httpx 미설치")
+        calls = []
+
+        class PickyClient:
+            class models:
+                @staticmethod
+                def generate_content(**kwargs):
+                    cfg = kwargs["config"]
+                    calls.append((kwargs["model"], cfg.thinking_config))
+                    if cfg.thinking_config is not None:
+                        raise Exception("400 INVALID_ARGUMENT. Request contains an invalid argument.")
+                    class R:
+                        text = '{"market_note": "ok", "top_picks": []}'
+                    return R()
+
+        patches = [patch.object(api.genai, "Client", lambda **_: PickyClient()),
+                   patch.object(stock_tools, "get_stock_metrics",
+                                return_value={"ticker": "AAPL", "price": 100.0,
+                                              "quant_score": 50.0, "signals": ["ok"]}),
+                   patch.object(api, "_get_recent_news", return_value=[]),
+                   patch.object(api.time, "sleep", lambda *_: None)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+        body = TestClient(api.app).post(
+            "/api/screen", json={"criteria": "저PER", "tickers": ["AAPL"]}).json()
+        self.assertEqual([c[0] for c in calls[:2]], [api.MODEL_ID, api.MODEL_ID])
+        self.assertEqual(calls[0][1].thinking_budget, 0)   # 첫 시도는 사고 끔
+        self.assertIsNone(calls[1][1])                    # 두 번째는 사고 설정 없이
+        self.assertEqual(body["analysis_source"], "gemini")
+        self.assertEqual(body["analysis_model"], api.MODEL_ID)
 
 
 if __name__ == "__main__":

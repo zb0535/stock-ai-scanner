@@ -579,11 +579,15 @@ def screen_stocks(req: ScreenRequest):
     analysis_note = ""
     thinking_budget = GEMINI_THINKING_BUDGET
     plan = _gemini_model_plan()
+    queue = list(plan)
     deadline = time.time() + GEMINI_TOTAL_BUDGET_MS / 1000.0
     last_error = None
     analysis_model = None
+    attempt = 0
     _t = time.perf_counter()
-    for attempt, (model, budget_ms) in enumerate(plan, 1):
+    while queue:
+        model, budget_ms = queue.pop(0)
+        attempt += 1
         remaining_ms = int((deadline - time.time()) * 1000)
         if remaining_ms < 3000:  # 남은 예산으로는 의미 있는 응답을 못 받는다
             analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
@@ -599,13 +603,17 @@ def screen_stocks(req: ScreenRequest):
             analysis_model = model
             break
         except Exception as exc:
-            logger.warning("Gemini 분석 실패(%d/%d, %s) → %s: %s", attempt, len(plan), model,
+            logger.warning("Gemini 분석 실패(시도 %d, %s) → %s: %s", attempt, model,
                            type(exc).__name__, str(exc)[:200])
             last_error = exc
-            if _thinking_rejected(exc):
-                thinking_budget = None   # 사고 예산을 모르는 모델이면 빼고 다시 보낸다
+            if _thinking_rejected(exc) and thinking_budget is not None:
+                # 400 INVALID_ARGUMENT: 이 모델은 사고 예산을 받지 않는다 → 같은 모델을
+                # 사고 설정 없이 다시 보낸다(바로 다른 모델로 넘기면 원인을 못 벗는다).
+                thinking_budget = None
+                queue.insert(0, (model, budget_ms))
+                continue
             if _retryable_gemini_error(exc):
-                time.sleep(0.3 * attempt)   # 빨리 돌아온 과부하만 짧게 쉰다
+                time.sleep(0.3)   # 빨리 돌아온 과부하만 짧게 쉰다
     if data is None:
         if analysis_note == "":
             analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
