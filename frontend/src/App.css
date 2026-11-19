@@ -412,6 +412,43 @@ th { color: #94a3b8; font-weight: 600; }
   flex-wrap: wrap;
 }
 
+/* --- 종목 선택 모달: 시장 토글(🌐 S&P 500 / 🇰🇷 코스피 200) --- */
+.modal-market { padding: 12px 22px 0; }
+.market-switch {
+  display: flex;
+  width: 100%;
+  margin-bottom: 0;
+}
+.market-switch .mode-btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 9px 14px;
+}
+.market-count {
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0.78;
+  background: rgba(148, 163, 184, 0.16);
+  padding: 1px 7px;
+  border-radius: 999px;
+}
+.market-switch .mode-btn.active .market-count { background: rgba(6, 9, 19, 0.18); }
+.tabs-quick {
+  align-items: center;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+.tabs-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #64748b;
+  margin-right: 2px;
+}
+
 .modal-list { padding: 10px 14px; overflow-y: auto; flex: 1; }
 .list-empty { padding: 36px 0; text-align: center; color: #64748b; font-size: 13px; }
 .list-row {

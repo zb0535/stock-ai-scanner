@@ -14,6 +14,10 @@ import "./App.css";
 
 const API_BASE = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/+$/, "");
 
+// 종목 선택 모달의 시장 토글 값 (목록 출처: /api/sp500, /api/kospi200)
+const MARKET_US = "sp500";
+const MARKET_KR = "kospi200";
+
 const TABS = {
   "인기": [
     { symbol: "NVDA", name: "NVIDIA Corp.", exchange: "NASDAQ" },
@@ -109,7 +113,7 @@ const PRESETS = [
 export default function App() {
   const [tickers, setTickers] = useState([]);
   const [modalOpen, setModalOpen] = useState(false);
-  const [tab, setTab] = useState("인기");
+  const [tab, setTab] = useState(null);   // 빠른 선택(인기·반도체·빅테크·한국), null이면 시장 전체 목록
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
@@ -119,6 +123,12 @@ export default function App() {
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
   const [sp500, setSp500] = useState([]);
+  // 종목 선택 모달의 시장 토글: S&P 500 목록 / 코스피 200 목록
+  const [market, setMarket] = useState(MARKET_US);
+  const [kospi, setKospi] = useState([]);
+  const [kospiLoading, setKospiLoading] = useState(false);
+  const [kospiError, setKospiError] = useState("");
+  const [sp500Error, setSp500Error] = useState("");
 
   // 관심 종목에 이름·코드로 바로 추가(삼성전자·카카오·005930 → /api/resolve-ticker)
   const [addQuery, setAddQuery] = useState("");
@@ -287,8 +297,32 @@ export default function App() {
   fetch(`${API_BASE}/api/sp500`)
     .then((r) => r.json())
     .then((d) => setSp500(d.results || []))
-    .catch(() => {});
+    .catch(() => setSp500Error("S&P 500 목록을 불러오지 못했습니다."));
 }, []);
+
+  // 코스피 200 목록 — 모달에서 🇰🇷 코스피 200 토글을 처음 열 때 한 번만 불러온다.
+  const loadKospi200 = async () => {
+    if (kospi.length || kospiLoading) return;
+    setKospiLoading(true);
+    setKospiError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/kospi200`);
+      if (!res.ok) throw new Error(`코스피 200 목록을 불러오지 못했습니다 (${res.status})`);
+      const data = await res.json();
+      const rows = data.results || [];
+      setKospi(rows);
+      if (!rows.length) setKospiError("코스피 200 목록이 비어 있습니다.");
+    } catch (err) {
+      setKospiError(err.message);
+    } finally {
+      setKospiLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (modalOpen && !tab && market === MARKET_KR) loadKospi200();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modalOpen, tab, market]);
   
   useEffect(() => {
     if (!query.trim()) {
@@ -341,9 +375,17 @@ export default function App() {
 
   const listItems = query.trim()
   ? searchResults
-  : tab === "S&P 500 (500개)"
-    ? sp500
-    : TABS[tab];
+  : tab
+    ? (TABS[tab] || [])
+    : market === MARKET_KR
+      ? kospi
+      : sp500;
+
+  // 목록을 불러오는 중/실패 상태 — "결과 없음" 문구와 겹치지 않게 구분한다.
+  const browsePending = !query.trim() && !tab && (
+    (market === MARKET_KR && (kospiLoading || Boolean(kospiError) || kospi.length === 0))
+    || (market === MARKET_US && (Boolean(sp500Error) || sp500.length === 0))
+  );
 
   const perfSummary = perf?.summary || {
     total_picks: 0,
@@ -745,13 +787,40 @@ export default function App() {
               />
             </div>
             {!query.trim() && (
-              <div className="tabs">
-                {["S&P 500 (500개)", ...Object.keys(TABS)].map((t) => (
+              <div className="modal-market">
+                <div className="mode-switch market-switch" role="tablist" aria-label="종목 목록 시장">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={market === MARKET_US && !tab}
+                    className={`mode-btn ${market === MARKET_US && !tab ? "active" : ""}`}
+                    onClick={() => { setMarket(MARKET_US); setTab(null); }}
+                  >
+                    🌐 S&amp;P 500
+                    <span className="market-count">{sp500.length || 500}</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={market === MARKET_KR && !tab}
+                    className={`mode-btn ${market === MARKET_KR && !tab ? "active" : ""}`}
+                    onClick={() => { setMarket(MARKET_KR); setTab(null); loadKospi200(); }}
+                  >
+                    🇰🇷 코스피 200
+                    <span className="market-count">{kospi.length || 200}</span>
+                  </button>
+                </div>
+              </div>
+            )}
+            {!query.trim() && (
+              <div className="tabs tabs-quick">
+                <span className="tabs-label">빠른 선택</span>
+                {Object.keys(TABS).map((t) => (
                   <button
                     key={t}
                     type="button"
                     className={`tab-btn ${tab === t ? "active" : ""}`}
-                    onClick={() => setTab(t)}
+                    onClick={() => setTab(tab === t ? null : t)}
                   >
                     {t}
                   </button>
@@ -761,7 +830,17 @@ export default function App() {
 
             <div className="modal-list">
               {searching && <div className="list-empty">야후 파이낸스 검색 중...</div>}
-              {!searching && listItems.length === 0 && (
+              {!searching && !query.trim() && !tab && market === MARKET_US && sp500.length === 0 && (
+                <div className="list-empty">
+                  {sp500Error || "S&P 500 목록을 불러오는 중..."}
+                </div>
+              )}
+              {!searching && !query.trim() && !tab && market === MARKET_KR && kospi.length === 0 && (
+                <div className="list-empty">
+                  {kospiLoading ? "코스피 200 목록을 불러오는 중..." : (kospiError || "코스피 200 목록이 비어 있습니다.")}
+                </div>
+              )}
+              {!searching && listItems.length === 0 && !browsePending && (
                 <div className="list-empty">검색 결과가 없습니다.</div>
               )}
               {!searching && listItems.map((item) => {
