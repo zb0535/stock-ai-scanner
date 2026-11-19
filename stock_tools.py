@@ -3,6 +3,7 @@ import math
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import yfinance as yf
 
@@ -24,6 +25,10 @@ METRICS_TTL = 1800      # 30분: 차트 지표 + 재무 지표 통합 결과
 HISTORY_TTL = 1800      # 30분: 6개월 일봉(이평선·RSI·차트 계산용)
 STALE_TTL = 300         # 5분: 재무 지표를 직전 성공값으로 보전 중일 때 재시도 간격
 PARTIAL_TTL = 60        # 60초: 재무 지표가 비어 있는 결과 (제한이 풀리면 바로 재조회)
+
+# 여러 종목을 동시에 조회할 때의 최대 병렬도. Yahoo가 짧은 시간에 동시 요청을 많이
+# 받으면 429(rate limited)로 막으므로 5~6개로 묶어 둔다.
+MAX_FETCH_WORKERS = 6
 
 # ticker -> (저장 시각, 결과 dict)
 _METRICS_CACHE: dict[str, tuple[float, dict]] = {}
@@ -50,6 +55,23 @@ _info_cooldown_until = 0.0
 def get_watchlist() -> list[str]:
     """스크리닝 대상 미국 주식 티커 목록을 반환합니다."""
     return list(DEFAULT_WATCHLIST)
+
+
+def bounded_map(fn, items, max_workers: int = MAX_FETCH_WORKERS) -> list:
+    """여러 종목 조회를 제한된 병렬도로 실행하고 입력 순서를 그대로 유지합니다.
+
+    Yahoo 429 폭풍을 피하려고 동시 호출 수를 max_workers(기본 6)로 묶는다.
+    ThreadPoolExecutor.map은 결과를 입력 순서대로 돌려주므로 종목 순서가 보존된다.
+    fn에서 예외가 나오면 순차 실행 때와 똑같이 그 예외가 그대로 전파된다.
+    """
+    items = list(items)
+    if not items:
+        return []
+    workers = max(1, min(int(max_workers or 1), len(items)))
+    if workers == 1:
+        return [fn(item) for item in items]
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fetch") as pool:
+        return list(pool.map(fn, items))
 
 
 # --- 내부 도우미 -------------------------------------------------------------
@@ -109,6 +131,8 @@ def get_history(ticker: str, period: str = "6mo"):
 
     조회에 실패하면 만료된 직전 성공값이라도 돌려주고, 그것도 없으면 빈 DataFrame을
     돌려줍니다. 반환된 DataFrame은 읽기 전용으로만 쓰세요.
+
+    캐시 읽기·쓰기는 _CACHE_LOCK으로 보호하므로 bounded_map으로 동시에 불러도 안전하다.
     """
     sym = (ticker or "").strip().upper()
     if not sym:

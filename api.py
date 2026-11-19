@@ -1,5 +1,6 @@
 import json
 import re
+import threading
 import time
 import pandas as pd
 import yfinance as yf
@@ -50,6 +51,8 @@ _NEWS_TTL_EMPTY = 60
 _NEWS_FETCH_LIMIT = 5
 # ticker -> (저장 시각, 유지 시간, 제목 목록)
 _NEWS_CACHE: dict[str, tuple[float, float, list[str]]] = {}
+# 병렬 스크리닝에서 여러 스레드가 동시에 뉴스를 조회하므로 캐시는 락으로 보호한다.
+_NEWS_LOCK = threading.Lock()
 
 
 def _get_recent_news(ticker: str, limit: int = 3) -> list[str]:
@@ -57,7 +60,8 @@ def _get_recent_news(ticker: str, limit: int = 3) -> list[str]:
     if not sym:
         return []
     now = time.time()
-    cached = _NEWS_CACHE.get(sym)
+    with _NEWS_LOCK:
+        cached = _NEWS_CACHE.get(sym)
     if cached and now - cached[0] < cached[1]:
         return list(cached[2][:limit])
 
@@ -73,11 +77,18 @@ def _get_recent_news(ticker: str, limit: int = 3) -> list[str]:
     except Exception:
         titles = []
 
-    _NEWS_CACHE[sym] = (now, _NEWS_TTL if titles else _NEWS_TTL_EMPTY, titles)
+    with _NEWS_LOCK:
+        _NEWS_CACHE[sym] = (now, _NEWS_TTL if titles else _NEWS_TTL_EMPTY, titles)
     return list(titles[:limit])
 
 
-@app.get("/api/watchlist")
+@app.api_route("/", methods=["GET", "HEAD"])
+def health():
+    """헬스 체크. UptimeRobot 무료 모니터는 HEAD로 찔러오므로 HEAD에도 200을 준다."""
+    return {"status": "ok"}
+
+
+@app.api_route("/api/watchlist", methods=["GET", "HEAD"])
 def get_watchlist():
     return {"tickers": stock_tools.get_watchlist()}
 
@@ -121,14 +132,40 @@ def search_stocks(q: str = ""):
     except Exception:
         return {"results": []}
 
+
+def _screen_row(ticker: str) -> dict:
+    """한 종목의 차트·재무 지표와 최근 뉴스를 묶어 한 행으로 만듭니다."""
+    metrics = stock_tools.get_stock_metrics(ticker)
+    metrics["news"] = _get_recent_news(ticker, limit=2)
+    return metrics
+
+
+def _attach_chart(pick: dict) -> dict:
+    """추천 종목 하나에 6개월 차트(가격·20일·60일선)와 뉴스를 붙입니다."""
+    hist = stock_tools.get_history(pick["ticker"], "6mo")
+    close = pd.Series(dtype=float) if hist is None or hist.empty else hist["Close"]
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    recent = pd.DataFrame({"price": close, "ma20": ma20, "ma60": ma60}).tail(60)
+    pick["chart"] = [
+        {
+            "date": idx.strftime("%m/%d"),
+            "price": None if pd.isna(r["price"]) else round(float(r["price"]), 2),
+            "ma20": None if pd.isna(r["ma20"]) else round(float(r["ma20"]), 2),
+            "ma60": None if pd.isna(r["ma60"]) else round(float(r["ma60"]), 2),
+        }
+        for idx, r in recent.iterrows()
+    ]
+    pick["news"] = _get_recent_news(pick["ticker"], limit=3)
+    return pick
+
+
 @app.post("/api/screen")
 def screen_stocks(req: ScreenRequest):
     tickers = [t.strip().upper() for t in (req.tickers or stock_tools.get_watchlist()) if t.strip()]
-    rows = []
-    for t in tickers:
-        m = stock_tools.get_stock_metrics(t)
-        m["news"] = _get_recent_news(t, limit=2)
-        rows.append(m)
+    # 15개 종목을 순차 조회하면 13초 넘게 걸리므로, 최대 6개씩 병렬로 당긴다.
+    # bounded_map이 입력 순서를 유지해 주므로 응답의 종목 순서는 그대로다.
+    rows = stock_tools.bounded_map(_screen_row, tickers)
 
     client = genai.Client()
     res = client.models.generate_content(
@@ -143,24 +180,11 @@ def screen_stocks(req: ScreenRequest):
     raw = re.sub(r"^```json\s*|\s*```$", "", (res.text or "").strip())
     data = json.loads(raw)
 
-    for pick in data.get("top_picks", []):
-        hist = stock_tools.get_history(pick["ticker"], "6mo")
-        close = pd.Series(dtype=float) if hist is None or hist.empty else hist["Close"]
-        ma20 = close.rolling(20).mean()
-        ma60 = close.rolling(60).mean()
-        recent = pd.DataFrame({"price": close, "ma20": ma20, "ma60": ma60}).tail(60)
-        pick["chart"] = [
-            {
-                "date": idx.strftime("%m/%d"),
-                "price": None if pd.isna(r["price"]) else round(float(r["price"]), 2),
-                "ma20": None if pd.isna(r["ma20"]) else round(float(r["ma20"]), 2),
-                "ma60": None if pd.isna(r["ma60"]) else round(float(r["ma60"]), 2),
-            }
-            for idx, r in recent.iterrows()
-        ]
-        pick["news"] = _get_recent_news(pick["ticker"], limit=3)
+    # 추천 종목의 차트·뉴스도 선택된 개수만큼 병렬로 채운다(보통 3개).
+    stock_tools.bounded_map(_attach_chart, data.get("top_picks", []))
 
     return {"analysis": data, "all_stocks": rows}
+
 
 @app.get("/api/stock/{ticker}")
 def get_stock_detail(ticker: str):
