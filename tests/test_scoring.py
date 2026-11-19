@@ -420,6 +420,34 @@ class RankStocksTests(unittest.TestCase):
         self.assertEqual(ranked, [])
         self.assertEqual(strategy, "balanced")
 
+    def test_each_strategy_orders_its_own_winner_first(self):
+        """같은 후보군이라도 전략이 바뀌면 1등이 바뀐다(가치/과매도/모멘텀)."""
+        rows = [
+            # 싸고 탄탄한데 이미 많이 올라 추세는 약한 종목
+            {"ticker": "CHEAP", "price": 100.0, "ma20": 90.0, "ma60": 110.0,
+             "trailing_pe": 7.2, "revenue_growth": 0.24, "operating_margins": 0.3,
+             "debt_to_equity": 20.0, "rsi14": 62.0, "bb_pct_b": 0.9,
+             "volume_ratio": 0.8, "drawdown_from_high_pct": -2.0, "range_position_pct": 70.0},
+            # 비싸지만 정배열·거래량 급증·신고가권 돌파
+            {"ticker": "BREAK", "price": 120.0, "ma20": 115.0, "ma60": 100.0,
+             "trailing_pe": 55.0, "revenue_growth": 0.05, "operating_margins": 0.1,
+             "debt_to_equity": 90.0, "rsi14": 63.0, "bb_pct_b": 0.85,
+             "macd_cross": "bullish", "volume_ratio": 2.8,
+             "drawdown_from_high_pct": -1.0, "range_position_pct": 96.0},
+            # 깊게 빠지고 과매도
+            {"ticker": "WASHED", "price": 60.0, "ma20": 75.0, "ma60": 90.0,
+             "trailing_pe": 30.0, "revenue_growth": -0.1, "operating_margins": 0.06,
+             "debt_to_equity": 120.0, "rsi14": 22.0, "bb_pct_b": -0.18,
+             "volume_ratio": 2.1, "drawdown_from_high_pct": -38.0, "range_position_pct": 4.0},
+        ]
+        for criteria, expected_first in (("저PER 가치주", "CHEAP"),
+                                         ("단기 눌림목 반등", "WASHED"),
+                                         ("모멘텀 돌파", "BREAK")):
+            ranked, strategy = scoring.rank_stocks(rows, criteria=criteria)
+            self.assertEqual(ranked[0]["ticker"], expected_first, (criteria, strategy))
+            scores = [r["quant_score"] for r in ranked]
+            self.assertEqual(scores, sorted(scores, reverse=True))
+
 
 # --- 5. /api/screen 통합 -----------------------------------------------------
 
