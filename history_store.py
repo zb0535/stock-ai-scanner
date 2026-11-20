@@ -696,29 +696,26 @@ def clear_price_cache() -> None:
         _PRICE_CACHE.clear()
 
 
-def _overlay_realtime(prices: dict[str, float | None], tickers: list[str]
-                      ) -> tuple[dict[str, float | None], dict[str, str]]:
-    """일봉 종가 위에 실시간 현재가를 덮어쓴다(실패한 종목은 종가 유지).
+def _realtime_prices(tickers: list[str]) -> tuple[dict[str, float], dict[str, str]]:
+    """실시간 현재가(한국 네이버·미국 Finnhub) → (가격, 출처). 예외는 모두 흡수.
 
-    반환: (가격 dict, 티커별 price_source dict). 예외는 모두 흡수해 성적표를 죽이지 않는다.
+    성적표는 실시간가가 있으면 일봉 종가 배치를 부르지 않는다 — 장중 새로고침이
+    Yahoo 왕복(2~5초)을 기다리지 않는다.
     """
-    merged = dict(prices or {})
+    prices: dict[str, float] = {}
     sources: dict[str, str] = {}
     try:
         quotes = realtime_quotes.get_prices(tickers)
-    except Exception as exc:  # 실시간 계층이 죽어도 종가는 그대로 보여준다
+    except Exception as exc:  # 실시간 계층이 죽어도 종가로 평가한다
         logger.warning("성적표 실시간 시세 실패: %s: %s", type(exc).__name__, str(exc)[:160])
-        quotes = {}
+        return prices, sources
     for sym, quote in (quotes or {}).items():
         price = _num(quote.get("price"))
         if price is None or price <= 0:
             continue
-        merged[sym] = price
+        prices[sym] = price
         sources[sym] = realtime_quotes.source_of(quote)
-    for sym, price in merged.items():
-        if sym not in sources and _num(price) is not None:
-            sources[sym] = realtime_quotes.SOURCE_DAILY
-    return merged, sources
+    return prices, sources
 
 
 # --- 성적표 ------------------------------------------------------------------
@@ -846,25 +843,32 @@ def get_performance(limit: int = DEFAULT_LIMIT, db_path: str | None = None,
         body["picks"] = []
         return _tag_backend(body, db_path)
 
-    try:
-        prices = latest_prices([p["ticker"] for p in picks],
-                               fetcher=price_fetcher or _fetch_prices_batch)
-    except Exception as exc:  # 가격 조회가 죽어도 이력은 보여준다(수익률만 null)
-        logger.warning("현재가 조회 실패: %s: %s", type(exc).__name__, str(exc)[:200])
-        prices = {}
-        body = compute_performance(picks, prices)
-        body["error"] = "price_unavailable"
-        body["as_of"] = kst_now().isoformat(timespec="seconds")
-        body["limit"] = n
-        return _tag_backend(body, db_path)
+    tickers = [p["ticker"] for p in picks]
 
-    # 장중 현재가: 최신 일봉 종가 위에 실시간 시세(네이버·Finnhub)를 덮어쓴다.
-    # `price_fetcher`를 주입한 호출(테스트·대체 경로)에는 적용하지 않는다.
+    # 1) 실시간 현재가(네이버·Finnhub)를 먼저 시도한다 — 장중 새로고침이 Yahoo 왕복을
+    #    기다리지 않게. `price_fetcher`를 주입한 호출(테스트·대체 경로)에는 쓰지 않는다.
+    prices: dict[str, float | None] = {}
     sources: dict[str, str] = {}
     if price_fetcher is None:
-        prices, sources = _overlay_realtime(prices, [p["ticker"] for p in picks])
+        prices, sources = _realtime_prices(tickers)
+
+    # 2) 실시간가를 못 받은 종목만 최근 일봉 종가로 채운다(5분 캐시).
+    pending = [t for t in tickers if _clean(t).upper() not in prices]
+    error = None
+    if pending:
+        try:
+            closes = latest_prices(pending, fetcher=price_fetcher or _fetch_prices_batch)
+        except Exception as exc:  # 가격 조회가 죽어도 이력은 보여준다(수익률만 null)
+            logger.warning("현재가 조회 실패: %s: %s", type(exc).__name__, str(exc)[:200])
+            closes = {}
+            error = "price_unavailable"
+        for sym, price in (closes or {}).items():
+            prices[sym] = price
+            sources.setdefault(sym, realtime_quotes.SOURCE_DAILY)
 
     body = compute_performance(picks, prices, sources=sources)
+    if error:
+        body["error"] = error
     body["as_of"] = kst_now().isoformat(timespec="seconds")
     body["limit"] = n
     return _tag_backend(body, db_path)

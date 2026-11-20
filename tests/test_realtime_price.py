@@ -406,6 +406,22 @@ class PerformanceRealtimeTests(unittest.TestCase):
                                                  price_fetcher=lambda t: {"AAPL": 105.0})
         self.assertEqual(body["picks"][0]["current_price"], 105.0)
 
+    def test_realtime_covers_so_daily_batch_is_skipped(self):
+        """실시간가가 모든 픽을 덮으면 Yahoo 일봉 배치(2~5초)를 부르지 않는다."""
+        self._record()
+
+        def no_batch(tickers):
+            raise AssertionError("실시간가가 있으면 일봉 배치를 부르지 않는다")
+
+        with patch.object(history_store, "_fetch_prices_batch", no_batch), \
+                patch.object(realtime_quotes, "get_prices",
+                             lambda *a, **k: {"AAPL": {"price": 111.0,
+                                                       "source": "finnhub_quote"}}):
+            body = history_store.get_performance(db_path=self.db)
+
+        self.assertEqual(body["picks"][0]["current_price"], 111.0)
+        self.assertEqual(body["picks"][0]["price_source"], "finnhub_quote")
+
 
 # ---------------------------------------------------------------------------
 # 6~7. /api/screen (AI 캐시·뉴스 상위 N) · /api/stock

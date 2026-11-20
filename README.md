@@ -91,9 +91,9 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     `GET /api/performance`의 `storage_backend`(`postgres`|`sqlite`)로 확인한다(자격 증명은 노출하지 않음).
     ⚠️ Render 무료 플랜은 영구 디스크가 없어 재배포 시 SQLite 이력이 초기화되므로,
     오래 쌓으려면 무료 PostgreSQL(Neon 등)을 붙여 `DATABASE_URL`만 넣으면 된다.
-  - 현재가는 일봉 종가(`yf.download`, 최대 50종목 한 번·5분 캐시) 위에 **실시간 시세**를 덮어쓴다 —
-    장중에는 픽마다 `price_source`가 `naver_realtime`/`finnhub_quote`이고, 실시간 조회에 실패한
-    종목만 `daily_close`(일봉 종가)다.
+  - 현재가는 **실시간 시세(네이버·Finnhub)를 먼저** 쓰고, 실시간가를 못 받은 종목만 일봉 종가
+    (`yf.download`, 최대 50종목 한 번·5분 캐시)로 채운다 — 장중 새로고침이 Yahoo 왕복을 기다리지
+    않는다. 픽마다 `price_source`가 `naver_realtime`/`finnhub_quote`/`daily_close`다.
   - 응답: `{"summary": {total_picks, evaluated_picks, win_count, win_rate_pct, avg_return_pct,
     best_pick, worst_pick}, "picks": [...], "as_of", "limit"}`. 이력이 비면 개수 0·비율 `null`.
     픽별로 `entry_price`·`current_price`·`return_pct`·`is_win`(return > 0)·`days_held`가 붙는다.
