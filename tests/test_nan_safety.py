@@ -127,6 +127,9 @@ class BaseCase(unittest.TestCase):
         stock_tools._METRICS_CACHE.clear()
         stock_tools._HISTORY_CACHE.clear()
         api._NEWS_CACHE.clear()
+        api.clear_analysis_cache()
+        self.addCleanup(api.clear_analysis_cache)
+        api.realtime_quotes.clear_cache()
         stock_tools._info_fail_streak = 0
         stock_tools._info_cooldown_until = 0.0
         naver_finance.clear_cache()
@@ -134,6 +137,7 @@ class BaseCase(unittest.TestCase):
         self.patch(stock_tools.sec_edgar, "get_financial_metrics", lambda *a, **k: {})
         self.patch(naver_finance, "get_fundamentals", lambda *a, **k: {})
         self.patch(naver_finance, "get_korean_news", lambda *a, **k: [])
+        self.patch(api.realtime_quotes, "get_prices", lambda *a, **k: {})
 
 
 # --- 1. 데이터 계층: 종가 빈 행 제거 -----------------------------------------

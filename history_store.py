@@ -17,6 +17,8 @@
   (진입가는 최초 추천 시점의 값이어야 수익률이 왜곡되지 않는다). 점수·mode·criteria만 갱신.
 - 평가는 배치: 현재가는 `yf.download` 한 번(최대 50종목)으로 받아 5분 메모리 캐시한다.
   `t.info`는 절대 부르지 않는다(Yahoo 429/401 차단 회피, 응답 속도).
+- 장중에는 일봉 종가 대신 **실시간 현재가**(한국 네이버·미국 Finnhub)를 우선 쓴다.
+  실시간 조회에 실패한 종목만 일봉 종가로 채우고, 픽마다 `price_source`를 남긴다.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ import pandas as pd
 import yfinance as yf
 
 import naver_finance
+import realtime_quotes
 
 logger = logging.getLogger("history_store")
 
@@ -693,6 +696,31 @@ def clear_price_cache() -> None:
         _PRICE_CACHE.clear()
 
 
+def _overlay_realtime(prices: dict[str, float | None], tickers: list[str]
+                      ) -> tuple[dict[str, float | None], dict[str, str]]:
+    """일봉 종가 위에 실시간 현재가를 덮어쓴다(실패한 종목은 종가 유지).
+
+    반환: (가격 dict, 티커별 price_source dict). 예외는 모두 흡수해 성적표를 죽이지 않는다.
+    """
+    merged = dict(prices or {})
+    sources: dict[str, str] = {}
+    try:
+        quotes = realtime_quotes.get_prices(tickers)
+    except Exception as exc:  # 실시간 계층이 죽어도 종가는 그대로 보여준다
+        logger.warning("성적표 실시간 시세 실패: %s: %s", type(exc).__name__, str(exc)[:160])
+        quotes = {}
+    for sym, quote in (quotes or {}).items():
+        price = _num(quote.get("price"))
+        if price is None or price <= 0:
+            continue
+        merged[sym] = price
+        sources[sym] = realtime_quotes.source_of(quote)
+    for sym, price in merged.items():
+        if sym not in sources and _num(price) is not None:
+            sources[sym] = realtime_quotes.SOURCE_DAILY
+    return merged, sources
+
+
 # --- 성적표 ------------------------------------------------------------------
 
 
@@ -714,7 +742,8 @@ def empty_performance(limit: int = DEFAULT_LIMIT, error: str | None = None) -> d
     return body
 
 
-def _evaluate(pick: dict, current_price: float | None, today: date) -> dict:
+def _evaluate(pick: dict, current_price: float | None, today: date,
+              price_source: str | None = None) -> dict:
     entry = _num(pick.get("entry_price"))
     price = _num(current_price)
     return_pct = None
@@ -737,6 +766,7 @@ def _evaluate(pick: dict, current_price: float | None, today: date) -> dict:
         "recommended_at": pick.get("recommended_at"),
         "entry_price": None if entry is None else round(entry, 4),
         "current_price": None if price is None else round(price, 4),
+        "price_source": price_source if price is not None else None,
         "return_pct": return_pct,
         "is_win": None if return_pct is None else return_pct > 0,
         "days_held": days_held,
@@ -777,10 +807,17 @@ def _summary(rows: list[dict]) -> dict:
 
 
 def compute_performance(picks: list[dict], prices: dict[str, float | None],
-                        today: date | None = None) -> dict:
-    """추천 원본 행 + 현재가 → 성적표(픽별 수익률·승패 + 요약). 네트워크 없음."""
+                        today: date | None = None,
+                        sources: dict[str, str] | None = None) -> dict:
+    """추천 원본 행 + 현재가 → 성적표(픽별 수익률·승패 + 요약). 네트워크 없음.
+
+    `sources`는 티커별 현재가 출처(`naver_realtime`/`finnhub_quote`/`daily_close`)다.
+    없으면 `daily_close`로 본다(기존 호출부 호환).
+    """
     day = today or kst_today()
-    rows = [_evaluate(p, (prices or {}).get(_clean(p.get("ticker")).upper()), day)
+    by_source = {_clean(k).upper(): v for k, v in (sources or {}).items()}
+    rows = [_evaluate(p, (prices or {}).get(_clean(p.get("ticker")).upper()), day,
+                      by_source.get(_clean(p.get("ticker")).upper()))
             for p in picks or []]
     return {"summary": _summary(rows), "picks": rows}
 
@@ -821,7 +858,13 @@ def get_performance(limit: int = DEFAULT_LIMIT, db_path: str | None = None,
         body["limit"] = n
         return _tag_backend(body, db_path)
 
-    body = compute_performance(picks, prices)
+    # 장중 현재가: 최신 일봉 종가 위에 실시간 시세(네이버·Finnhub)를 덮어쓴다.
+    # `price_fetcher`를 주입한 호출(테스트·대체 경로)에는 적용하지 않는다.
+    sources: dict[str, str] = {}
+    if price_fetcher is None:
+        prices, sources = _overlay_realtime(prices, [p["ticker"] for p in picks])
+
+    body = compute_performance(picks, prices, sources=sources)
     body["as_of"] = kst_now().isoformat(timespec="seconds")
     body["limit"] = n
     return _tag_backend(body, db_path)

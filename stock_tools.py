@@ -11,6 +11,7 @@ import yfinance as yf
 
 import finnhub_client
 import naver_finance
+import realtime_quotes
 import sec_edgar
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -652,6 +653,17 @@ def _metrics_ttl(payload: dict) -> float:
     return PARTIAL_TTL
 
 
+def _trend_text(price, ma20, ma60) -> str:
+    """현재가·20일선·60일선 배열로 추세 문구를 만든다(실시간가 재판정에도 같은 문구를 쓴다)."""
+    if ma20 is None or ma60 is None or price is None:
+        return "판단불가"
+    if price > ma20 > ma60:
+        return "상승 추세(정배열: 현재가>20일선>60일선)"
+    if price < ma20 < ma60:
+        return "하락 추세(역배열: 현재가<20일선<60일선)"
+    return "횡보/혼조"
+
+
 def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     hist = get_history(sym, "6mo")
     if hist is None or getattr(hist, "empty", True):
@@ -673,14 +685,7 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     rsi14 = _calc_rsi(close, 14)
     indicators = compute_advanced_indicators(hist)
 
-    trend = "판단불가"
-    if ma20 is not None and ma60 is not None:
-        if price > ma20 > ma60:
-            trend = "상승 추세(정배열: 현재가>20일선>60일선)"
-        elif price < ma20 < ma60:
-            trend = "하락 추세(역배열: 현재가<20일선<60일선)"
-        else:
-            trend = "횡보/혼조"
+    trend = _trend_text(price, ma20, ma60)
 
     # --- 재무 지표: 실패해도 차트 지표는 그대로 살린다 ---
     # 한국 종목(.KS/.KQ)은 Yahoo `t.info`를 **아예 부르지 않는다**. Render 같은 데이터센터
@@ -864,6 +869,55 @@ def get_stock_metrics(ticker: str) -> dict:
     with _CACHE_LOCK:
         _METRICS_CACHE[sym] = (now, payload)
     return dict(payload)
+
+
+# --- 실시간 현재가 오버레이 --------------------------------------------------
+# 지표·재무는 30분 캐시(METRICS_TTL) 그대로 두고 **현재가만** 실시간으로 덮어쓴다.
+# S&P 500/코스피 200 프리 스캔에는 쓰지 않고, 최종 15종목·성적표처럼 종목 수가 적은
+# 응답 직전에만 부른다(한국은 네이버 요청 1회, 미국은 Finnhub 병렬 8개).
+
+
+def apply_realtime_prices(rows: list, max_workers: int = realtime_quotes.QUOTE_WORKERS) -> list:
+    """종목 dict 목록의 `price`를 실시간 현재가로 덮어쓰고 `price_source`를 붙인다.
+
+    - 한국 종목: 네이버 polling → `price_source="naver_realtime"`
+    - 미국 종목: Finnhub `/quote` → `price_source="finnhub_quote"`
+    - 조회 실패·미지원:
+        기존 일봉 종가 유지 → `price_source="daily_close"`
+    `price`가 바뀌면 추세 문구(`trend`)도 새 가격으로 다시 판정해, 화면에서 "현재가보다
+    20일선이 낮은데 역배열"처럼 앞뒤가 맞지 않는 일이 없게 한다.
+
+    반환: 같은 리스트(항목 dict를 제자리에서 바꾼다). rows에 `ticker`/`price`가 없으면
+    그대로 두고 건드리지 않는다.
+    """
+    if not isinstance(rows, list):
+        return rows
+    targets = [row for row in rows
+               if isinstance(row, dict) and row.get("ticker") and not row.get("error")]
+    if not targets:
+        return rows
+
+    try:
+        quotes = realtime_quotes.get_prices([row.get("ticker") for row in targets],
+                                           max_workers=max_workers)
+    except Exception as exc:  # 실시간 시세 계층 전체 실패 → 전부 일봉 종가 유지
+        logger.warning("실시간 시세 오버레이 실패: %s: %s", type(exc).__name__, str(exc)[:160])
+        quotes = {}
+
+    for row in targets:
+        sym = str(row.get("ticker") or "").strip().upper()
+        quote = quotes.get(sym) or {}
+        price = _to_number(quote.get("price"))
+        if price is not None and price > 0:
+            row["price"] = round(float(price), 2)
+            row["price_source"] = realtime_quotes.source_of(quote)
+            row["trend"] = _trend_text(row["price"], _to_number(row.get("ma20")),
+                                       _to_number(row.get("ma60")))
+            if quote.get("market_status"):
+                row["market_status"] = quote["market_status"]
+        else:
+            row["price_source"] = realtime_quotes.SOURCE_DAILY
+    return rows
 
 
 if __name__ == "__main__":

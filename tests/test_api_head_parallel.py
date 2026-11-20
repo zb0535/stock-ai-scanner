@@ -97,6 +97,11 @@ class BaseCase(unittest.TestCase):
         stock_tools._METRICS_CACHE.clear()
         stock_tools._HISTORY_CACHE.clear()
         api._NEWS_CACHE.clear()
+        api.clear_analysis_cache()
+        self.addCleanup(api.clear_analysis_cache)
+        api.realtime_quotes.clear_cache()
+        # 실시간 시세는 실네트워크를 탄다 — 스크리닝 계약을 보는 테스트에서는 끄고 일봉 종가를 쓴다.
+        self.patch_attr(api.realtime_quotes, "get_prices", lambda *a, **k: {})
         stock_tools._info_fail_streak = 0
         stock_tools._info_cooldown_until = 0.0
         FakeTicker.calls = {"info": [], "history": []}
@@ -180,8 +185,15 @@ class ParallelScreenTests(BaseCase):
         body = resp.json()
         # 순서 보존: 입력 순서 그대로 15행
         self.assertEqual([r["ticker"] for r in body["all_stocks"]], self.TICKERS)
-        # 각 행에 뉴스가 붙는다(limit=2)
-        self.assertTrue(all(r["news"] == [f"{r['ticker']} headline"] for r in body["all_stocks"]))
+        # 뉴스는 정량 점수 상위 NEWS_TOP_N종목에만 븥고 나머지는 빈 배열(토큰·네트워크 절약)
+        with_news = [r for r in body["all_stocks"] if r["news"]]
+        self.assertEqual(len(with_news), api.NEWS_TOP_N)
+        for row in with_news:
+            self.assertEqual(row["news"], [f"{row['ticker']} headline"])
+        for row in body["all_stocks"]:
+            if row["news"]:
+                continue
+            self.assertEqual(row["news"], [])
         # 병렬 실행 + 동시 호출 6개 상한
         self.assertGreaterEqual(state["peak"], 2, "병렬로 실행되지 않았다")
         self.assertLessEqual(state["peak"], stock_tools.MAX_FETCH_WORKERS)

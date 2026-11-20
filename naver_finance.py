@@ -46,6 +46,7 @@ logger = logging.getLogger("naver_finance")
 
 BASE_AC = "https://ac.stock.naver.com/ac"
 BASE_MOBILE = "https://m.stock.naver.com/api"
+BASE_POLLING = "https://polling.finance.naver.com/api/realtime/domestic/stock"
 BASE_GOOGLE_NEWS = "https://news.google.com/rss/search"
 TIMEOUT = 8
 HEADERS = {"User-Agent": "Mozilla/5.0 (stock-ai-scanner)"}
@@ -56,6 +57,12 @@ FUND_TTL = 6 * 3600
 TABLE_TTL = 6 * 3600
 FAIL_TTL = 15 * 60
 NEWS_TTL = 10 * 60
+
+# 실시간 현재가(초) — 같은 요청 안에서 중복 호출만 막을 만큼만 짧게 둔다.
+REALTIME_TTL = 10            # 성공: 10초 뒤 다시 조회하면 최신 체결가가 온다
+REALTIME_FAIL_TTL = 30       # 실패: 30초만 기억(장 마감·일시 장애 때 매 호출을 반복하지 않게)
+REALTIME_TIMEOUT = 3         # 실시간 시세 한 번에 허용하는 대기(초) — 스크리닝을 붙잡지 않게
+REALTIME_BATCH = 50          # polling은 쉼표 목록을 받는다 — 한 요청에 넣을 최대 코드 수
 
 KOSPI200_PAGE_SIZE = 20      # enrollStocks 한 페이지 기본 개수
 KOSPI200_MAX_PAGES = 15      # 20 × 15 = 300 (201종목이면 11페이지에서 끝난다)
@@ -135,10 +142,11 @@ def _num(value):
     return num
 
 
-def _get_json(url: str, params: dict | None = None):
+def _get_json(url: str, params: dict | None = None, timeout: float | None = None):
     """짧은 타임아웃 GET → JSON. 실패는 예외 대신 None."""
     try:
-        resp = requests.get(url, params=params or None, timeout=TIMEOUT, headers=HEADERS)
+        resp = requests.get(url, params=params or None,
+                            timeout=TIMEOUT if timeout is None else timeout, headers=HEADERS)
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:  # 네트워크·JSON·차단 모두 흡수
@@ -407,6 +415,133 @@ def get_fundamentals(ticker) -> dict | None:
                                   "operating_margins", "debt_to_equity"))
     _cache_put(key, data, FUND_TTL if has_value else FAIL_TTL)
     return data
+
+
+# --- 실시간 현재가 -----------------------------------------------------------
+# 라이브 확인한 엔드포인트 (2026-11-20, 장중 15:11 KST)
+# - 실시간 polling  `https://polling.finance.naver.com/api/realtime/domestic/stock/005930`
+#   → `{"pollingInterval":7000,"datas":[{"itemCode","stockName","closePrice":"183,200",
+#      "marketStatus":"OPEN","localTradedAt":"...",...}]}`  · 7초 간격 갱신, **쉼표로 여러 코드**를
+#      한 번에 받을 수 있다(`/stock/005930,000660` → datas 2개). 잘못된 코드만 있으면
+#      `datas: []`(200)이므로 404 예외 처리가 필요 없다.
+# - 종목 기본    `https://m.stock.naver.com/api/stock/005930/basic` → 같은 `closePrice`
+#   polling이 빈 응답을 준 경우(일부 코드만 누락)에만 코드별로 한 번 더 확인하는 폴백이다.
+#
+# 장 마감 뒤에도 `closePrice`는 그날 종가로 채워져 있어 "현재가"로 쓸 수 있다(장외 단일가인
+# `overMarketPriceInfo.overPrice`는 일봉 종가와 기준이 달라 쓰지 않는다).
+#
+# 반환 dict: `{"price": float, "source": "naver_realtime", "market_status": str, "traded_at": str}`
+
+
+def _parse_realtime_item(item) -> dict | None:
+    """polling 응답 한 항목 → 시세 dict. 가격이 없거나 0 이하이면 None."""
+    if not isinstance(item, dict):
+        return None
+    price = _num(item.get("closePrice"))
+    if price is None or price <= 0:
+        return None
+    return {
+        "price": float(price),
+        "source": "naver_realtime",
+        "market_status": str(item.get("marketStatus") or ""),
+        "traded_at": str(item.get("localTradedAt") or ""),
+    }
+
+
+def _basic_quote(code: str) -> dict | None:
+    """polling이 그 코드를 안 줬을 때의 단건 폴백(`.../basic`)."""
+    data = _get_json(f"{BASE_MOBILE}/stock/{code}/basic", timeout=REALTIME_TIMEOUT)
+    if not isinstance(data, dict):
+        return None
+    price = _num(data.get("closePrice"))
+    if price is None or price <= 0:
+        return None
+    return {
+        "price": float(price),
+        "source": "naver_realtime",
+        "market_status": str(data.get("marketStatus") or ""),
+        "traded_at": str(data.get("localTradedAt") or ""),
+    }
+
+
+def _fetch_realtime_chunk(codes: list[str]) -> dict[str, dict]:
+    """코드 여러 개를 polling 한 번으로 받는다. 응답이 아예 없으면 폴백도 하지 않는다.
+
+    (polling 자체가 죽었을 때 코드마다 basic을 부르면 50번 요청이 나간다 — 그 경우는
+     빈 dict로 끝내고 호출부가 일봉 종가를 유지하는 편이 낫다.)
+    """
+    data = _get_json(f"{BASE_POLLING}/{','.join(codes)}", timeout=REALTIME_TIMEOUT)
+    out: dict[str, dict] = {}
+    if isinstance(data, dict):
+        for item in data.get("datas") or []:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("itemCode") or "").strip().upper()
+            quote = _parse_realtime_item(item)
+            if code and quote:
+                out[code] = quote
+    else:
+        return out  # 네트워크·차단 실패 → 폴백 없음
+
+    for code in codes:  # 응답은 왔는데 일부만 빠진 경우만 단건으로 보충
+        if code in out:
+            continue
+        quote = _basic_quote(code)
+        if quote:
+            out[code] = quote
+    return out
+
+
+def get_realtime_prices(tickers) -> dict[str, dict]:
+    """한국 종목 여러 개의 실시간 현재가를 10초 캐시로 모아 돌려준다.
+
+    - 여러 코드를 `REALTIME_BATCH`개씩 묶어 **요청 수를 종목 수가 아니라 묶음 수**로 만든다
+        (15종목이면 1회). 스크리닝·성적표에서 부담 없이 부를 수 있는 이유다.
+    - 반환: `{야후 티커: {"price", "source": "naver_realtime", "market_status", "traded_at"}}`
+      실패한 종목은 키가 없다(호출부가 일봉 종가 유지).
+    - 한국 티커(`.KS`/`.KQ`)가 아니면 아무것도 하지 않는다.
+    """
+    wanted: dict[str, str] = {}       # 야후 티커 -> 6자리 코드
+    pending: list[str] = []
+    out: dict[str, dict] = {}
+    for raw in tickers or []:
+        sym = str(raw or "").strip().upper()
+        code = naver_code(sym)
+        if not sym or not code or sym in wanted:
+            continue
+        wanted[sym] = code
+        cached = _cache_get(f"rt:{code}")
+        if cached is not _MISS:
+            if cached:
+                out[sym] = dict(cached)
+            continue
+        pending.append(code)
+
+    fetched: dict[str, dict] = {}
+    for start in range(0, len(pending), REALTIME_BATCH):
+        fetched.update(_fetch_realtime_chunk(pending[start:start + REALTIME_BATCH]))
+
+    for code in pending:
+        quote = fetched.get(code)
+        _cache_put(f"rt:{code}", dict(quote) if quote else None,
+                   REALTIME_TTL if quote else REALTIME_FAIL_TTL)
+
+    for sym, code in wanted.items():
+        if sym in out:
+            continue
+        quote = fetched.get(code)
+        if quote:
+            out[sym] = dict(quote)
+    return out
+
+
+def get_realtime_price(ticker) -> float | None:
+    """한국 종목 하나의 실시간 현재가(원). 실패·타임아웃·파싱 불가면 None."""
+    sym = str(ticker or "").strip().upper()
+    if not naver_code(sym):
+        return None
+    quote = get_realtime_prices([sym]).get(sym)
+    return float(quote["price"]) if quote else None
 
 
 # --- 한국 뉴스 ---------------------------------------------------------------

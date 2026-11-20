@@ -22,6 +22,7 @@ import sp500_scanner
 import kospi200_scanner
 import naver_finance
 import history_store
+import realtime_quotes
 from finnhub_client import status as finnhub_status
 
 logger = logging.getLogger("api")
@@ -47,23 +48,34 @@ GEMINI_THINKING_BUDGET = int(os.environ.get("GEMINI_THINKING_BUDGET", "0"))
 # S&P 500 자동 발굴에서 Gemini로 넘길 후보 수.
 DISCOVERY_TOP_N = sp500_scanner.TOP_N
 
+# AI 분석(프롬프트)에 뉴스를 넣을 상위 종목 수. 뉴스는 종목당 네트워크 1회라
+# 정량 점수 상위 몇 개만 넣고, 나머지는 점수·지표만으로 평가한다(프롬프트 토큰·시간 절약).
+NEWS_TOP_N = max(0, int(os.environ.get("NEWS_TOP_N", "5")))
+
+# --- AI 분석 캐시 -------------------------------------------------------------
+# Gemini 호출이 응답 시간의 대부분을 차지한다. 같은 (mode·전략·조건·종목) 요청이 10분 안에
+# 다시 오면 분석 결과를 재사용하고, **주가는 매번 실시간으로 다시 조회해 덮어쓴다**.
+# Gemini 실패로 만든 폴백 분석은 결과가 빈약하니 아주 짧게(60초)만 기억해 다음 호출에서
+# 정상 분석을 다시 시도한다.
+ANALYSIS_CACHE_TTL = int(os.environ.get("ANALYSIS_CACHE_TTL", "600"))
+ANALYSIS_FALLBACK_TTL = int(os.environ.get("ANALYSIS_FALLBACK_TTL", "60"))
+_ANALYSIS_MAX_ENTRIES = 64
+_ANALYSIS_CACHE: dict[tuple, dict] = {}
+_ANALYSIS_LOCK = threading.Lock()
+
 SYSTEM_PROMPT = """너는 한국·미국 주식 차트·재무제표 스크리닝 보조 봇이다.
 제공된 데이터에 없는 가격·지표·뉴스를 절대 지어내지 마라.
-종목 데이터는 서버가 계산한 정량 점수 `quant_score`(0~100, 높을수록 조건 적합) 내림차순으로 정렬돼 있고, 각 종목에는 점수 근거인 `signals` 목록이 붙어 있다. `strategy`는 사용자 조건에서 읽은 전략 의도(value=가치, oversold=과매도 반등, momentum=모멘텀, balanced=균형)다.
-통화: 각 종목의 `currency`를 따른다. `KRW`면 가격을 `₩65,400`처럼 원 단위로, `USD`면 `$352.45`처럼 달러로 적어라. 통화를 섞거나 환율로 환산하지 마라. `name`에 한국어 종목명이 있으면 `삼성전자(005930.KS)`처럼 티커와 함께 써라.
-선정 근거에는 `quant_score`와 그 근거(`signals`)를 반드시 수치로 인용하고, 함께 제공된 차트 지표(이평선·RSI·MACD·볼린저밴드·거래량 배수·고점 대비 낙폭)와 재무 지표(PER·매출성장률·영업이익률·부채비율), 최근 뉴스 맥락이 있다면 그것도 엮어라. 점수가 높아도 약한 신호(`signals`의 부정 항목, 예: 고PER·과열 RSI·역배열)가 있으면 리스크로 짚어라.
-점수는 참고값이다. 점수가 비슷한 종목은 재무·뉴스로 우열을 가려도 되지만, 점수가 높은 종목을 이유 없이 빼지 마라.
-만약 일부 종목의 재무 지표가 일시적 API 제한으로 비어(`null`) 있더라도, 주가·이동평균·RSI 등 제공된 수치만으로 분석하거나 값이 있는 다른 종목을 우선 추천하고, '전체 정보가 없다'고 뭉뚱그리지 마라. `financials_note`가 붙은 종목은 재무 지표만 일시 미수신일 뿐 차트 수치는 유효하다.
-반드시 아래 JSON 형식으로만 출력하라(다른 키를 추가하지 마라):
+종목은 서버가 계산한 정량 점수 `quant_score`(0~100, 높을수록 조건 적합) 내림차순이고, 점수 근거는 `signals`다. `strategy`는 사용자 조건의 의도(value=가치, oversold=과매도 반등, momentum=모멘텀, balanced=균형)다.
+통화는 종목의 `currency`를 따른다(`KRW`→`₩65,400`, `USD`→`$352.45`). 환산·혼용하지 마라. `name`이 있으면 `삼성전자(005930.KS)`처럼 써라.
+근거에는 `quant_score`와 `signals`를 수치로 인용하고, 차트 지표(이평선·RSI·MACD·볼린저·거래량 배수·고점 대비 낙폭)와 재무 지표(PER·매출성장률·영업이익률·부채비율), 제공된 뉴스를 엮어라. 부정 신호(고PER·과열 RSI·역배열)는 리스크로 짚어라.
+`price_source`가 `naver_realtime`/`finnhub_quote`면 그 가격이 실시간 현재가다.
+점수는 참고값이다. 비슷하면 재무·뉴스로 우열을 가려도 되지만, 높은 점수를 이유 없이 빼지 마라.
+재무 지표가 `null`이거나 `financials_note`가 붙어도 가격·이평선·RSI는 유효하다 — 있는 수치로 분석하라.
+반드시 아래 JSON만 출력하라(다른 키를 추가하지 마라):
 {
   "market_note": "후보군 전반 요약 1~2문장",
   "top_picks": [
-    {
-      "ticker": "티커",
-      "price": 0.0,
-      "reason": "quant_score·signals·차트+재무+뉴스 기준 추천 근거 (실제 수치 포함)",
-      "risk": "주의할 점 또는 단점"
-    }
+    {"ticker": "티커", "price": 0.0, "reason": "quant_score·signals·차트+재무+뉴스 근거(수치 포함)", "risk": "주의점 또는 단점"}
   ]
 }"""
 
@@ -263,6 +275,121 @@ def _yahoo_guard() -> dict:
             "history_cache": stock_tools.history_cache_status()}
 
 
+def _attach_news(row: dict) -> dict:
+    """한 행에 최근 뉴스(2건)를 붙인다 — 실패해도 행은 그대로 둔다."""
+    try:
+        row["news"] = _get_recent_news(row.get("ticker"), limit=2)
+    except Exception as exc:
+        logger.warning("%s: 뉴스 조회 실패 → %s: %s", row.get("ticker"), type(exc).__name__, str(exc)[:120])
+        row["news"] = []
+    return row
+
+
+def _attach_news_top(rows: list[dict], top_n: int = NEWS_TOP_N) -> list[dict]:
+    """정량 점수 상위 N개(입력 순서 = 점수 내림차순)에만 뉴스를 병렬로 붙인다.
+
+    예전에는 15종목 모두 뉴스를 조회했지만, 프롬프트에 들어가는 것은 상위 후보뿐이라
+    나머지는 뉴스 빈 배열(`[]`)로 두어 네트워크·토큰을 아낀다(점수·지표는 그대로 유지).
+    """
+    if top_n <= 0:
+        for row in rows or []:
+            if isinstance(row, dict):
+                row["news"] = []
+        return rows
+    targets = [row for row in (rows or [])
+               if isinstance(row, dict) and row.get("ticker") and not row.get("error")][:top_n]
+    if targets:
+        stock_tools.bounded_map(_attach_news, targets)
+    return rows
+
+
+# 프롬프트에 넣는 종목 필드(서버가 계산한 값만). 내부 진단 필드·빈 뉴스는 빼서
+# 입력 토큰을 줄인다 — 생성 시간은 프롬프트 길이에 비례해 늘어난다.
+_PROMPT_ROW_FIELDS = (
+    "ticker", "name", "currency", "price", "price_source", "ma20", "ma60", "rsi14", "trend",
+    "macd", "macd_signal", "macd_hist", "macd_cross", "macd_state",
+    "bb_upper", "bb_lower", "bb_pct_b", "volume_ratio", "drawdown_from_high_pct",
+    "range_position_pct", "trailing_pe", "forward_pe", "revenue_growth", "operating_margins",
+    "debt_to_equity", "quant_score", "signals", "news", "financials_note",
+)
+
+
+def _compact_rows(rows: list[dict]) -> list[dict]:
+    """프롬프트용 종목 요약 — 필요한 필드만 남기고 빈 뉴스는 생략한다."""
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("error"):
+            out.append({"ticker": row.get("ticker"), "error": row.get("error")})
+            continue
+        compact = {key: row[key] for key in _PROMPT_ROW_FIELDS if key in row}
+        if not compact.get("news"):
+            compact.pop("news", None)
+        out.append(compact)
+    return out
+
+
+def _analysis_key(mode: str, strategy: str, criteria: str, tickers: list[str]) -> tuple:
+    """AI 분석 캐시 키 — 같은 조건·같은 종목 묶음일 때만 재사용한다.
+
+    종목 순서가 달라도 같은 묶음이면 같은 키가 되도록 정렬하고, 공백만 다른 조건도
+    같은 요청으로 본다. `criteria`를 키에 넣는 이유: 전략이 같아도 조건 문장이 다르면
+    사용자가 기대하는 해설도 달라진다.
+    """
+    normalized = re.sub(r"\s+", " ", str(criteria or "")).strip()
+    return (mode, strategy, normalized, tuple(sorted({str(t).strip().upper() for t in tickers or []})))
+
+
+def _analysis_cache_get(key: tuple) -> dict | None:
+    """캐시 히트면 `{data, source, model, age_sec}` 사본, 아니면 None."""
+    now = time.time()
+    with _ANALYSIS_LOCK:
+        entry = _ANALYSIS_CACHE.get(key)
+        if not entry:
+            return None
+        if now - entry["at"] >= entry["ttl"]:
+            _ANALYSIS_CACHE.pop(key, None)
+            return None
+        return {"data": json.loads(json.dumps(entry["data"], ensure_ascii=False)),
+                "source": entry["source"], "model": entry["model"],
+                "age_sec": round(now - entry["at"], 1)}
+
+
+def _analysis_cache_put(key: tuple, data: dict, source: str, model: str | None) -> None:
+    """분석 결과를 기억한다 — Gemini 결과만 길게(기본 600초), 폴백은 짧게(60초)."""
+    ttl = ANALYSIS_CACHE_TTL if source == "gemini" else ANALYSIS_FALLBACK_TTL
+    if ttl <= 0:
+        return
+    try:
+        snapshot = json.loads(json.dumps(data, ensure_ascii=False))
+    except (TypeError, ValueError):  # 직렬화 불가한 값이 섞였으면 캐시하지 않는다
+        return
+    with _ANALYSIS_LOCK:
+        _ANALYSIS_CACHE[key] = {"at": time.time(), "ttl": ttl, "data": snapshot,
+                                "source": source, "model": model}
+        if len(_ANALYSIS_CACHE) > _ANALYSIS_MAX_ENTRIES:
+            oldest = sorted(_ANALYSIS_CACHE.items(), key=lambda kv: kv[1]["at"])[:len(_ANALYSIS_CACHE) - _ANALYSIS_MAX_ENTRIES]
+            for old_key, _ in oldest:
+                _ANALYSIS_CACHE.pop(old_key, None)
+
+
+def clear_analysis_cache() -> None:
+    """테스트·수동 초기화용."""
+    with _ANALYSIS_LOCK:
+        _ANALYSIS_CACHE.clear()
+
+
+def analysis_cache_status() -> dict:
+    """`GET /` 진단용 — 캐시 개수·TTL(내용·키는 노출하지 않는다)."""
+    now = time.time()
+    with _ANALYSIS_LOCK:
+        alive = sum(1 for e in _ANALYSIS_CACHE.values() if now - e["at"] < e["ttl"])
+        total = len(_ANALYSIS_CACHE)
+    return {"entries": alive, "stale_entries": total - alive,
+            "ttl_sec": ANALYSIS_CACHE_TTL, "fallback_ttl_sec": ANALYSIS_FALLBACK_TTL}
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
     """헬스 체크. UptimeRobot 무료 모니터는 HEAD로 찔러오므로 HEAD에도 200을 준다.
@@ -280,6 +407,9 @@ def health():
             "storage_backend": history_store.storage_backend(),
             "sp500_cache": sp500_scanner.cache_status(),
             "kospi200_cache": kospi200_scanner.cache_status(),
+            "analysis_cache": analysis_cache_status(),
+            "realtime": {"enabled": realtime_quotes.is_enabled(),
+                         "ttl_sec": realtime_quotes.REALTIME_TTL},
             "yahoo_guard": _yahoo_guard(),
             "errors_recent": recent_errors()}
 
@@ -372,11 +502,8 @@ def _screen_row(ticker: str) -> dict:
         metrics = {"ticker": ticker, "error": "주가 데이터를 찾을 수 없습니다."}
     if not isinstance(metrics, dict):  # 계약을 어기는 응답도 한 행만 망가지게
         metrics = {"ticker": ticker, "error": "주가 데이터를 찾을 수 없습니다."}
-    try:
-        metrics["news"] = _get_recent_news(ticker, limit=2)
-    except Exception as exc:
-        logger.warning("%s: 뉴스 조회 실패 → %s: %s", ticker, type(exc).__name__, str(exc)[:120])
-        metrics["news"] = []
+    # 뉴스는 여기서 부르지 않는다 — 정량 점수를 매긴 뒤 상위 몇 개에만 붙인다(`_attach_news_top`).
+    metrics.setdefault("news", [])
     return _json_safe(metrics)
 
 
@@ -507,8 +634,74 @@ def _thinking_rejected(exc: Exception) -> bool:
     return "thinking" in text or "invalid_argument" in text or " 400" in text
 
 
+def _run_analysis(prompt: str, rows: list[dict]) -> tuple[dict, str, str, str | None]:
+    """Gemini 분석을 모델 순서대로 시도하고, 끝내 실패하면 서버 점수 기반 폴백을 돌려준다.
+
+    반환: (analysis dict, analysis_source, analysis_note, model)
+    - `analysis_source`: "gemini"(정상) | "fallback"(모델 호출 실패 → 서버 정량 요약)
+    - 타임아웃(DEADLINE_EXCEEDED)·503은 다음 모델로 넘어간다 — 같은 모델을 다시 부르면
+      같은 지연을 또 기다리거나 같은 과부하를 만난다.
+    """
+    data = None
+    analysis_source = "gemini"
+    analysis_note = ""
+    thinking_budget = GEMINI_THINKING_BUDGET
+    queue = list(_gemini_model_plan())
+    deadline = time.time() + GEMINI_TOTAL_BUDGET_MS / 1000.0
+    last_error = None
+    analysis_model = None
+    attempt = 0
+    while queue:
+        model, budget_ms = queue.pop(0)
+        attempt += 1
+        remaining_ms = int((deadline - time.time()) * 1000)
+        if remaining_ms < 3000:  # 남은 예산으로는 의미 있는 응답을 못 받는다
+            analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
+            break
+        try:
+            client = _gemini_client(min(budget_ms, remaining_ms))
+            res = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=_gemini_config(thinking_budget),
+            )
+            data = _parse_analysis(res.text)
+            analysis_model = model
+            break
+        except Exception as exc:
+            logger.warning("Gemini 분석 실패(시도 %d, %s) → %s: %s", attempt, model,
+                           type(exc).__name__, str(exc)[:200])
+            last_error = exc
+            if _thinking_rejected(exc) and thinking_budget is not None:
+                # 400 INVALID_ARGUMENT: 이 모델은 사고 예산을 받지 않는다 → 같은 모델을
+                # 사고 설정 없이 다시 보낸다(바로 다른 모델로 넘기면 원인을 못 벗는다).
+                thinking_budget = None
+                queue.insert(0, (model, budget_ms))
+                continue
+            if _retryable_gemini_error(exc):
+                time.sleep(0.3)   # 빨리 돌아온 과부하만 짧게 쉰다
+    if data is None:
+        if analysis_note == "":
+            analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
+            _record_error(uuid.uuid4().hex[:8], "POST /api/screen (gemini)",
+                          last_error if last_error else Exception("gemini_budget_exhausted"),
+                          note="폴백 분석으로 응답")
+        data = _fallback_analysis(rows, analysis_note)
+        analysis_source = "fallback"
+    return data, analysis_source, analysis_note, analysis_model
+
+
 @app.post("/api/screen")
 def screen_stocks(req: ScreenRequest):
+    """조건으로 종목을 스크리닝하고 AI 해설을 붙인다.
+
+    속도를 위해 세 가지를 함께 쓴다.
+    1. 지표·재무(30분 캐시)·일봉(프리 스캔 적재분)은 다시 받지 않고, **현재가만** 실시간으로
+       덮어쓴다(`price`, `price_source`).
+    2. 뉴스는 정량 점수 상위 `NEWS_TOP_N`종목만 조회한다.
+    3. 같은 (mode·전략·조건·종목) 요청은 10분 동안 AI 분석을 재사용한다(`analysis_cached`).
+       재사용해도 주가는 매번 새로 조회하므로 화면의 현재가는 항상 최신이다.
+    """
     mode = (req.mode or "watchlist").strip().lower()
     if mode not in ("watchlist", "sp500", "kospi200"):
         mode = "watchlist"  # 모르는 값은 기존 동작으로 되돌린다(클라이언트 호환)
@@ -545,15 +738,26 @@ def screen_stocks(req: ScreenRequest):
         tickers = [t.strip().upper() for t in (req.tickers or stock_tools.get_watchlist()) if t.strip()]
 
     # 15개 종목을 최대 8개씩 병렬로 당긴다. bounded_map이 입력 순서를 유지해 주므로
-    # 점수가 같은 종목의 정렬도 흔들리지 않는다.
+    # 점수가 같은 종목의 정렬도 흔들리지 않는다. 뉴스는 여기서 부르지 않는다.
     _t = time.perf_counter()
     rows = stock_tools.bounded_map(_screen_row, tickers)
     _mark("rows_ms", _t)
     rows = [_json_safe(row) for row in rows]  # NaN·inf가 프롬프트·응답으로 나가지 않게
 
+    # 실시간 현재가: 최종 15종목에만(한국 네이버 1회, 미국 Finnhub 병렬).
+    # 지표·재무는 30분 캐시 그대로이고 price만 덮어쓰므로 추가 지연이 작다.
+    _t = time.perf_counter()
+    rows = stock_tools.apply_realtime_prices(rows)
+    _mark("realtime_ms", _t)
+
     # 정량 스코어링: 조건에서 전략을 읽고 quant_score·signals를 붙여 내림차순 정렬한다.
     # 네트워크 호출은 없다(이미 받은 지표만 사용). 동점은 입력 순서를 유지한다.
     rows, strategy = scoring.rank_stocks(rows, criteria=req.criteria)
+
+    # 뉴스는 프롬프트에 들어가는 상위 N종목만 — 나머지는 []로 두어 네트워크·토큰을 아낀다.
+    _t = time.perf_counter()
+    rows = _attach_news_top(rows, NEWS_TOP_N)
+    _mark("news_ms", _t)
 
     universe_note = ""
     if mode == "sp500":
@@ -562,68 +766,34 @@ def screen_stocks(req: ScreenRequest):
     elif mode == "kospi200":
         universe_note = (f"발굴 유니버스: 코스피 200 {universe_scanned}종목 중 기술적 사전 스캔 상위 "
                          f"{len(tickers)}종목(관심 종목 목록이 아니다). 가격은 원화(₩)다.\n")
-    prompt = (
-        universe_note
-        + f"조건: {req.criteria}\n"
-        f"strategy: {strategy} ({scoring.STRATEGY_LABELS.get(strategy, strategy)})\n\n"
-        f"종목 데이터(quant_score 내림차순):\n{json.dumps(rows, ensure_ascii=False, default=str)}"
-    )
 
-    # AI 분석은 모델 순서대로(주 모델 → 주 모델 → 2순위 모델) 시도하고, AI 단계 전체
-    # 예산(GEMINI_TOTAL_BUDGET_MS)을 넘기면 더 보내지 않는다. 끝내 실패해도 500 대신
-    # 서버 점수 기반 요약을 돌려준다(Gemini 쿼터·장애가 사용자 화면을 500으로 만들지 않게).
-    # 타임아웃(DEADLINE_EXCEEDED)·503은 다음 모델로 넘어간다 — 같은 모델을 다시 부르면
-    # 같은 지연을 또 기다리거나 같은 과부하를 만난다.
-    data = None
-    analysis_source = "gemini"
+    # --- AI 분석: 10분 캐시 먼저 확인 ---
+    cache_key = _analysis_key(mode, strategy, req.criteria, tickers)
+    cached = _analysis_cache_get(cache_key)
+    analysis_cached = cached is not None
     analysis_note = ""
-    thinking_budget = GEMINI_THINKING_BUDGET
-    plan = _gemini_model_plan()
-    queue = list(plan)
-    deadline = time.time() + GEMINI_TOTAL_BUDGET_MS / 1000.0
-    last_error = None
-    analysis_model = None
-    attempt = 0
-    _t = time.perf_counter()
-    while queue:
-        model, budget_ms = queue.pop(0)
-        attempt += 1
-        remaining_ms = int((deadline - time.time()) * 1000)
-        if remaining_ms < 3000:  # 남은 예산으로는 의미 있는 응답을 못 받는다
+    if cached:
+        data = cached["data"]
+        analysis_source = cached["source"]
+        analysis_model = cached["model"]
+        timings["gemini_ms"] = 0
+        if analysis_source == "fallback":
             analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
-            break
-        try:
-            client = _gemini_client(min(budget_ms, remaining_ms))
-            res = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=_gemini_config(thinking_budget),
-            )
-            data = _parse_analysis(res.text)
-            analysis_model = model
-            break
-        except Exception as exc:
-            logger.warning("Gemini 분석 실패(시도 %d, %s) → %s: %s", attempt, model,
-                           type(exc).__name__, str(exc)[:200])
-            last_error = exc
-            if _thinking_rejected(exc) and thinking_budget is not None:
-                # 400 INVALID_ARGUMENT: 이 모델은 사고 예산을 받지 않는다 → 같은 모델을
-                # 사고 설정 없이 다시 보낸다(바로 다른 모델로 넘기면 원인을 못 벗는다).
-                thinking_budget = None
-                queue.insert(0, (model, budget_ms))
-                continue
-            if _retryable_gemini_error(exc):
-                time.sleep(0.3)   # 빨리 돌아온 과부하만 짧게 쉰다
-    if data is None:
-        if analysis_note == "":
-            analysis_note = "AI 분석 호출이 실패해 서버 정량 점수 기반 요약을 대신 제공합니다."
-            _record_error(uuid.uuid4().hex[:8], "POST /api/screen (gemini)",
-                          last_error if last_error else Exception("gemini_budget_exhausted"),
-                          note="폴백 분석으로 응답")
-    _mark("gemini_ms", _t)
-    if data is None:
-        data = _fallback_analysis(rows, analysis_note)
-        analysis_source = "fallback"
+        logger.info("AI 분석 캐시 히트(%.0f초 전, %s) mode=%s 종목=%d",
+                    cached["age_sec"], analysis_source, mode, len(tickers))
+    else:
+        prompt = (
+            universe_note
+            + f"조건: {req.criteria}\n"
+            f"strategy: {strategy} ({scoring.STRATEGY_LABELS.get(strategy, strategy)})\n\n"
+            f"종목 데이터(quant_score 내림차순):\n"
+            f"{json.dumps(_compact_rows(rows), ensure_ascii=False, default=str)}"
+        )
+        _t = time.perf_counter()
+        data, analysis_source, analysis_note, analysis_model = _run_analysis(prompt, rows)
+        _mark("gemini_ms", _t)
+        # Gemini 결과만 길게 기억한다(폴백은 60초 — 다음 호출에서 정상 분석을 다시 시도).
+        _analysis_cache_put(cache_key, data, analysis_source, analysis_model)
 
     # 추천 종목에도 같은 quant_score·signals를 붙인다(기존 키는 그대로, 추가만).
     score_by_ticker = {
@@ -642,6 +812,11 @@ def screen_stocks(req: ScreenRequest):
         for field in ("currency", "name"):
             if row.get(field) is not None:
                 pick.setdefault(field, row[field])
+        # 가격은 서버가 방금 받은 실시간 값으로 덮어쓴다(캐시된 분석·모델이 적은 옛 가격 모두).
+        if row.get("price") is not None:
+            pick["price"] = row["price"]
+        if row.get("price_source"):
+            pick["price_source"] = row["price_source"]
 
     # 추천 종목의 차트·뉴스도 선택된 개수만큼 병렬로 채운다(보통 3개).
     # 발굴(sp500/kospi200) 모드에서는 6개월 일봉이 프리 스캔으로 이미 캐시에 있어 네트워크가 없다.
@@ -654,14 +829,18 @@ def screen_stocks(req: ScreenRequest):
     # 성적표를 오염시켰으므로, 클라이언트가 카드의 "📌 추적 추가"로 고른 픽만
     # `POST /api/performance/track`에서 기록한다. 응답 모양은 그대로다.
 
-    # strategy·mode·universe_scanned·analysis_source·timings는 추가 필드다(기존 클라이언트는 무시해도 동작한다).
+    # strategy·mode·universe_scanned·analysis_source·analysis_cached·timings는 추가 필드다
+    # (기존 클라이언트는 무시해도 동작한다).
     # analysis_source: "gemini"(정상) | "fallback"(모델 호출 실패 → 서버 점수 기반 요약)
-    # timings: 단계별 소요 시간(ms) — discovery_ms·rows_ms·gemini_ms·charts_ms·total_ms
-    logger.info("스크리닝 완료 mode=%s 종목=%d 상위=%d %s", mode, len(tickers), len(picks), timings)
+    # analysis_cached: true면 10분 안의 같은 요청 → Gemini를 부르지 않고 분석만 재사용(주가는 최신)
+    # timings: 단계별 소요 시간(ms) — discovery_ms·rows_ms·realtime_ms·news_ms·gemini_ms·charts_ms·total_ms
+    logger.info("스크리닝 완료 mode=%s 종목=%d 상위=%d 캐시=%s %s", mode, len(tickers),
+                len(picks), analysis_cached, timings)
     return _json_safe({"analysis": data, "all_stocks": rows, "strategy": strategy,
                        "mode": mode, "universe_scanned": universe_scanned,
                        "analysis_source": analysis_source, "analysis_note": analysis_note,
-                       "analysis_model": analysis_model, "timings": timings})
+                       "analysis_model": analysis_model, "analysis_cached": analysis_cached,
+                       "timings": timings})
 
 
 @app.get("/api/performance")
@@ -674,7 +853,8 @@ def get_performance(limit: int = history_store.DEFAULT_LIMIT):
       best_pick, worst_pick (이력이 없으면 개수 0, 비율 null)
     - `picks`: 최신 추천부터 `id`(개별 삭제용 정수 PK)·ticker·entry_price·current_price·
       return_pct·is_win·days_held 등
-    현재가는 성적표 조회 시점 기준 최근 종가(5분 캐시)를 쓴다.
+    현재가는 장중이면 실시간 시세(네이버·Finnhub)를 쓰고, 실패한 종목만 최근 종가(5분 캐시)로
+    대신한다 — 각 행의 `price_source`(`naver_realtime`/`finnhub_quote`/`daily_close`)로 확인한다.
     """
     try:
         return history_store.get_performance(limit=limit)
@@ -780,6 +960,16 @@ def get_stock_detail(ticker: str):
         quarters = []
 
     currency = naver_finance.currency_for(sym)
+    # 장중이면 상세 화면의 현재가도 실시간 시세로 맞춘다(실패하면 일봉 종가 유지).
+    price_source = "daily_close"
+    try:
+        quote = realtime_quotes.get_prices([sym]).get(sym) or {}
+        live = quote.get("price")
+        if live is not None and float(live) > 0 and levels:
+            levels["current"] = round(float(live), 2)
+            price_source = realtime_quotes.source_of(quote)
+    except Exception as exc:  # 상세 화면이 실시간 시세 때문에 500이 되지 않게
+        logger.warning("%s: 상세 실시간 시세 실패 → %s: %s", sym, type(exc).__name__, str(exc)[:120])
     name = None
     if currency == "KRW":
         try:
@@ -788,4 +978,4 @@ def get_stock_detail(ticker: str):
             name = None
 
     return _json_safe({"ticker": sym, "name": name, "currency": currency,
-                       "levels": levels, "quarters": quarters})
+                       "levels": levels, "quarters": quarters, "price_source": price_source})

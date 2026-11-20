@@ -91,7 +91,9 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     `GET /api/performance`의 `storage_backend`(`postgres`|`sqlite`)로 확인한다(자격 증명은 노출하지 않음).
     ⚠️ Render 무료 플랜은 영구 디스크가 없어 재배포 시 SQLite 이력이 초기화되므로,
     오래 쌓으려면 무료 PostgreSQL(Neon 등)을 붙여 `DATABASE_URL`만 넣으면 된다.
-  - 현재가는 `yf.download`로 **최대 50종목을 한 번에** 받아 5분 캐시한다(`t.info` 호출 없음).
+  - 현재가는 일봉 종가(`yf.download`, 최대 50종목 한 번·5분 캐시) 위에 **실시간 시세**를 덮어쓴다 —
+    장중에는 픽마다 `price_source`가 `naver_realtime`/`finnhub_quote`이고, 실시간 조회에 실패한
+    종목만 `daily_close`(일봉 종가)다.
   - 응답: `{"summary": {total_picks, evaluated_picks, win_count, win_rate_pct, avg_return_pct,
     best_pick, worst_pick}, "picks": [...], "as_of", "limit"}`. 이력이 비면 개수 0·비율 `null`.
     픽별로 `entry_price`·`current_price`·`return_pct`·`is_win`(return > 0)·`days_held`가 붙는다.
@@ -129,11 +131,27 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     않고 바로 정량 점수 폴백으로 간다(대기가 두 배가 되지 않게).
   - 응답의 `analysis_model`에 실제로 해설을 만든 모델이 담긴다(폴백이면 null).
   - 응답의 `timings`(ms)에 단계별 소요 시간이 담긴다 — `discovery_ms`(발굴·프리 스캔) ·
-    `rows_ms`(15종목 지표+뉴스) · `gemini_ms` · `charts_ms` · `total_ms`.
+    `rows_ms`(지표) · `realtime_ms`(실시간 시세) · `news_ms`(상위 뉴스) · `gemini_ms` · `charts_ms` · `total_ms`.
+  - **실시간 현재가**(`realtime_quotes.py`): 지표·재무는 30분 캐시 그대로 두고 `price`만 덮어쓴다.
+    한국 종목은 네이버 금융 `polling.finance.naver.com`(여러 코드를 한 요청으로), 미국 종목은
+    Finnhub `/quote`(병렬 8·분당 50회 자체 상한)를 쓴다. 최종 15종목·성적표·상세 화면에서만
+    호출하며 프리 스캔(500/201종목)에는 쓰지 않는다. 캐시는 10~12초 — 같은 요청의 중복 호출만
+    막고 새 조회에는 최신 체결가가 반영된다. 실패는 조용히 일봉 종가로 폴백하고 응답에
+    `price_source`(`naver_realtime` | `finnhub_quote` | `daily_close`)를 남긴다.
+    `REALTIME_PRICE=0`으로 끌 수 있다.
+  - **AI 분석 10분 캐시**: 같은 `(mode, 전략, 조건, 종목 묶음)` 요청이 10분 안에 다시 오면
+    Gemini를 부르지 않고 분석(`market_note`·`top_picks` 이유)을 재사용한다(`analysis_cached: true`,
+    `timings.gemini_ms = 0`). 재사용해도 `price`·`price_source`는 **매번 새로 조회**해 덮어쓰므로
+    화면의 현재가는 항상 최신이다. Gemini 실패 폴백은 60초만 캐시해 다음 호출에서 정상 분석을
+    다시 시도한다(`ANALYSIS_CACHE_TTL`·`ANALYSIS_FALLBACK_TTL`).
+  - **뉴스는 상위 5종목만**: 정량 점수 상위 `NEWS_TOP_N`(기본 5) 종목만 뉴스를 조회해 프롬프트에
+    넣고 나머지는 `news: []`로 둔다. 프롬프트도 필요한 지표 필드만 담도록 간결화했다(출력 JSON
+    스키마는 그대로).
   - `GET /`의 `yahoo_guard`에 `t.info`/뉴스 우회 상태(`blocked`·`remaining_sec`·`fail_streak`)와
     프리 적재된 일봉 캐시 개수가 나온다(병목이 다시 생기면 여기서 바로 보인다).
 - `GET /` 헬스 응답에 배포 커밋(`build`)과 Finnhub 키 설정·마지막 오류(`finnhub`),
-  저장소 종류(`storage_backend`)를 노출한다. 키 본문은 나오지 않고 설정 여부·이름·길이만 보인다.
+  저장소 종류(`storage_backend`), 실시간 시세 스위치(`realtime`), AI 분석 캐시 상태
+  (`analysis_cache`: 개수·TTL)를 노출한다. 키 본문은 나오지 않고 설정 여부·이름·길이만 보인다.
   `errors_recent`에는 최근 처리되지 않은 예외 10건(`error_id`·`path`·`type`·`message`)이 남는다.
 - **NaN 안전(2026-11 사고 수정)**: 야후가 한국 종목 일봉의 마지막 행을 OHLC 전부 NaN인
   자리표시자 행으로 내려줄 때가 있다. 그대로 쓰면 현재가·이평선·RSI가 NaN이 되고, JSON은

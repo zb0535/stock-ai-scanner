@@ -155,6 +155,11 @@ class KoreanBase(unittest.TestCase):
         stock_tools._METRICS_CACHE.clear()
         stock_tools._HISTORY_CACHE.clear()
         api._NEWS_CACHE.clear()
+        api.clear_analysis_cache()
+        self.addCleanup(api.clear_analysis_cache)
+        api.realtime_quotes.clear_cache()
+        # 실시간 시세(네이버 polling)는 실네트워크라 테스트에서는 끄고 일봉 종가를 쓴다.
+        self.patch(api.realtime_quotes, "get_prices", lambda *a, **k: {})
         stock_tools._info_fail_streak = 0
         stock_tools._info_cooldown_until = 0.0
 
@@ -163,6 +168,7 @@ class KoreanBase(unittest.TestCase):
         naver_finance.clear_cache()
         naver_finance.reset_table_cache()
         kospi200_scanner.reset_cache()
+        api.clear_analysis_cache()
 
     def patch(self, target, name, value):
         patcher = patch.object(target, name, value)

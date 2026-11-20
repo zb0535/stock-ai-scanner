@@ -420,11 +420,14 @@ class ScreenIntegrationTests(TempDB):
         stock_tools._METRICS_CACHE.clear()
         stock_tools._HISTORY_CACHE.clear()
         api._NEWS_CACHE.clear()
+        api.clear_analysis_cache()
+        api.realtime_quotes.clear_cache()
         self.addCleanup(stock_tools._METRICS_CACHE.clear)
         self.addCleanup(stock_tools._HISTORY_CACHE.clear)
         self._patch(stock_tools, "get_stock_metrics",
                     lambda t: {"ticker": t, "price": 100.0 if t == "AAPL" else 200.0,
                                "financials_available": True})
+        self._patch(api.realtime_quotes, "get_prices", lambda *a, **k: {})
         self._patch(api, "_get_recent_news", lambda t, limit=3: [f"{t} news"])
         self._patch(stock_tools, "get_history", lambda t, p="6mo": make_hist())
         self._patch(api.genai, "Client",

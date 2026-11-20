@@ -467,7 +467,10 @@ class ScreenIntegrationTests(unittest.TestCase):
         stock_tools._METRICS_CACHE.clear()
         stock_tools._HISTORY_CACHE.clear()
         api._NEWS_CACHE.clear()
+        api.clear_analysis_cache()
+        api.realtime_quotes.clear_cache()
         self._patches = []
+        self.patch_attr(api.realtime_quotes, "get_prices", lambda *a, **k: {})
         self.patch_attr(api, "_get_recent_news", lambda ticker, limit=3: [f"{ticker} headline"])
         self.patch_attr(stock_tools, "get_history",
                         lambda ticker, period="6mo": flat_hist(np.linspace(100, 150, 130)))
@@ -551,7 +554,7 @@ class ScreenIntegrationTests(unittest.TestCase):
             "/api/screen", json={"criteria": "모멘텀 돌파", "tickers": ["MID"]}).json()
 
         self.assertEqual(sorted(body),
-                         ["all_stocks", "analysis", "analysis_model", "analysis_note",
+                         ["all_stocks", "analysis", "analysis_cached", "analysis_model", "analysis_note",
                           "analysis_source", "mode", "strategy", "timings", "universe_scanned"])
         self.assertEqual(body["analysis_source"], "gemini")  # 정상 경로는 모델 해설
         self.assertEqual(body["analysis_note"], "")

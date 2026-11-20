@@ -81,6 +81,13 @@ class BaseCase(unittest.TestCase):
         stock_tools._METRICS_CACHE.clear()
         stock_tools._HISTORY_CACHE.clear()
         api._NEWS_CACHE.clear()
+        api.clear_analysis_cache()
+        self.addCleanup(api.clear_analysis_cache)
+        api.realtime_quotes.clear_cache()
+        # 실시간 시세는 실네트워크를 탄다 — 이 파일은 지연·가드 행동만 본다.
+        self.patcher_rt = patch.object(api.realtime_quotes, "get_prices", lambda *a, **k: {})
+        self.patcher_rt.start()
+        self.addCleanup(self.patcher_rt.stop)
         stock_tools.reset_info_breaker()
         stock_tools.reset_news_breaker()
         FakeTicker.info_calls = []
@@ -374,8 +381,9 @@ class ScreenGuardIntegrationTests(BaseCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertNotIn("005930.KS", FakeTicker.info_calls)
-        self.assertEqual(sorted(body["timings"]),
-                         ["charts_ms", "gemini_ms", "rows_ms", "total_ms"])
+        # timings는 단계가 늘어도 기존 키를 지우지 않는다(추가만).
+        self.assertTrue({"rows_ms", "gemini_ms", "charts_ms", "total_ms"}
+                        <= set(body["timings"]))
         self.assertGreaterEqual(body["timings"]["total_ms"], 0)
         for row in body["all_stocks"]:
             self.assertIsNotNone(row.get("price"))
@@ -383,6 +391,16 @@ class ScreenGuardIntegrationTests(BaseCase):
 
 class GeminiGuardTests(unittest.TestCase):
     """Gemini 호출 상한·재시도·모델 폴백 규칙."""
+
+    def setUp(self):
+        # 이 클래스는 /api/screen을 직접 침 — 앞선 테스트의 10분 분석 캐시가 남아 있으면
+        # Gemini를 부르지 않아 호출 횟수 검증이 흔들린다.
+        api.clear_analysis_cache()
+        api.realtime_quotes.clear_cache()
+        self.addCleanup(api.clear_analysis_cache)
+        rt = patch.object(api.realtime_quotes, "get_prices", lambda *a, **k: {})
+        rt.start()
+        self.addCleanup(rt.stop)
 
     def test_deadline_exceeded_is_not_slept_on(self):
         exc = Exception("504 DEADLINE_EXCEEDED. Deadline expired before operation could complete.")

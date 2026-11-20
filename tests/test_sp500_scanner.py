@@ -351,7 +351,10 @@ class ScreenModeTests(unittest.TestCase):
         stock_tools._METRICS_CACHE.clear()
         stock_tools._HISTORY_CACHE.clear()
         api._NEWS_CACHE.clear()
+        api.clear_analysis_cache()
+        api.realtime_quotes.clear_cache()
         self._patches = []
+        self.patch_attr(api.realtime_quotes, "get_prices", lambda *a, **k: {})
         self.patch_attr(api, "_get_recent_news", lambda ticker, limit=3: [f"{ticker} headline"])
         self.patch_attr(stock_tools, "get_history", lambda ticker, period="6mo": uptrend())
         self.patch_attr(stock_tools, "get_stock_metrics", stock_row)
@@ -411,7 +414,7 @@ class ScreenModeTests(unittest.TestCase):
         self.assertIsNone(body["universe_scanned"])
         self.assertEqual([r["ticker"] for r in body["all_stocks"]], ["AAPL", "MSFT"])
         self.assertEqual(self.discovery_calls, [])
-        self.assertEqual(sorted(body), ["all_stocks", "analysis", "analysis_model", "analysis_note",
+        self.assertEqual(sorted(body), ["all_stocks", "analysis", "analysis_cached", "analysis_model", "analysis_note",
                                         "analysis_source", "mode", "strategy", "timings",
                                         "universe_scanned"])
 
