@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import yfinance as yf
@@ -739,16 +740,33 @@ def screen_stocks(req: ScreenRequest):
 
     # 15개 종목을 최대 8개씩 병렬로 당긴다. bounded_map이 입력 순서를 유지해 주므로
     # 점수가 같은 종목의 정렬도 흔들리지 않는다. 뉴스는 여기서 부르지 않는다.
+    # 실시간 시세는 **지표 조회와 동시에** 별도 스레드로 받아 둔다 — 서로 기다리지 않아
+    # 첫 호출의 합산 지연이 줄어든다(특히 지표 캐시가 비은 재배포 직후).
     _t = time.perf_counter()
-    rows = stock_tools.bounded_map(_screen_row, tickers)
+    quote_box: dict = {}
+
+    def _load_quotes() -> None:
+        started = time.perf_counter()
+        try:
+            quote_box["quotes"] = realtime_quotes.get_prices(tickers)
+        except Exception as exc:  # 실시간 계층 장애 → 일봉 종가 유지
+            logger.warning("실시간 시세 조회 실패: %s: %s", type(exc).__name__, str(exc)[:160])
+            quote_box["quotes"] = {}
+        finally:
+            _mark("realtime_ms", started)
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="screen") as pool:
+        rows_future = pool.submit(stock_tools.bounded_map, _screen_row, tickers)
+        quotes_future = pool.submit(_load_quotes)
+        rows = rows_future.result()
+        quotes_future.result()
     _mark("rows_ms", _t)
     rows = [_json_safe(row) for row in rows]  # NaN·inf가 프롬프트·응답으로 나가지 않게
 
-    # 실시간 현재가: 최종 15종목에만(한국 네이버 1회, 미국 Finnhub 병렬).
-    # 지표·재무는 30분 캐시 그대로이고 price만 덮어쓰므로 추가 지연이 작다.
+    # 실시간 현재가 적용: 한국 네이버·미국 Finnhub 값을 price에 덮어쓴다(위에서 이미 받아 둔 것).
     _t = time.perf_counter()
-    rows = stock_tools.apply_realtime_prices(rows)
-    _mark("realtime_ms", _t)
+    rows = stock_tools.apply_realtime_prices(rows, quotes=quote_box.get("quotes") or {})
+    _mark("overlay_ms", _t)
 
     # 정량 스코어링: 조건에서 전략을 읽고 quant_score·signals를 붙여 내림차순 정렬한다.
     # 네트워크 호출은 없다(이미 받은 지표만 사용). 동점은 입력 순서를 유지한다.
@@ -833,7 +851,8 @@ def screen_stocks(req: ScreenRequest):
     # (기존 클라이언트는 무시해도 동작한다).
     # analysis_source: "gemini"(정상) | "fallback"(모델 호출 실패 → 서버 점수 기반 요약)
     # analysis_cached: true면 10분 안의 같은 요청 → Gemini를 부르지 않고 분석만 재사용(주가는 최신)
-    # timings: 단계별 소요 시간(ms) — discovery_ms·rows_ms·realtime_ms·news_ms·gemini_ms·charts_ms·total_ms
+    # timings: 단계별 소요 시간(ms) — discovery_ms·rows_ms(지표+실시간 병렬)·realtime_ms·overlay_ms·
+    #          news_ms·gemini_ms·charts_ms·total_ms
     logger.info("스크리닝 완료 mode=%s 종목=%d 상위=%d 캐시=%s %s", mode, len(tickers),
                 len(picks), analysis_cached, timings)
     return _json_safe({"analysis": data, "all_stocks": rows, "strategy": strategy,

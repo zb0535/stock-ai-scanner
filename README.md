@@ -131,7 +131,8 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     않고 바로 정량 점수 폴백으로 간다(대기가 두 배가 되지 않게).
   - 응답의 `analysis_model`에 실제로 해설을 만든 모델이 담긴다(폴백이면 null).
   - 응답의 `timings`(ms)에 단계별 소요 시간이 담긴다 — `discovery_ms`(발굴·프리 스캔) ·
-    `rows_ms`(지표) · `realtime_ms`(실시간 시세) · `news_ms`(상위 뉴스) · `gemini_ms` · `charts_ms` · `total_ms`.
+    `rows_ms`(지표+실시간 병렬) · `realtime_ms`(실시간 시세 구간) · `overlay_ms`(가격 적용) ·
+    `news_ms`(상위 뉴스) · `gemini_ms` · `charts_ms` · `total_ms`.
   - **실시간 현재가**(`realtime_quotes.py`): 지표·재무는 30분 캐시 그대로 두고 `price`만 덮어쓴다.
     한국 종목은 네이버 금융 `polling.finance.naver.com`(여러 코드를 한 요청으로), 미국 종목은
     Finnhub `/quote`(병렬 8·분당 50회 자체 상한)를 쓴다. 최종 15종목·성적표·상세 화면에서만

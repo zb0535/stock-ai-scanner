@@ -877,7 +877,8 @@ def get_stock_metrics(ticker: str) -> dict:
 # 응답 직전에만 부른다(한국은 네이버 요청 1회, 미국은 Finnhub 병렬 8개).
 
 
-def apply_realtime_prices(rows: list, max_workers: int = realtime_quotes.QUOTE_WORKERS) -> list:
+def apply_realtime_prices(rows: list, quotes: dict | None = None,
+                         max_workers: int = realtime_quotes.QUOTE_WORKERS) -> list:
     """종목 dict 목록의 `price`를 실시간 현재가로 덮어쓰고 `price_source`를 붙인다.
 
     - 한국 종목: 네이버 polling → `price_source="naver_realtime"`
@@ -886,6 +887,9 @@ def apply_realtime_prices(rows: list, max_workers: int = realtime_quotes.QUOTE_W
         기존 일봉 종가 유지 → `price_source="daily_close"`
     `price`가 바뀌면 추세 문구(`trend`)도 새 가격으로 다시 판정해, 화면에서 "현재가보다
     20일선이 낮은데 역배열"처럼 앞뒤가 맞지 않는 일이 없게 한다.
+
+    `quotes`를 주면 그 시세를 그대로 쓴다 — 호출부가 지표 조회와 **병렬로** 미리 받아 둔
+    경우(스크리닝) 추가 네트워크 없이 적용할 수 있다.
 
     반환: 같은 리스트(항목 dict를 제자리에서 바꾼다). rows에 `ticker`/`price`가 없으면
     그대로 두고 건드리지 않는다.
@@ -897,12 +901,13 @@ def apply_realtime_prices(rows: list, max_workers: int = realtime_quotes.QUOTE_W
     if not targets:
         return rows
 
-    try:
-        quotes = realtime_quotes.get_prices([row.get("ticker") for row in targets],
-                                           max_workers=max_workers)
-    except Exception as exc:  # 실시간 시세 계층 전체 실패 → 전부 일봉 종가 유지
-        logger.warning("실시간 시세 오버레이 실패: %s: %s", type(exc).__name__, str(exc)[:160])
-        quotes = {}
+    if quotes is None:
+        try:
+            quotes = realtime_quotes.get_prices([row.get("ticker") for row in targets],
+                                                max_workers=max_workers)
+        except Exception as exc:  # 실시간 시세 계층 전체 실패 → 전부 일봉 종가 유지
+            logger.warning("실시간 시세 오버레이 실패: %s: %s", type(exc).__name__, str(exc)[:160])
+            quotes = {}
 
     for row in targets:
         sym = str(row.get("ticker") or "").strip().upper()

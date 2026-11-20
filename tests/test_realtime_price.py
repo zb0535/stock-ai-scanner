@@ -326,6 +326,18 @@ class ApplyRealtimeTests(unittest.TestCase):
         self.assertEqual(out[1]["price"], 200.0)
         self.assertEqual(out[1]["price_source"], "daily_close")
 
+    def test_prefetched_quotes_skip_network(self):
+        rows = [{"ticker": "AAPL", "price": 100.0}]
+
+        def boom(*args, **kwargs):
+            raise AssertionError("미리 받은 시세가 있으면 다시 조회하지 않는다")
+
+        with patch.object(realtime_quotes, "get_prices", boom):
+            out = stock_tools.apply_realtime_prices(
+                rows, quotes={"AAPL": {"price": 101.0, "source": "finnhub_quote"}})
+        self.assertEqual(out[0]["price"], 101.0)
+        self.assertEqual(out[0]["price_source"], "finnhub_quote")
+
 
 # ---------------------------------------------------------------------------
 # 5. 성적표 현재가
