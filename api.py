@@ -216,8 +216,9 @@ class ScreenRequest(BaseModel):
 class TrackRequest(BaseModel):
     """수동 추적 요청(`POST /api/performance/track`).
 
-    `entry_price`는 선택이다. 비었거나 0 이하면 서버가 최신 종가를 받아 채우고,
-    그마저 실패하면 400(잘못된 티커)이다.
+    `entry_price`는 선택이다. 비었거나 0 이하면 서버가 실시간 현재가를 먼저 받아 채우고
+    (네이버·Finnhub), 실시간가를 못 받을 때만 최신 일봉 종가로 폴백한다 — 그마저 실패하면
+    400(잘못된 티커)이다.
     """
 
     ticker: str
@@ -886,9 +887,14 @@ def get_performance(limit: int = history_store.DEFAULT_LIMIT):
 def track_performance(req: TrackRequest):
     """종목 하나를 사용자가 직접 추적 목록에 넣는다(추천 카드의 "📌 추적 추가").
 
-    - `entry_price`가 없거나 0 이하면 최근 종가를 채운다. 가격을 못 받으면 400(잘못된 티커).
+    - `entry_price`가 없거나 0 이하면 **실시간 현재가(네이버·Finnhub)를 먼저** 받아 채운다.
+      실시간가를 못 받을 때만 최근 일봉 종가로 폴백하고, 둘 다 실패하면 400(잘못된 티커).
+    - 요청으로 온 `entry_price`는 그대로 쓴다(실시간 조회를 하지 않는다 — 기존 동작 유지).
     - 같은 날 같은 `(티커, 전략)`을 다시 넣으면 새 행을 만들지 않고 기존 행을 돌려준다.
     - 응답: `{"ok": true, "created": bool, "pick": {id, ticker, ..., criteria}}`
+      + `entry_price_source`: 이 요청이 서버에서 진입가를 조회했을 때 그 출처
+      (`naver_realtime`/`finnhub_quote`/`daily_close`, 클라이언트가 값을 보냈거나 기존 행을
+      돌려준 경우 null) — 기존 클라이언트는 무시해도 된다.
     """
     ticker = (req.ticker or "").strip().upper()
     if not ticker:
@@ -899,15 +905,21 @@ def track_performance(req: TrackRequest):
     entry = req.entry_price
     if entry is not None and (not math.isfinite(entry) or entry <= 0):
         entry = None  # NaN·inf·0·음수는 "값 없음"으로 보고 서버가 채운다
+    entry_source = None
     if entry is None:
+        # 성적표 현재가와 같은 우선순위: 실시간 시세 → (실패 종목만) 일봉 종가.
         try:
-            price = history_store.latest_prices([ticker]).get(ticker)
+            prices, sources, _ = history_store.resolve_current_prices([ticker])
+            price = prices.get(ticker)
+            entry_source = sources.get(ticker)
         except Exception as exc:  # 가격 조회가 죽어도 400으로 깔끔하게 끝낸다
             logger.warning("추적 진입가 조회 실패 %s: %s", ticker, type(exc).__name__)
             price = None
+            entry_source = None
         if not price or price <= 0:
             raise HTTPException(status_code=400, detail="invalid_ticker")
         entry = float(price)
+        logger.info("추적 진입가 %s=%.4f (source=%s)", ticker, entry, entry_source)
 
     try:
         out = history_store.record_pick(
@@ -925,8 +937,10 @@ def track_performance(req: TrackRequest):
     if not out.get("pick"):
         # 저장은 됐는데 행을 못 읽은 경우(경합 등) — 클라이언트가 id를 못 받으므로 재시도를 유도한다.
         raise HTTPException(status_code=503, detail="track_unavailable")
+    # 진입가 출처는 "이 요청이 실제로 저장한 값"에만 붙인다(중복이면 기존 행의 진입가가 남는다).
     return {"ok": True, "created": out["created"], "pick": out["pick"],
-            "backend": out.get("backend")}
+            "backend": out.get("backend"),
+            "entry_price_source": entry_source if out["created"] else None}
 
 
 @app.delete("/api/performance/{pick_id}")

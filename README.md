@@ -71,13 +71,18 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   - **`POST /api/performance/track`** — 픽 하나를 추적에 추가한다. 본문
     `{"ticker": "NVDA", "entry_price": 150.96, "strategy": "oversold", "mode": "watchlist",
     "quant_score": 92.0, "criteria": "..."}`. `entry_price`는 선택이며, 없거나 0 이하면 서버가
-    최신 종가를 채운다(가격을 못 받으면 400 `invalid_ticker`). 응답은
-    `{"ok": true, "created": bool, "pick": {id, ticker, ...}}`(같은 날 같은 티커·전략은 기존 행 반환).
+    **실시간 현재가(네이버·Finnhub)를 먼저** 받아 채우고, 실시간가를 못 받을 때만 최근 일봉 종가로
+    폴백한다(둘 다 실패하면 400 `invalid_ticker`). 응답은
+    `{"ok": true, "created": bool, "pick": {id, ticker, ...}, "entry_price_source": str|null}`
+    (같은 날 같은 티커·전략은 기존 행 반환). `entry_price_source`는 서버가 진입가를 조회했을 때의
+    출처(`naver_realtime`/`finnhub_quote`/`daily_close`)이고, 클라이언트가 값을 보냈거나 기존 행을
+    돌려준 경우 `null`이다(기존 클라이언트는 무시해도 된다).
   - **`DELETE /api/performance/{id}`** — 그 `id` 행 **하나만** 삭제한다.
     응답 `{"ok": true, "deleted_id": id}`, 없으면 404. 저장소 장애는 503.
   - `GET /api/performance`의 `picks` 각 항목은 `id`(정수 PK)를 포함한다 — 웹 성적표의 행별 🗑️가 이 값으로 지운다.
   - 저장: `ticker`·`recommended_date`(KST YYYY-MM-DD)·`recommended_at`(ISO)·`entry_price`·`strategy`·
-    `mode`·`quant_score`·`criteria`. 진입가는 Gemini가 적은 값이 아니라 서버가 계산한 최신 종가를 쓴다.
+    `mode`·`quant_score`·`criteria`. 진입가는 Gemini가 적은 값이 아니라 서버가 계산한 현재가
+    (**실시간 시세 우선**, 없으면 최근 일봉 종가)를 쓴다.
   - 같은 날 같은 `(date, ticker, strategy)`는 한 행만 남긴다(첫 진입가·첫 시각 유지, 점수·mode·criteria만 갱신).
   - DB 경로: `HISTORY_DB_PATH` 환경변수 > `data/recommendations.db`(부모 폴더 자동 생성) >
     만들 수 없으면 `/tmp/stock_scanner_history.db`. DB 쓰기가 실패해도 `/api/screen`은 정상 응답한다
@@ -91,9 +96,11 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     `GET /api/performance`의 `storage_backend`(`postgres`|`sqlite`)로 확인한다(자격 증명은 노출하지 않음).
     ⚠️ Render 무료 플랜은 영구 디스크가 없어 재배포 시 SQLite 이력이 초기화되므로,
     오래 쌓으려면 무료 PostgreSQL(Neon 등)을 붙여 `DATABASE_URL`만 넣으면 된다.
-  - 현재가는 **실시간 시세(네이버·Finnhub)를 먼저** 쓰고, 실시간가를 못 받은 종목만 일봉 종가
+  - 현재가·진입가는 **실시간 시세(네이버·Finnhub)를 먼저** 쓰고, 실시간가를 못 받은 종목만 일봉 종가
     (`yf.download`, 최대 50종목 한 번·5분 캐시)로 채운다 — 장중 새로고침이 Yahoo 왕복을 기다리지
-    않는다. 픽마다 `price_source`가 `naver_realtime`/`finnhub_quote`/`daily_close`다.
+    않는다. 두 경로는 `history_store.resolve_current_prices` 하나로 모아 성적표 현재가와 추적
+    진입가가 같은 우선순위를 쓴다(장중에 전일 종가로 진입가가 잡혀 수익률이 어긋나던 문제).
+    픽마다 `price_source`가 `naver_realtime`/`finnhub_quote`/`daily_close`다.
   - 응답: `{"summary": {total_picks, evaluated_picks, win_count, win_rate_pct, avg_return_pct,
     best_pick, worst_pick}, "picks": [...], "as_of", "limit"}`. 이력이 비면 개수 0·비율 `null`.
     픽별로 `entry_price`·`current_price`·`return_pct`·`is_win`(return > 0)·`days_held`가 붙는다.

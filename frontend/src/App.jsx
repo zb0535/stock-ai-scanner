@@ -165,7 +165,8 @@ export default function App() {
     setTracking(ticker);
     setPerfError("");
     try {
-      // 진입가는 서버가 계산한 최신 종가(all_stocks)를 우선 보낸다.
+      // 진입가는 서버가 계산한 현재가(all_stocks, 실시간 시세 반영)를 우선 보낸다.
+      // 값이 없으면 서버가 실시간 시세 → 일봉 종가 순으로 채운다.
       const serverPrice = (result?.all_stocks || [])
         .find((s) => upper(s.ticker) === ticker)?.price;
       const entry = serverPrice ?? pick?.price ?? null;

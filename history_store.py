@@ -718,6 +718,49 @@ def _realtime_prices(tickers: list[str]) -> tuple[dict[str, float], dict[str, st
     return prices, sources
 
 
+def resolve_current_prices(tickers: Iterable[str], price_fetcher=None,
+                           use_realtime: bool = True
+                           ) -> tuple[dict[str, float | None], dict[str, str], bool]:
+    """현재가를 **실시간 시세(네이버·Finnhub) 우선**으로 채우고, 못 받은 종목만 일봉 종가로.
+
+    성적표의 현재가와 수동 추적의 진입가가 같은 규칙을 쓰도록 한 곳에 모았다 — 장중에
+    일봉 종가(전일 종가)로 진입가를 잡으면 수익률이 처음부터 어긋난다.
+
+    반환: `(prices, sources, fallback_ok)`
+    - `prices`: 티커(대문자) → 가격 또는 None(어느 경로로도 못 받음)
+    - `sources`: 티커 → `naver_realtime`/`finnhub_quote`/`daily_close`
+    - `fallback_ok`: 일봉 폴백 조회가 예외로 실패했으면 False(실시간가는 그대로 유지)
+    `price_fetcher`는 일봉 조회 주입점(테스트·대체 경로)이고,
+    `use_realtime=False`면 실시간 계층을 건너뛴다(주입된 fetcher를 쓸 때).
+    """
+    prices: dict[str, float | None] = {}
+    sources: dict[str, str] = {}
+    want: list[str] = []
+    for t in tickers or []:
+        sym = _clean(t).upper()
+        if sym and sym not in want:
+            want.append(sym)
+    if not want:
+        return prices, sources, True
+
+    if use_realtime:
+        prices, sources = _realtime_prices(want)
+
+    pending = [sym for sym in want if sym not in prices]
+    fallback_ok = True
+    if pending:
+        try:
+            closes = latest_prices(pending, fetcher=price_fetcher or _fetch_prices_batch)
+        except Exception as exc:  # 가격 조회가 죽어도 이력은 보여준다(수익률만 null)
+            logger.warning("현재가 조회 실패: %s: %s", type(exc).__name__, str(exc)[:200])
+            closes = {}
+            fallback_ok = False
+        for sym, price in (closes or {}).items():
+            prices[sym] = price
+            sources.setdefault(sym, realtime_quotes.SOURCE_DAILY)
+    return prices, sources, fallback_ok
+
+
 # --- 성적표 ------------------------------------------------------------------
 
 
@@ -845,30 +888,15 @@ def get_performance(limit: int = DEFAULT_LIMIT, db_path: str | None = None,
 
     tickers = [p["ticker"] for p in picks]
 
-    # 1) 실시간 현재가(네이버·Finnhub)를 먼저 시도한다 — 장중 새로고침이 Yahoo 왕복을
-    #    기다리지 않게. `price_fetcher`를 주입한 호출(테스트·대체 경로)에는 쓰지 않는다.
-    prices: dict[str, float | None] = {}
-    sources: dict[str, str] = {}
-    if price_fetcher is None:
-        prices, sources = _realtime_prices(tickers)
-
-    # 2) 실시간가를 못 받은 종목만 최근 일봉 종가로 채운다(5분 캐시).
-    pending = [t for t in tickers if _clean(t).upper() not in prices]
-    error = None
-    if pending:
-        try:
-            closes = latest_prices(pending, fetcher=price_fetcher or _fetch_prices_batch)
-        except Exception as exc:  # 가격 조회가 죽어도 이력은 보여준다(수익률만 null)
-            logger.warning("현재가 조회 실패: %s: %s", type(exc).__name__, str(exc)[:200])
-            closes = {}
-            error = "price_unavailable"
-        for sym, price in (closes or {}).items():
-            prices[sym] = price
-            sources.setdefault(sym, realtime_quotes.SOURCE_DAILY)
+    # 현재가는 실시간 시세(네이버·Finnhub) → 못 받은 종목만 일봉 종가(5분 캐시) 순으로 채운다.
+    # `price_fetcher`를 주입한 호출(테스트·대체 경로)은 실시간 계층을 타지 않는다.
+    use_realtime = price_fetcher is None
+    prices, sources, fallback_ok = resolve_current_prices(
+        tickers, price_fetcher=price_fetcher, use_realtime=use_realtime)
 
     body = compute_performance(picks, prices, sources=sources)
-    if error:
-        body["error"] = error
+    if not fallback_ok:
+        body["error"] = "price_unavailable"
     body["as_of"] = kst_now().isoformat(timespec="seconds")
     body["limit"] = n
     return _tag_backend(body, db_path)

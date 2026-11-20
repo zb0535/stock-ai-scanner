@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import api  # noqa: E402
 import history_store  # noqa: E402
+import realtime_quotes  # noqa: E402
 import stock_tools  # noqa: E402
 
 try:
@@ -562,6 +563,7 @@ class ApiPostgresFlowTests(PostgresCase):
         self._patch(api.genai, "Client",
                     lambda **_: FakeGenai({"market_note": "ok", "top_picks": list(self.PICKS)}))
         # 성적표·수동 추적의 진입가 조회를 네트워크 없이 고정한다.
+        self._patch(realtime_quotes, "get_prices", lambda *a, **k: {})
         self._patch(history_store, "_fetch_prices_batch",
                     lambda tickers: {t: 110.0 for t in tickers})
         history_store.clear_price_cache()

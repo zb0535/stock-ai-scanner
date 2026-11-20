@@ -7,6 +7,7 @@
 4. 현재가 배치 조회: 멀티/단일 컬럼 파싱, 5분 캐시, 실패 시 수익률만 비움
 5. 빈 이력: 개수 0, 비율 null
 6. **수동 추적**: `/api/screen`은 기록하지 않고, `POST /api/performance/track`만 기록한다
+   — 진입가는 실시간 현재가 우선(실패 시 일봉 종가 폴백)
 7. **개별 삭제**: `DELETE /api/performance/{id}`가 그 행만 지우고, 없으면 404
 
 실행: python -m unittest discover -s tests -v
@@ -27,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import api  # noqa: E402
 import history_store  # noqa: E402
+import realtime_quotes  # noqa: E402
 import stock_tools  # noqa: E402
 
 try:
@@ -507,7 +509,11 @@ PRICES = {"NVDA": 150.96, "AAPL": 191.25, "MSFT": 410.0}
 
 
 class StubPricesMixin:
-    """가격 조회를 네트워크 없이 고정한다(모르는 티커는 값 없음)."""
+    """가격 조회를 네트워크 없이 고정한다(모르는 티커는 값 없음).
+
+    실시간 시세도 기본은 빈 응답으로 둔다 — 진입가 테스트가 네트워크(네이버·Finnhub)를
+    타지 않게. 실시간가를 쓰는 검사는 `stub_quotes`로 대신 넣는다.
+    """
 
     def stub_prices(self, mapping=None):
         table = dict(PRICES if mapping is None else mapping)
@@ -519,12 +525,30 @@ class StubPricesMixin:
         self.addCleanup(history_store.clear_price_cache)
         return table
 
+    def stub_quotes(self, mapping=None):
+        """실시간 시세 대역 — `{티커: (가격, 출처)}` 또는 `None`/예외 안 냄."""
+        table = dict(mapping or {})
+        calls = []
+
+        def fake(tickers, max_workers=8):
+            calls.append(list(tickers))
+            return {t: {"price": table[t][0], "source": table[t][1]}
+                    for t in tickers if t in table}
+
+        p = patch.object(realtime_quotes, "get_prices", fake)
+        p.start()
+        self.addCleanup(p.stop)
+        realtime_quotes.clear_cache()
+        self.addCleanup(realtime_quotes.clear_cache)
+        return calls
+
 
 @unittest.skipIf(TestClient is None, "fastapi.testclient 사용에 httpx가 필요합니다")
 class TrackApiTests(StubPricesMixin, TempDB):
     def setUp(self):
         super().setUp()
         self.stub_prices()
+        self.quotes = self.stub_quotes()                   # 기본: 실시간가는 없음
         self.client = TestClient(api.app)
 
     def track(self, **body):
@@ -552,6 +576,61 @@ class TrackApiTests(StubPricesMixin, TempDB):
         resp = self.track(ticker="AAPL", strategy="value")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["pick"]["entry_price"], 191.25)
+        self.assertEqual(resp.json()["entry_price_source"], "daily_close")
+
+    # --- 진입가: 실시간 현재가 우선, 일봉 종가는 폴백 (2026-11 변경) ----------------
+
+    def test_track_without_entry_price_prefers_realtime_quote(self):
+        # 일봉 종가(AAPL 191.25)보다 실시간 현재가가 우선해야 한다.
+        quotes = self.stub_quotes({"AAPL": (205.4, "finnhub_quote")})
+        body = self.track(ticker="AAPL", strategy="value").json()
+        self.assertEqual(body["pick"]["entry_price"], 205.4)
+        self.assertEqual(body["entry_price_source"], "finnhub_quote")
+        self.assertEqual(quotes, [["AAPL"]])               # 진입가 하나만 조회
+        self.assertEqual(self.picks()[0]["entry_price"], 205.4)   # 저장된 값도 실시간가
+
+    def test_track_without_entry_price_prefers_naver_realtime_for_korean(self):
+        self.stub_prices({"005930.KS": 180000.0})
+        self.stub_quotes({"005930.KS": (183200.0, "naver_realtime")})
+        body = self.track(ticker="005930.KS", strategy="value").json()
+        self.assertEqual(body["pick"]["entry_price"], 183200.0)
+        self.assertEqual(body["entry_price_source"], "naver_realtime")
+
+    def test_track_falls_back_to_daily_close_when_realtime_fails(self):
+        with patch.object(realtime_quotes, "get_prices", side_effect=RuntimeError("quote down")):
+            body = self.track(ticker="AAPL", strategy="value").json()
+        self.assertEqual(body["pick"]["entry_price"], 191.25)   # 일봉 종가로 폴백
+        self.assertEqual(body["entry_price_source"], "daily_close")
+
+    def test_track_ignores_zero_or_negative_quote(self):
+        for price in (0, -1.0, None, "nope"):
+            with self.subTest(quote=price):
+                self.stub_quotes({"MSFT": (price, "finnhub_quote")})
+                body = self.track(ticker="MSFT", strategy=f"q{price}").json()
+                self.assertEqual(body["pick"]["entry_price"], 410.0)
+                self.assertEqual(body["entry_price_source"], "daily_close")
+
+    def test_track_explicit_entry_price_wins_and_skips_lookup(self):
+        quotes = self.stub_quotes({"AAPL": (205.4, "finnhub_quote")})
+        body = self.track(ticker="AAPL", entry_price=100.0, strategy="value").json()
+        self.assertEqual(body["pick"]["entry_price"], 100.0)    # 클라이언트 값 그대로
+        self.assertIsNone(body["entry_price_source"])
+        self.assertEqual(quotes, [])                             # 조회 자체를 하지 않는다
+
+    def test_track_400_when_neither_realtime_nor_close(self):
+        self.stub_prices({})
+        self.stub_quotes({})
+        resp = self.track(ticker="ZZZZ", strategy="value")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.picks(), [])
+
+    def test_track_deduped_row_reports_no_entry_source(self):
+        self.track(ticker="AAPL", entry_price=100.0, strategy="value")
+        self.stub_quotes({"AAPL": (205.4, "finnhub_quote")})
+        body = self.track(ticker="AAPL", strategy="value").json()
+        self.assertFalse(body["created"])
+        self.assertEqual(body["pick"]["entry_price"], 100.0)     # 첫 진입가 유지
+        self.assertIsNone(body["entry_price_source"])            # 이 요청이 저장한 값이 아니다
 
     def test_track_treats_zero_or_negative_price_as_missing(self):
         for bad in (0, -3.5, None):
@@ -630,6 +709,7 @@ class DeleteApiTests(StubPricesMixin, TempDB):
     def setUp(self):
         super().setUp()
         self.stub_prices()
+        self.stub_quotes()                                  # 성적표 현재가는 일봉 종가 고정
         self.client = TestClient(api.app)
 
     def seed(self):

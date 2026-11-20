@@ -6,8 +6,9 @@
 3. `realtime_quotes` — 한국/미국 분기, 실패 종목 누락, `REALTIME_PRICE=0` 스위치
 4. `stock_tools.apply_realtime_prices` — price 덮어쓰기·price_source·추세 재판정
 5. `history_store.get_performance` — 성적표 현재가에 실시간가 우선
-6. `/api/screen` — AI 분석 캐시 히트에서 Gemini 미호출 + 주가는 매번 갱신, 상위 5종목만 뉴스
-7. `/api/stock/{ticker}` — 상세 현재가도 실시간
+6. `history_store.resolve_current_prices` — 진입가·성적표가 같이 쓰는 가격 우선순위
+7. `/api/screen` — AI 분석 캐시 히트에서 Gemini 미호출 + 주가는 매번 갱신, 상위 5종목만 뉴스
+8. `/api/stock/{ticker}` — 상세 현재가도 실시간
 
 실행: python -m unittest discover -s tests -v
 """
@@ -421,6 +422,53 @@ class PerformanceRealtimeTests(unittest.TestCase):
 
         self.assertEqual(body["picks"][0]["current_price"], 111.0)
         self.assertEqual(body["picks"][0]["price_source"], "finnhub_quote")
+
+
+class ResolveCurrentPricesTests(unittest.TestCase):
+    """`resolve_current_prices` — 진입가·성적표가 같이 쓰는 가격 우선순위."""
+
+    def setUp(self):
+        history_store.clear_price_cache()
+        self.addCleanup(history_store.clear_price_cache)
+
+    def test_realtime_wins_and_untouched_tickers_use_close(self):
+        with patch.object(realtime_quotes, "get_prices",
+                          lambda *a, **k: {"AAPL": {"price": 205.4, "source": "finnhub_quote"}}):
+            prices, sources, ok = history_store.resolve_current_prices(
+                ["AAPL", "MSFT"], price_fetcher=lambda t: {"MSFT": 410.0})
+        self.assertEqual(prices, {"AAPL": 205.4, "MSFT": 410.0})
+        self.assertEqual(sources, {"AAPL": "finnhub_quote", "MSFT": "daily_close"})
+        self.assertTrue(ok)
+
+    def test_use_realtime_false_skips_quote_layer(self):
+        def no_realtime(*args, **kwargs):
+            raise AssertionError("use_realtime=False면 실시간 조회를 하지 않는다")
+
+        with patch.object(realtime_quotes, "get_prices", no_realtime):
+            prices, sources, ok = history_store.resolve_current_prices(
+                ["AAPL"], price_fetcher=lambda t: {"AAPL": 101.0}, use_realtime=False)
+        self.assertEqual((prices, sources, ok), ({"AAPL": 101.0},
+                                                 {"AAPL": "daily_close"}, True))
+
+    def test_everything_fails_returns_none_prices(self):
+        with patch.object(realtime_quotes, "get_prices", lambda *a, **k: {}):
+            prices, sources, ok = history_store.resolve_current_prices(
+                ["ZZZZ"], price_fetcher=lambda t: {})
+        self.assertEqual(prices, {"ZZZZ": None})
+        self.assertEqual(sources, {"ZZZZ": "daily_close"})
+        self.assertTrue(ok)
+
+    def test_close_failure_keeps_realtime_and_flags_fallback(self):
+        def boom(tickers):
+            raise RuntimeError("yahoo down")
+
+        with patch.object(realtime_quotes, "get_prices",
+                          lambda *a, **k: {"AAPL": {"price": 205.4, "source": "finnhub_quote"}}):
+            prices, sources, ok = history_store.resolve_current_prices(
+                ["AAPL", "MSFT"], price_fetcher=boom)
+        self.assertEqual(prices["AAPL"], 205.4)                       # 실시간가는 살아 있다
+        self.assertEqual(sources["AAPL"], "finnhub_quote")
+        self.assertFalse(ok)                                         # 폴백 실패 표시
 
 
 # ---------------------------------------------------------------------------
