@@ -173,6 +173,33 @@ class IntentScoringTests(unittest.TestCase):
         self.assertTrue(any(sig.startswith("거래량급증일치") for sig in signals))
 
 
+class FallbackAnalysisTests(unittest.TestCase):
+    """AI 호출이 실패한 폴백 경로에서도 조건을 지키는지."""
+
+    def test_fallback_prefers_condition_matching_rows(self):
+        rows = [
+            dict(down_row(ticker="DOWN"), quant_score=90.0, price=80.0, signals=["저PER(6.0)"]),
+            dict(up_row(ticker="UP"), quant_score=70.0, price=120.0, signals=["정배열일치"]),
+            dict(up_row(ticker="UP2"), quant_score=65.0, price=130.0, signals=["정배열일치"]),
+        ]
+        data = api._fallback_analysis(rows, "AI 실패", intents=["uptrend"])
+        self.assertEqual([p["ticker"] for p in data["top_picks"]], ["UP", "UP2", "DOWN"])
+
+    def test_fallback_says_so_when_no_row_satisfies_the_condition(self):
+        rows = [dict(down_row(ticker="DOWN"), quant_score=90.0, price=80.0, signals=["저PER(6.0)"]),
+                dict(down_row(ticker="DOWN2"), quant_score=80.0, price=70.0, signals=["저PER(7.0)"])]
+        data = api._fallback_analysis(rows, "AI 실패", intents=["uptrend"])
+        self.assertEqual([p["ticker"] for p in data["top_picks"]], ["DOWN", "DOWN2"])
+        self.assertIn("충족하는 종목이 후보에 없어", data["market_note"])
+
+    def test_fallback_without_conditions_keeps_score_order(self):
+        rows = [dict(down_row(ticker="A"), quant_score=90.0, price=80.0, signals=[]),
+                dict(up_row(ticker="B"), quant_score=70.0, price=120.0, signals=[])]
+        data = api._fallback_analysis(rows, "AI 실패")
+        self.assertEqual([p["ticker"] for p in data["top_picks"]], ["A", "B"])
+        self.assertNotIn("충족하는 종목이 없어", data["market_note"])
+
+
 class RankStocksCompositeTests(unittest.TestCase):
     ROWS = [
         # PER이 가장 낮지만 역배열 — 기본 가치 프리셋의 1등

@@ -559,17 +559,31 @@ def _parse_analysis(text: str) -> dict:
     return data
 
 
-def _fallback_analysis(rows: list[dict], note: str) -> dict:
+def _fallback_analysis(rows: list[dict], note: str, intents=None) -> dict:
     """Gemini를 쓸 수 없을 때 서버 정량 점수만으로 만드는 분석(200 유지).
 
     점수·점수 근거(signals)는 모두 서버가 계산한 값이라 지어낸 내용이 없다.
+    세부 조건(`intents`)이 추세를 요구하면 그 조건을 충족하는 종목을 먼저 채운다 — AI 없이도
+    `"상승추세"`를 요구한 요청이 역배열 종목을 1순위로 내놓지 않게. 충족 종목이 하나도 없으면
+    점수 순서로 채우되 그 사실을 `market_note`에 밝힌다(지어내지 않는다).
     """
+    usable = [row for row in rows or []
+              if isinstance(row, dict) and not row.get("error") and row.get("price") is not None]
+    direction = scoring.requires_trend(intents)
+    ordered = usable
+    missing_note = ""
+    if direction:
+        matched = [row for row in usable if scoring.trend_state(row) == direction]
+        if matched:
+            ordered = matched + [row for row in usable if row not in matched]
+        else:
+            label = scoring.INTENT_LABELS.get("uptrend" if direction == "up" else "downtrend", direction)
+            missing_note = f" 조건({label})을 충족하는 종목이 후보에 없어 점수 순위대로 제시합니다."
+
     picks = []
-    for row in rows:
+    for row in ordered:
         if len(picks) >= 3:
             break
-        if not isinstance(row, dict) or row.get("error") or row.get("price") is None:
-            continue
         signals = row.get("signals") or []
         picks.append({
             "ticker": row.get("ticker"),
@@ -578,7 +592,7 @@ def _fallback_analysis(rows: list[dict], note: str) -> dict:
                        + (", ".join(str(s) for s in signals[:5]) if signals else "제공된 지표 기준")),
             "risk": "AI 해설 미제공(모델 호출 실패) — 서버가 계산한 점수·신호만 반영",
         })
-    return {"market_note": note, "top_picks": picks}
+    return {"market_note": (note or "") + missing_note, "top_picks": picks}
 
 
 def _gemini_client(timeout_ms: int | None = None):
@@ -641,8 +655,10 @@ def _thinking_rejected(exc: Exception) -> bool:
     return "thinking" in text or "invalid_argument" in text or " 400" in text
 
 
-def _run_analysis(prompt: str, rows: list[dict]) -> tuple[dict, str, str, str | None]:
+def _run_analysis(prompt: str, rows: list[dict], intents=None) -> tuple[dict, str, str, str | None]:
     """Gemini 분석을 모델 순서대로 시도하고, 끝내 실패하면 서버 점수 기반 폴백을 돌려준다.
+
+    `intents`(세부 조건)는 폴백 경로에만 쓰인다 — 모델이 없을 때도 조건에 맞는 종목이 앞에 온다.
 
     반환: (analysis dict, analysis_source, analysis_note, model)
     - `analysis_source`: "gemini"(정상) | "fallback"(모델 호출 실패 → 서버 정량 요약)
@@ -693,7 +709,7 @@ def _run_analysis(prompt: str, rows: list[dict]) -> tuple[dict, str, str, str | 
             _record_error(uuid.uuid4().hex[:8], "POST /api/screen (gemini)",
                           last_error if last_error else Exception("gemini_budget_exhausted"),
                           note="폴백 분석으로 응답")
-        data = _fallback_analysis(rows, analysis_note)
+        data = _fallback_analysis(rows, analysis_note, intents=intents)
         analysis_source = "fallback"
     return data, analysis_source, analysis_note, analysis_model
 
@@ -831,7 +847,8 @@ def screen_stocks(req: ScreenRequest):
             f"{json.dumps(_compact_rows(rows), ensure_ascii=False, default=str)}"
         )
         _t = time.perf_counter()
-        data, analysis_source, analysis_note, analysis_model = _run_analysis(prompt, rows)
+        data, analysis_source, analysis_note, analysis_model = _run_analysis(prompt, rows,
+                                                                           intents=conditions)
         _mark("gemini_ms", _t)
         # Gemini 결과만 길게 기억한다(폴백은 60초 — 다음 호출에서 정상 분석을 다시 시도).
         _analysis_cache_put(cache_key, data, analysis_source, analysis_model)
