@@ -553,9 +553,11 @@ class ScreenIntegrationTests(unittest.TestCase):
         body = TestClient(api.app).post(
             "/api/screen", json={"criteria": "모멘텀 돌파", "tickers": ["MID"]}).json()
 
+        # `conditions`는 2026-11 추가 필드(사용자 문장의 세부 조건) — 기존 키는 그대로다.
         self.assertEqual(sorted(body),
                          ["all_stocks", "analysis", "analysis_cached", "analysis_model", "analysis_note",
-                          "analysis_source", "mode", "strategy", "timings", "universe_scanned"])
+                          "analysis_source", "conditions", "mode", "strategy", "timings",
+                          "universe_scanned"])
         self.assertEqual(body["analysis_source"], "gemini")  # 정상 경로는 모델 해설
         self.assertEqual(body["analysis_note"], "")
         self.assertEqual(body["mode"], "watchlist")  # 기본값은 기존과 같은 관심 종목 모드

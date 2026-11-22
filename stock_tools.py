@@ -13,6 +13,7 @@ import finnhub_client
 import naver_finance
 import realtime_quotes
 import sec_edgar
+import sector_pe
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -786,6 +787,24 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
         # 한국 종목은 영어 shortName(SamsungElec)보다 네이버의 한글 종목명을 쓴다.
         name = naver_fin.get("name") or naver_finance.static_display_name(sym) or name
     name = name or cached_payload.get("name") or sym
+
+    # --- 동종업계 비교 기준(2026-11 추가) ---
+    # 한국: 네이버가 같은 업종 종목 PER로 만든 업종명·업종 기준 PER.
+    # 미국: GICS 섹터(Yahoo info 우선, 없으면 S&P 500 표)를 쓰고, 업종 PER은 스크리닝이 지나가며
+    #       모은 섹터 표본의 중앙값을 api 단계에서 붙인다(500종목 PER을 새로 받지 않는다).
+    sector = None
+    industry_pe = None
+    if is_korean:
+        sector = sector_pe.normalize_sector(naver_fin.get("sector")) or cached_payload.get("sector")
+        industry_pe = _to_number(naver_fin.get("industry_pe"))
+        if industry_pe is None:
+            industry_pe = _to_number(cached_payload.get("industry_pe"))
+    else:
+        sector = (sector_pe.normalize_sector((info or {}).get("sector"))
+                  or sector_pe.us_sector(sym) or cached_payload.get("sector"))
+        # 섹터 표본에 이 종목의 PER을 남긴다 → 다음 스크리닝의 업종 중앙값이 두터워진다.
+        sector_pe.record_pe(sector, sym, financials.get("trailing_pe"))
+
     payload = {
         "ticker": sym,
         "name": name,
@@ -799,6 +818,10 @@ def _build_metrics(sym: str, cached_payload: dict | None) -> dict:
     # MACD·볼린저·거래량 배수·고점 대비·구간 위치(추가 필드, 기존 키는 그대로)
     payload.update(indicators)
     payload.update(financials)
+    if sector:
+        payload["sector"] = sector
+    if industry_pe is not None:
+        payload["industry_pe"] = industry_pe
     payload["financials_available"] = financials_available
     if financials_stale:
         payload["financials_stale"] = True

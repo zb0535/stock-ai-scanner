@@ -309,16 +309,19 @@ def select_candidates(criteria: str | None = None, top_n: int = TOP_N,
                       force_refresh: bool = False) -> dict:
     """조건에 맞는 코스피 200 상위 후보를 고른다(S&P 500과 같은 반환 모양).
 
-    반환: `{"tickers","candidates","strategy","universe_scanned","scanned","skipped",
+    반환: `{"tickers","candidates","strategy","intents","universe_scanned","scanned","skipped",
            "cached","stale","universe_source"}`
     """
-    strategy = scoring.detect_strategy(criteria)
+    parsed = scoring.parse_criteria(criteria)
+    strategy = parsed["strategy"]
     snapshot = prescan(force_refresh=force_refresh)
-    ranking = sp500_scanner.rank_rows(snapshot["rows"], strategy, top_n=top_n)
+    ranking = sp500_scanner.rank_rows(snapshot["rows"], strategy, top_n=top_n,
+                                      intents=parsed["intents"])
     return {
         "tickers": [row["ticker"] for row in ranking],
         "candidates": ranking,
         "strategy": strategy,
+        "intents": parsed["intents"],
         "universe_scanned": snapshot.get("universe", 0),
         "scanned": len(snapshot.get("rows") or []),
         "skipped": snapshot.get("skipped", 0),

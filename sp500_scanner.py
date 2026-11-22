@@ -593,23 +593,34 @@ def stop_prewarm(timeout: float = 1.0) -> bool:
 
 # --- 후보 선정 ---------------------------------------------------------------
 
-def rank_rows(rows: list[dict], strategy: str, top_n: int = TOP_N) -> list[dict]:
+def rank_rows(rows: list[dict], strategy: str, top_n: int = TOP_N,
+              intents=None) -> list[dict]:
     """지표 행을 전략별 프리 스캔 점수로 정렬해 상위 top_n개를 돌려준다.
 
     점수는 `scoring.score_prescan`이 계산한다(재무 지표가 없으므로 value는 품질 조정
     프록시를 쓴다). 동점은 입력 순서(=S&P 500 목록 순서)를 유지한다.
+
+    `intents`에 추세 조건(`상승추세`/`정배열` 등)이 있으면 **조건 일치 종목을 먼저** 채운다 —
+    일치가 top_n 이상이면 일치 종목만 고르고, 모자라면 점수 순서로 나머지를 채워 빈 결과가
+    되지 않는다(안전 폴백).
     """
-    scored: list[tuple[float, int, dict]] = []
+    direction = scoring.requires_trend(intents)
+    scored: list[tuple[float, int, dict, bool]] = []
     for idx, row in enumerate(rows or []):
         if not isinstance(row, dict) or not row.get("ticker"):
             continue
-        score, signals = scoring.score_prescan(row, strategy)
+        score, signals = scoring.score_prescan(row, strategy, intents=intents)
         enriched = dict(row)
         enriched["prescore"] = score
         enriched["presignals"] = signals
-        scored.append((score, idx, enriched))
+        matches = direction is not None and scoring.trend_state(row) == direction
+        scored.append((score, idx, enriched, matches))
     scored.sort(key=lambda item: (-item[0], item[1]))
     limit = max(1, int(top_n or TOP_N))
+    if direction is not None:
+        matched = [item for item in scored if item[3]]
+        if len(matched) >= limit:
+            return [item[2] for item in matched[:limit]]
     return [item[2] for item in scored[:limit]]
 
 
@@ -617,23 +628,45 @@ def select_candidates(criteria: str | None = None, top_n: int = TOP_N,
                       force_refresh: bool = False) -> dict:
     """조건에 맞는 S&P 500 상위 후보를 고른다.
 
-    반환: {"tickers": [...], "candidates": [...], "strategy": "oversold",
+    반환: {"tickers": [...], "candidates": [...], "strategy": "oversold", "intents": [...],
            "universe_scanned": 503, "scanned": 498, "skipped": 5,
            "cached": True, "stale": False}
     """
-    strategy = scoring.detect_strategy(criteria)
+    parsed = scoring.parse_criteria(criteria)
+    strategy = parsed["strategy"]
     snapshot = prescan(force_refresh=force_refresh)
-    ranking = rank_rows(snapshot["rows"], strategy, top_n=top_n)
+    ranking = rank_rows(snapshot["rows"], strategy, top_n=top_n, intents=parsed["intents"])
     return {
         "tickers": [row["ticker"] for row in ranking],
         "candidates": ranking,
         "strategy": strategy,
+        "intents": parsed["intents"],
         "universe_scanned": snapshot.get("universe", 0),
         "scanned": len(snapshot.get("rows") or []),
         "skipped": snapshot.get("skipped", 0),
         "cached": snapshot.get("cached", False),
         "stale": snapshot.get("stale", False),
     }
+
+
+def sector_for(ticker: str) -> str | None:
+    """S&P 500 표에서 종목의 GICS 섹터 — 미국 종목의 동종업계 비교 기준(6시간 캐시 재사용).
+
+    목록 테이블은 `exchange` 키에 GICS Sector를 담고 있다(기존 응답 모양 유지).
+    Wikipedia·폴백 목록 모두 실패해도 표는 항상 채워지므로 추가 네트워크 호출은 없다.
+    """
+    sym = str(ticker or "").strip().upper()
+    if not sym:
+        return None
+    try:
+        rows = get_sp500_table()["rows"]
+    except Exception:  # 목록 조회 실패가 스크리닝을 막지 않게
+        return None
+    for row in rows:
+        if str(row.get("symbol") or "").strip().upper() == sym:
+            sector = str(row.get("exchange") or "").strip()
+            return sector or None
+    return None
 
 
 def reset_cache() -> None:

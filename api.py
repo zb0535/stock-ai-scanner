@@ -24,6 +24,7 @@ import kospi200_scanner
 import naver_finance
 import history_store
 import realtime_quotes
+import sector_pe
 from finnhub_client import status as finnhub_status
 
 logger = logging.getLogger("api")
@@ -67,8 +68,10 @@ _ANALYSIS_LOCK = threading.Lock()
 SYSTEM_PROMPT = """너는 한국·미국 주식 차트·재무제표 스크리닝 보조 봇이다.
 제공된 데이터에 없는 가격·지표·뉴스를 절대 지어내지 마라.
 종목은 서버가 계산한 정량 점수 `quant_score`(0~100, 높을수록 조건 적합) 내림차순이고, 점수 근거는 `signals`다. `strategy`는 사용자 조건의 의도(value=가치, oversold=과매도 반등, momentum=모멘텀, balanced=균형)다.
+`required_conditions`는 사용자가 문장에 직접 적은 **필수 조건**이다(예: 상승추세(정배열), 저PER, 재무안정). `quant_score`가 높더라도 필수 조건에 어긋나는 종목은 추천에서 제외하고, 조건을 충족하는 종목 중에서 고르라. 조건 충족 여부는 `signals`(예: `정배열일치` / `역배열(조건밖)` / `정배열미충족`)와 `trend`·이평선 값으로 판단하라. 조건을 충족하는 종목이 3개 미만이면 충족하는 종목을 모두 넣고, 그 다음에야 부족분을 점수 높은 종목으로 채우되 그 이유를 밝혀라.
+`industry_pe`는 같은 업종 기준 PER이다. `trailing_pe`/`forward_pe`가 업종 기준보다 낮으면(`업종대비저PER` signal) 절대 수치가 높아도 상대적으로 저평가라고 설명하고, 업종보다 크게 높으면(`업종대비고PER`) 리스크로 짚어라. `industry_pe`가 `null`이면 업종 정보가 없다는 뜻이므로 절대 PER만으로 평가하라(없는 업종 수치를 지어내지 마라).
 통화는 종목의 `currency`를 따른다(`KRW`→`₩65,400`, `USD`→`$352.45`). 환산·혼용하지 마라. `name`이 있으면 `삼성전자(005930.KS)`처럼 써라.
-근거에는 `quant_score`와 `signals`를 수치로 인용하고, 차트 지표(이평선·RSI·MACD·볼린저·거래량 배수·고점 대비 낙폭)와 재무 지표(PER·매출성장률·영업이익률·부채비율), 제공된 뉴스를 엮어라. 부정 신호(고PER·과열 RSI·역배열)는 리스크로 짚어라.
+근거에는 `quant_score`와 `signals`를 수치로 인용하고, 차트 지표(이평선·RSI·MACD·볼린저·거래량 배수·고점 대비 낙폭)와 재무 지표(PER·업종 기준 PER·매출성장률·영업이익률·부채비율), 제공된 뉴스를 엮어라. 부정 신호(고PER·과열 RSI·역배열)는 리스크로 짚어라.
 `price_source`가 `naver_realtime`/`finnhub_quote`면 그 가격이 실시간 현재가다.
 점수는 참고값이다. 비슷하면 재무·뉴스로 우열을 가려도 되지만, 높은 점수를 이유 없이 빼지 마라.
 재무 지표가 `null`이거나 `financials_note`가 붙어도 가격·이평선·RSI는 유효하다 — 있는 수치로 분석하라.
@@ -76,7 +79,7 @@ SYSTEM_PROMPT = """너는 한국·미국 주식 차트·재무제표 스크리�
 {
   "market_note": "후보군 전반 요약 1~2문장",
   "top_picks": [
-    {"ticker": "티커", "price": 0.0, "reason": "quant_score·signals·차트+재무+뉴스 근거(수치 포함)", "risk": "주의점 또는 단점"}
+    {"ticker": "티커", "price": 0.0, "reason": "quant_score·signals·차트+재무+업종 PER 비교+뉴스 근거(수치 포함)", "risk": "주의점 또는 단점"}
   ]
 }"""
 
@@ -311,7 +314,8 @@ _PROMPT_ROW_FIELDS = (
     "ticker", "name", "currency", "price", "price_source", "ma20", "ma60", "rsi14", "trend",
     "macd", "macd_signal", "macd_hist", "macd_cross", "macd_state",
     "bb_upper", "bb_lower", "bb_pct_b", "volume_ratio", "drawdown_from_high_pct",
-    "range_position_pct", "trailing_pe", "forward_pe", "revenue_growth", "operating_margins",
+    "range_position_pct", "trailing_pe", "forward_pe", "sector", "industry_pe",
+    "revenue_growth", "operating_margins",
     "debt_to_equity", "quant_score", "signals", "news", "financials_note",
 )
 
@@ -410,6 +414,7 @@ def health():
             "sp500_cache": sp500_scanner.cache_status(),
             "kospi200_cache": kospi200_scanner.cache_status(),
             "analysis_cache": analysis_cache_status(),
+            "sector_pe_samples": sector_pe.sample_status(),
             "realtime": {"enabled": realtime_quotes.is_enabled(),
                          "ttl_sec": realtime_quotes.REALTIME_TTL},
             "yahoo_guard": _yahoo_guard(),
@@ -769,9 +774,16 @@ def screen_stocks(req: ScreenRequest):
     rows = stock_tools.apply_realtime_prices(rows, quotes=quote_box.get("quotes") or {})
     _mark("overlay_ms", _t)
 
-    # 정량 스코어링: 조건에서 전략을 읽고 quant_score·signals를 붙여 내림차순 정렬한다.
+    # 동종업계 비교: `sector`가 비었으면 S&P 500 표에서, `industry_pe`가 비었으면 같은 섹터
+    # 표본 중앙값으로 채운다(네트워크 호출 없음). 한국 종목은 네이버 업종 PER이 이미 붙어 있다.
+    _t = time.perf_counter()
+    rows = sector_pe.fill_sector_pe(rows)
+    _mark("sector_ms", _t)
+
+    # 정량 스코어링: 조건에서 전략·세부 조건을 읽고 quant_score·signals를 붙여 내림차순 정렬한다.
     # 네트워크 호출은 없다(이미 받은 지표만 사용). 동점은 입력 순서를 유지한다.
     rows, strategy = scoring.rank_stocks(rows, criteria=req.criteria)
+    conditions = scoring.detect_intents(req.criteria)
 
     # 뉴스는 프롬프트에 들어가는 상위 N종목만 — 나머지는 []로 두어 네트워크·토큰을 아낀다.
     _t = time.perf_counter()
@@ -801,10 +813,20 @@ def screen_stocks(req: ScreenRequest):
         logger.info("AI 분석 캐시 히트(%.0f초 전, %s) mode=%s 종목=%d",
                     cached["age_sec"], analysis_source, mode, len(tickers))
     else:
+        condition_note = ""
+        if conditions:
+            labels = [scoring.INTENT_LABELS.get(name, name) for name in conditions]
+            condition_note = (
+                f"필수 조건(사용자 문장에서 읽음): {', '.join(labels)}\n"
+                "이 조건에 어긋나는 종목은 quant_score가 높아도 top_picks에서 제외하라. "
+                "`signals`의 '…일치' / '…(조건밖)' / '…미충족' 표시로 충족 여부를 확인할 수 있다.\n"
+            )
         prompt = (
             universe_note
+            + condition_note
             + f"조건: {req.criteria}\n"
-            f"strategy: {strategy} ({scoring.STRATEGY_LABELS.get(strategy, strategy)})\n\n"
+            f"strategy: {strategy} ({scoring.STRATEGY_LABELS.get(strategy, strategy)})\n"
+            f"required_conditions: {json.dumps([scoring.INTENT_LABELS.get(n, n) for n in conditions], ensure_ascii=False)}\n\n"
             f"종목 데이터(quant_score 내림차순):\n"
             f"{json.dumps(_compact_rows(rows), ensure_ascii=False, default=str)}"
         )
@@ -848,15 +870,17 @@ def screen_stocks(req: ScreenRequest):
     # 성적표를 오염시켰으므로, 클라이언트가 카드의 "📌 추적 추가"로 고른 픽만
     # `POST /api/performance/track`에서 기록한다. 응답 모양은 그대로다.
 
-    # strategy·mode·universe_scanned·analysis_source·analysis_cached·timings는 추가 필드다
+    # strategy·mode·universe_scanned·conditions·analysis_source·analysis_cached·timings는 추가 필드다
     # (기존 클라이언트는 무시해도 동작한다).
+    # conditions: 사용자 문장에서 읽은 세부 조건 키 (예: ["uptrend", "low_pe"])
     # analysis_source: "gemini"(정상) | "fallback"(모델 호출 실패 → 서버 점수 기반 요약)
     # analysis_cached: true면 10분 안의 같은 요청 → Gemini를 부르지 않고 분석만 재사용(주가는 최신)
     # timings: 단계별 소요 시간(ms) — discovery_ms·rows_ms(지표+실시간 병렬)·realtime_ms·overlay_ms·
-    #          news_ms·gemini_ms·charts_ms·total_ms
+    #          sector_ms·news_ms·gemini_ms·charts_ms·total_ms
     logger.info("스크리닝 완료 mode=%s 종목=%d 상위=%d 캐시=%s %s", mode, len(tickers),
                 len(picks), analysis_cached, timings)
     return _json_safe({"analysis": data, "all_stocks": rows, "strategy": strategy,
+                       "conditions": conditions,
                        "mode": mode, "universe_scanned": universe_scanned,
                        "analysis_source": analysis_source, "analysis_note": analysis_note,
                        "analysis_model": analysis_model, "analysis_cached": analysis_cached,

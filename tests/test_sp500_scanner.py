@@ -414,8 +414,9 @@ class ScreenModeTests(unittest.TestCase):
         self.assertIsNone(body["universe_scanned"])
         self.assertEqual([r["ticker"] for r in body["all_stocks"]], ["AAPL", "MSFT"])
         self.assertEqual(self.discovery_calls, [])
+        # 응답 키 집합 — `conditions`(사용자 문장의 세부 조건, 2026-11 추가)는 추가 필드다.
         self.assertEqual(sorted(body), ["all_stocks", "analysis", "analysis_cached", "analysis_model", "analysis_note",
-                                        "analysis_source", "mode", "strategy", "timings",
+                                        "analysis_source", "conditions", "mode", "strategy", "timings",
                                         "universe_scanned"])
 
     def test_unknown_mode_falls_back_to_watchlist(self):

@@ -36,9 +36,11 @@ yfinance는 `.KS`/`.KQ` 종목의 시세·차트는 잘 주지만, Render 같은
 import logging
 import math
 import re
+import statistics
 import threading
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -57,6 +59,16 @@ FUND_TTL = 6 * 3600
 TABLE_TTL = 6 * 3600
 FAIL_TTL = 15 * 60
 NEWS_TTL = 10 * 60
+
+# 동종업계 PER 비교(2026-11 추가)
+# 종목 통합 조회 응답의 `industryCode`·`industryCompareInfo`(같은 업종 종목)를 써서
+# 업종명과 **업종 기준 PER(이웃 종목 PER 중앙값)** 을 만든다. 이웃 PER은 종목별 통합 조회로
+# 받아오므로 업종 단위로 6시간 캐시하고, 한 번에 최대 PEER_SAMPLE_LIMIT개만 본다.
+INDUSTRY_TTL = 6 * 3600
+PEER_SAMPLE_LIMIT = 8        # 업종 중앙값에 넣을 이웃 종목 수 상한(호출 폭증 방지)
+PEER_MIN_SAMPLES = 3         # 업종 중앙값을 인정하는 최소 표본 수
+PEER_WORKERS = 4             # 이웃 PER 병렬 조회 상한(네이버에 부담을 주지 않게)
+PEER_TIMEOUT = 6
 
 # 실시간 현재가(초) — 같은 요청 안에서 중복 호출만 막을 만큼만 짧게 둔다.
 REALTIME_TTL = 10            # 성공: 10초 뒤 다시 조회하면 최신 체결가가 온다
@@ -101,6 +113,16 @@ def clear_cache() -> None:
     """테스트·수동 초기화용 캐시 비우기."""
     with _CACHE_LOCK:
         _CACHE.clear()
+
+
+# 업종별 계산은 한 번만: 같은 업종 종목이 병렬로 들어와도 이웃 PER을 중복 조회하지 않는다.
+_INDUSTRY_LOCKS: dict[str, threading.Lock] = {}
+_INDUSTRY_LOCKS_GUARD = threading.Lock()
+
+
+def _industry_lock(key: str) -> threading.Lock:
+    with _INDUSTRY_LOCKS_GUARD:
+        return _INDUSTRY_LOCKS.setdefault(key, threading.Lock())
 
 
 # --- 공통 유틸 ---------------------------------------------------------------
@@ -351,10 +373,12 @@ def _fetch_fundamentals(code: str) -> dict:
         "pbr": None,
         "eps": None,
         "dividend_yield": None,
+        "sector": None,
+        "industry_pe": None,
         "source": "naver",
     }
 
-    # ① 통합 시세: 현재 PER · 추정 PER · PBR
+    # ① 통합 시세: 현재 PER · 추정 PER · PBR (+ 업종 코드·같은 업종 종목)
     integration = _get_json(f"{BASE_MOBILE}/stock/{code}/integration")
     if isinstance(integration, dict):
         out["name"] = integration.get("stockName") or out["name"]
@@ -365,6 +389,17 @@ def _fetch_fundamentals(code: str) -> dict:
         out["pbr"] = _num(infos.get("pbr"))
         out["eps"] = _num(infos.get("eps"))
         out["dividend_yield"] = _num(infos.get("dividendYieldRatio"))
+
+        # ①-1 동종업계: 업종명 + 업종 기준 PER(이웃 종목 PER 중앙값)
+        industry_code = str(integration.get("industryCode") or "").strip()
+        peers = [str(p.get("itemCode")).strip()
+                 for p in (integration.get("industryCompareInfo") or [])
+                 if isinstance(p, dict) and p.get("itemCode")]
+        peers = [peer for peer in peers if peer and peer != code]
+        if industry_code:
+            out["sector"] = _industry_name(industry_code)
+        if out["trailing_pe"] is not None and peers:
+            out["industry_pe"] = _industry_pe(industry_code or code, peers)
 
     # ② 연간 재무: 영업이익률 · 부채비율 · 매출증가율(확정 연도끼리)
     annual = _get_json(f"{BASE_MOBILE}/stock/{code}/finance/annual")
@@ -395,11 +430,91 @@ def _fetch_fundamentals(code: str) -> dict:
     return out
 
 
+def _industry_name(industry_code: str) -> str | None:
+    """네이버 업종 코드 → 업종명(예: 278 → `반도체와반도체장비`). 실패하면 None.
+
+    업종 목록 API는 종목 목록과 함께 `groupInfo.name`을 준다 — pageSize=1이면 응답이 작다.
+    """
+    code = str(industry_code or "").strip()
+    if not code:
+        return None
+    key = f"indname:{code}"
+    cached = _cache_get(key)
+    if cached is not _MISS:
+        return cached
+    data = _get_json(f"{BASE_MOBILE}/stocks/industry/{code}", {"pageSize": 1}, timeout=PEER_TIMEOUT)
+    name = None
+    if isinstance(data, dict):
+        name = (data.get("groupInfo") or {}).get("name")
+    name = str(name).strip() if name else None
+    _cache_put(key, name, INDUSTRY_TTL if name else FAIL_TTL)
+    return name
+
+
+def _peer_pe(code: str) -> float | None:
+    """이웃 종목 하나의 현재 PER(6시간 캐시). 적자(0 이하)·결측은 None."""
+    key = f"pe:{code}"
+    cached = _cache_get(key)
+    if cached is not _MISS:
+        return cached
+    data = _get_json(f"{BASE_MOBILE}/stock/{code}/integration", timeout=PEER_TIMEOUT)
+    pe = None
+    if isinstance(data, dict):
+        infos = {str(i.get("code")): i.get("value")
+                 for i in (data.get("totalInfos") or []) if isinstance(i, dict)}
+        pe = _num(infos.get("per"))
+        if pe is not None and pe <= 0:
+            pe = None
+    _cache_put(key, pe, FUND_TTL if pe is not None else FAIL_TTL)
+    return pe
+
+
+def _peer_median(peers: list[str]) -> float | None:
+    """이웃 종목 PER 중앙값 — 표본이 PEER_MIN_SAMPLES개 미만이면 None.
+
+    중앙값을 쓰는 이유: 한 종목의 적자 직전 PER(수백 배)이 평균을 통째로 끌고 간다.
+    """
+    codes = [str(peer).strip() for peer in (peers or []) if str(peer).strip()][:PEER_SAMPLE_LIMIT]
+    if len(codes) < PEER_MIN_SAMPLES:
+        return None
+    values: list[float] = []
+    try:
+        with ThreadPoolExecutor(max_workers=PEER_WORKERS, thread_name_prefix="naver-peer") as pool:
+            for value in pool.map(_peer_pe, codes):
+                if value is not None:
+                    values.append(float(value))
+    except Exception as exc:  # 병렬 조회 실패 → 업종 비교만 생략
+        logger.warning("업종 PER 이웃 조회 실패: %s: %s", type(exc).__name__, str(exc)[:120])
+        return None
+    if len(values) < PEER_MIN_SAMPLES:
+        return None
+    return round(float(statistics.median(values)), 2)
+
+
+def _industry_pe(industry_key: str, peers: list[str]) -> float | None:
+    """업종 기준 PER(이웃 종목 PER 중앙값). 업종 단위 6시간 캐시 + 업종별 락.
+
+    같은 업종 종목이 병렬로 스크리닝돼도 이웃 PER 조회는 한 번만 한다.
+    """
+    key = f"indpe:{industry_key}"
+    cached = _cache_get(key)
+    if cached is not _MISS:
+        return cached
+    with _industry_lock(key):
+        cached = _cache_get(key)
+        if cached is not _MISS:
+            return cached
+        value = _peer_median(peers)
+        _cache_put(key, value, INDUSTRY_TTL if value is not None else FAIL_TTL)
+        return value
+
+
 def get_fundamentals(ticker) -> dict | None:
     """한국 종목의 네이버 재무 지표(6시간 캐시). 한국 티커가 아니면 None.
 
     반환 키: `name`·`trailing_pe`·`forward_pe`·`revenue_growth`(소수)·`operating_margins`(소수)·
-    `debt_to_equity`(%)·`pbr`·`eps`·`dividend_yield`·`source`. 못 받은 값은 None.
+    `debt_to_equity`(%)·`pbr`·`eps`·`dividend_yield`·`sector`(업종명)·`industry_pe`(업종 기준 PER)·
+    `source`. 못 받은 값은 None.
     """
     code = naver_code(ticker)
     if not code:
