@@ -297,6 +297,10 @@ class ScreenSectorPromptTests(unittest.TestCase):
         self._patches.append(patcher)
         return value
 
+    def test_system_prompt_forbids_industry_claims_without_data(self):
+        self.assertIn("industry_pe", api.SYSTEM_PROMPT)
+        self.assertIn("업종 비교를 아예 언급하지 마라", api.SYSTEM_PROMPT)
+
     def test_prompt_and_rows_carry_sector_and_industry_pe(self):
         metrics = {
             "AAA": row(ticker="AAA", name="Alpha", sector="Technology", trailing_pe=18.0),
