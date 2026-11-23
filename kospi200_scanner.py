@@ -31,6 +31,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import naver_finance
 import scoring
@@ -47,6 +48,17 @@ PREWARM_INTERVAL = 50 * 60       # 재예열 주기(50분)
 PREWARM_REFRESH_AGE = 45 * 60    # 스냅샷이 이보다 새로우면 예열은 건너뛴다
 PREWARM_OVERLAP_WAIT = 180       # S&P 500 스캔이 끝나기를 기다리는 최대 시간(초)
 TOP_N = 15                       # Gemini에 넘길 후보 수
+
+# 발굴 후보의 네이버 재무를 미리 받아 두는 작업(백그라운드).
+# 왜: `/api/screen`의 `rows_ms`는 종목당 네이버 재무(통합 시세+연간 재무+동종업계 PER)를
+# 기다리는 시간이다. Render에서 네이버 한 요청이 1~2초라 처음 보는 15종목이면 20초를 넘겼다.
+# 예열 주기마다 **주요 전략 상위 후보**의 재무를 미리 받아 두면 사용자 요청은 캐시만 읽는다
+# (6시간 캐시). 네이버에 부담을 주지 않게 동시 3개·당 45종목으로 제한한다.
+FUND_PREWARM_ENV = "KOSPI_FUND_PREWARM"
+FUND_PREWARM_LIMIT = max(0, int(os.environ.get("KOSPI_FUND_PREWARM_LIMIT", "45")))
+FUND_PREWARM_WORKERS = max(1, int(os.environ.get("KOSPI_FUND_PREWARM_WORKERS", "3")))
+_FUND_PREWARM_LOCK = threading.Lock()
+_FUND_PREWARM_STATE: dict = {"thread": None, "last": 0.0, "warmed": 0}
 
 _TECH_HINT = "코스피 200"
 
@@ -193,6 +205,83 @@ def _wait_for_sp500(timeout: float | None = None) -> bool:
     return True
 
 
+def _warm_candidate_fundamentals(rows: list[dict]) -> dict:
+    """후보군의 네이버 재무를 미리 받는다(네트워크 I/O, 백그라운드 스레드에서만 호출).
+
+    예열 대상을 고르는 기준: 주요 전략(가치·성장·모멘텀) 상위 후보의 합집합. 어떤 조건으로
+    발굴해도 상위 15개는 이 안에서 나오기 때문이다. 이미 캐시에 있으면 건너뛰고, 동시 3개로
+    나눠 부른다(네이버에 부담을 주지 않게).
+    반환: `{"targets", "warmed", "elapsed_sec"}`
+    """
+    started = time.time()
+    targets: list[str] = []
+    for strategy in ("value", "growth", "momentum"):
+        try:
+            ranked = sp500_scanner.rank_rows(rows, strategy, top_n=TOP_N)
+        except Exception as exc:  # 한 전략이 실패해도 나머지는 예열한다
+            logger.warning("코스피 재무 예열 후보 계산 실패(%s): %s", strategy, type(exc).__name__)
+            continue
+        for row in ranked:
+            ticker = str(row.get("ticker") or "").strip()
+            if ticker and ticker not in targets:
+                targets.append(ticker)
+
+    pending = [t for t in targets if not naver_finance.has_fundamentals(t)][:FUND_PREWARM_LIMIT]
+    warmed = 0
+    if pending:
+        def _one(ticker: str) -> None:
+            naver_finance.get_fundamentals(ticker)
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(FUND_PREWARM_WORKERS, len(pending)),
+                                    thread_name_prefix="kospi-fund") as pool:
+                for _ in pool.map(_one, pending):
+                    warmed += 1
+        except Exception as exc:  # 예열 실패가 예열 루프를 죽이지 않는다
+            logger.warning("코스피 재무 예열 실패: %s: %s", type(exc).__name__, str(exc)[:120])
+    elapsed = round(time.time() - started, 1)
+    logger.info("코스피 재무 예열: 대상 %d종목 중 %d종목 새로 받음 %.1fs", len(pending), warmed, elapsed)
+    return {"targets": len(targets), "warmed": warmed, "elapsed_sec": elapsed}
+
+
+def _start_fundamental_prewarm(rows: list[dict]) -> bool:
+    """재무 예열을 백그라운드로 시작한다(이미 돌고 있으면 건너뛴다). 반환: 시작했으면 True."""
+    if (os.environ.get(FUND_PREWARM_ENV) or "1").strip() in ("0", "false", "no", "off"):
+        return False
+    if FUND_PREWARM_LIMIT <= 0 or not rows:
+        return False
+    with _FUND_PREWARM_LOCK:
+        thread = _FUND_PREWARM_STATE.get("thread")
+        if thread is not None and thread.is_alive():
+            return False
+
+        def _run() -> None:
+            try:
+                result = _warm_candidate_fundamentals(list(rows))
+                _FUND_PREWARM_STATE["warmed"] = result["warmed"]
+            finally:
+                _FUND_PREWARM_STATE["last"] = time.time()
+
+        worker = threading.Thread(target=_run, name="kospi-fund-prewarm", daemon=True)
+        _FUND_PREWARM_STATE["thread"] = worker
+        worker.start()
+    return True
+
+
+def fundamental_prewarm_status() -> dict:
+    """`GET /` 진단용 — 재무 예열 상태(종목 수·마지막 시간)."""
+    with _FUND_PREWARM_LOCK:
+        thread = _FUND_PREWARM_STATE.get("thread")
+        return {"enabled": (os.environ.get(FUND_PREWARM_ENV) or "1").strip()
+                           not in ("0", "false", "no", "off"),
+                "limit": FUND_PREWARM_LIMIT,
+                "workers": FUND_PREWARM_WORKERS,
+                "running": bool(thread is not None and thread.is_alive()),
+                "warmed_last": _FUND_PREWARM_STATE.get("warmed", 0),
+                "last_sec": (round(time.time() - _FUND_PREWARM_STATE["last"])
+                             if _FUND_PREWARM_STATE.get("last") else None)}
+
+
 def prewarm_once(max_age: float | None = None, wait_for_sp500: bool = True) -> dict:
     """한 번 예열한다 = 스냅샷이 오래됐으면 새로 만든다.
 
@@ -241,6 +330,7 @@ def prewarm_once(max_age: float | None = None, wait_for_sp500: bool = True) -> d
     if ok:
         logger.info("코스피 200 예열 완료: %d종목 캐시=%s %.1fs",
                     len(rows), result.get("cached"), elapsed)
+        _start_fundamental_prewarm(rows)   # 후보 재무를 백그라운드로 미리 받아 둔다
     else:
         logger.warning("코스피 200 예열 실패 → 직전 스냅샷(%d종목) 유지", len(rows))
     return {"ok": ok, "scanned": not result.get("cached"), "tickers": len(rows),

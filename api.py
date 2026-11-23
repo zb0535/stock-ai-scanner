@@ -414,6 +414,7 @@ def health():
             "storage_backend": history_store.storage_backend(),
             "sp500_cache": sp500_scanner.cache_status(),
             "kospi200_cache": kospi200_scanner.cache_status(),
+            "kospi200_fund_prewarm": kospi200_scanner.fundamental_prewarm_status(),
             "analysis_cache": analysis_cache_status(),
             "sector_pe_samples": sector_pe.sample_status(),
             "realtime": {"enabled": realtime_quotes.is_enabled(),

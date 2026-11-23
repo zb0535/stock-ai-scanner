@@ -374,6 +374,14 @@ def _fetch_integration_and_annual(code: str) -> tuple:
         return integration_future.result(), annual_future.result()
 
 
+def has_fundamentals(ticker) -> bool:
+    """이 종목의 재무가 캐시에 살아 있는지(예열·중복 조회 판단용)."""
+    code = naver_code(ticker)
+    if not code:
+        return False
+    return _cache_get(f"fund:{code}") is not _MISS
+
+
 def _fetch_fundamentals(code: str) -> dict:
     """네이버 통합 시세 + 연간 재무 → stock_tools 키와 같은 재무 dict."""
     out = {
