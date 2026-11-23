@@ -75,7 +75,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     폴백한다(둘 다 실패하면 400 `invalid_ticker`). 응답은
     `{"ok": true, "created": bool, "pick": {id, ticker, ...}, "entry_price_source": str|null}`
     (같은 날 같은 티커·전략은 기존 행 반환). `entry_price_source`는 서버가 진입가를 조회했을 때의
-    출처(`naver_realtime`/`finnhub_quote`/`yahoo_prepost`/`yahoo_quote`/`daily_close`)이고, 클라이언트가 값을 보냈거나 기존 행을
+    출처(`naver_realtime`/`finnhub_quote`/`naver_prepost`/`yahoo_prepost`/`daily_close`)이고, 클라이언트가 값을 보냈거나 기존 행을
     돌려준 경우 `null`이다(기존 클라이언트는 무시해도 된다).
   - **`DELETE /api/performance/{id}`** — 그 `id` 행 **하나만** 삭제한다.
     응답 `{"ok": true, "deleted_id": id}`, 없으면 404. 저장소 장애는 503.
@@ -100,7 +100,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     (`yf.download`, 최대 50종목 한 번·5분 캐시)로 채운다 — 장중 새로고침이 Yahoo 왕복을 기다리지
     않는다. 두 경로는 `history_store.resolve_current_prices` 하나로 모아 성적표 현재가와 추적
     진입가가 같은 우선순위를 쓴다(장중에 전일 종가로 진입가가 잡혀 수익률이 어긋나던 문제).
-    픽마다 `price_source`가 `naver_realtime`/`finnhub_quote`/`yahoo_prepost`/`yahoo_quote`/`daily_close`다.
+    픽마다 `price_source`가 `naver_realtime`/`finnhub_quote`/`naver_prepost`/`yahoo_prepost`/`naver_quote`/`yahoo_quote`/`daily_close`다.
   - 응답: `{"summary": {total_picks, evaluated_picks, win_count, win_rate_pct, avg_return_pct,
     best_pick, worst_pick}, "picks": [...], "as_of", "limit"}`. 이력이 비면 개수 0·비율 `null`.
     픽별로 `entry_price`·`current_price`·`return_pct`·`is_win`(return > 0)·`days_held`가 붙는다.
@@ -143,15 +143,16 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   - **실시간 현재가**(`realtime_quotes.py`): 지표·재무는 30분 캐시 그대로 두고 `price`만 덮어쓴다.
     한국 종목은 네이버 금융 `polling.finance.naver.com`(여러 코드를 한 요청으로), 미국 종목은
     **정규장이면 Finnhub `/quote`**(병렬 8·분당 50회 자체 상한)를 쓰고, **프리·애프터마켓·주말에는
-    Yahoo v8 chart 메타의 시간외 마지막 체결가**(`extended_quotes.py`)를 우선한다 — Finnhub는
-    정규장 종가만 주므로 한국 낮에는 토스증권 같은 시간외 시세와 어긋났다(예: SKHY 103.57 vs
-    106.30, MNST 43.69 vs 43.27). 두 소스는 동시에 조회하고, 각 소스 장애는 그 소스만 비운다.
+    네이버 해외주식 `overMarketPriceInfo.overPrice` → Yahoo v8 chart 메타의 시간외 마지막 체결가**
+    (`extended_quotes.py`)를 우선한다 — Finnhub는 정규장 종가만 주므로 한국 낮에는 토스증권 같은
+    시간외 시세와 어긋났다(예: SKHY 103.57 vs 106.30, MNST 43.69 vs 43.27). 두 소스는 동시에
+    조회하고, 각 소스 장애는 그 소스만 비우며 소스별로 3회 연속 실패 시 10분 쉰다.
     최종 15종목·성적표·상세 화면에서만 호출하며 프리 스캔(500/201종목)에는 쓰지 않는다.
     캐시는 10~30초 — 같은 요청의 중복 호출만 막고 새 조회에는 최신 체결가가 반영된다.
     실패는 조용히 일봉 종가로 폴백하고 응답에 `price_source`
-    (`naver_realtime` | `finnhub_quote` | `yahoo_prepost` | `yahoo_quote` | `daily_close`)를 남긴다.
+    (`naver_realtime` | `finnhub_quote` | `naver_prepost` | `yahoo_prepost` | `naver_quote` | `yahoo_quote` | `daily_close`)를 남긴다.
     `REALTIME_PRICE=0`(전체)·`EXTENDED_QUOTES=0`(시간외 계층만)으로 끌 수 있다.
-    시간외 계층은 3회 연속 실패하면 10분 쉬고, 헬스 `extended_quotes`에 그 상태가 나온다.
+    시간외 계층은 소스별로 3회 연속 실패하면 10분 쉬고, 헬스 `extended_quotes`에 그 상태가 나온다.
   - **AI 분석 10분 캐시**: 같은 `(mode, 전략, 조건, 종목 묶음)` 요청이 10분 안에 다시 오면
     Gemini를 부르지 않고 분석(`market_note`·`top_picks` 이유)을 재사용한다(`analysis_cached: true`,
     `timings.gemini_ms = 0`). 재사용해도 `price`·`price_source`는 **매번 새로 조회**해 덮어쓰므로
