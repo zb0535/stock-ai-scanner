@@ -18,8 +18,8 @@ class FundamentalPrewarmTests(unittest.TestCase):
         rows = [{"ticker": t} for t in ("A.KS", "B.KS", "C.KS")]
 
         with patch.object(kospi200_scanner.sp500_scanner, "rank_rows",
-                          side_effect=lambda rows, strategy, top_n=15: [{"ticker": "A.KS"},
-                                                                        {"ticker": "B.KS"}]), \
+                          side_effect=lambda rows, strategy, top_n=15, intents=None: [{"ticker": "A.KS"},
+                                                                                 {"ticker": "B.KS"}]), \
                 patch.object(kospi200_scanner.naver_finance, "has_fundamentals",
                              side_effect=lambda t: t == "B.KS"), \
                 patch.object(kospi200_scanner.naver_finance, "get_fundamentals",
@@ -31,7 +31,7 @@ class FundamentalPrewarmTests(unittest.TestCase):
         get_fundamentals.assert_called_once_with("A.KS")   # 캐시에 있는 B는 건너뛴다
 
     def test_strategy_failure_does_not_stop_the_rest(self):
-        def rank(rows, strategy, top_n=15):
+        def rank(rows, strategy, top_n=15, intents=None):
             if strategy == "value":
                 raise RuntimeError("boom")
             return [{"ticker": "A.KS"}]
@@ -67,8 +67,8 @@ class Sp500MetricPrewarmTests(unittest.TestCase):
     def test_warms_union_and_skips_cached(self):
         rows = [{"ticker": t} for t in ("AAA", "BBB", "CCC")]
         with patch.object(kospi200_scanner.sp500_scanner, "rank_rows",
-                          side_effect=lambda rows, strategy, top_n=15: [{"ticker": "AAA"},
-                                                                        {"ticker": "BBB"}]), \
+                          side_effect=lambda rows, strategy, top_n=15, intents=None: [{"ticker": "AAA"},
+                                                                                 {"ticker": "BBB"}]), \
                 patch.object(kospi200_scanner.sp500_scanner.stock_tools, "has_metrics",
                              side_effect=lambda t: t == "BBB"), \
                 patch.object(kospi200_scanner.sp500_scanner.stock_tools, "get_stock_metrics",
