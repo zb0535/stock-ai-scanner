@@ -228,7 +228,10 @@ class FinnhubQuoteTests(unittest.TestCase):
 class RealtimeOverlayTests(unittest.TestCase):
     def setUp(self):
         realtime_quotes.clear_cache()
-        env = patch.dict(os.environ, {"REALTIME_PRICE": "1"})
+        # 미국 시간외(Yahoo) 계층은 실제 네트워크를 쓰므로 이 클래스에서는 끈다 —
+        # 여기서 검증하는 것은 한국/미국 분기와 실패 캐시이고, 시간외 병합은
+        # tests/test_extended_quotes.py가 주입된 응답으로 따로 검증한다.
+        env = patch.dict(os.environ, {"REALTIME_PRICE": "1", "EXTENDED_QUOTES": "0"})
         env.start()
         self.addCleanup(env.stop)
 

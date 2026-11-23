@@ -64,10 +64,10 @@ NEWS_TTL = 10 * 60
 # 종목 통합 조회 응답의 `industryCode`·`industryCompareInfo`(같은 업종 종목)를 써서
 # 업종명과 **업종 기준 PER(이웃 종목 PER 중앙값)** 을 만든다. 이웃 PER은 종목별 통합 조회로
 # 받아오므로 업종 단위로 6시간 캐시하고, 한 번에 최대 PEER_SAMPLE_LIMIT개만 본다.
-INDUSTRY_TTL = 6 * 3600
+INDUSTRY_TTL = 24 * 3600     # 업종명·업종 PER — 하루면 중앙값이 크게 달라지지 않는다
 PEER_SAMPLE_LIMIT = 8        # 업종 중앙값에 넣을 이웃 종목 수 상한(호출 폭증 방지)
 PEER_MIN_SAMPLES = 3         # 업종 중앙값을 인정하는 최소 표본 수
-PEER_WORKERS = 4             # 이웃 PER 병렬 조회 상한(네이버에 부담을 주지 않게)
+PEER_WORKERS = 6             # 이웃 PER 병렬 조회 상한(네이버에 부담을 주지 않게)
 PEER_TIMEOUT = 6
 
 # 실시간 현재가(초) — 같은 요청 안에서 중복 호출만 막을 만큼만 짧게 둔다.
@@ -361,6 +361,19 @@ def _row_map(finance_info: dict, title: str) -> dict:
     return {}
 
 
+def _fetch_integration_and_annual(code: str) -> tuple:
+    """코드 하나의 [통합 시세]·[연간 재무]를 **동시에** 받는다.
+
+    두 응답은 서로 의존하지 않는데 예전에는 순서대로 기다렸다(종목당 2×지연).
+    네이버가 종목당 두 요청을 동시에 받는 부담은 작고(각 응답 5~10KB), 15종목 발굴에서
+    이 병렬화만으로 대기시간이 약 절반으로 줄었다. `_get_json`은 예외를 흡수한다.
+    """
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="naver-fund") as pool:
+        integration_future = pool.submit(_get_json, f"{BASE_MOBILE}/stock/{code}/integration")
+        annual_future = pool.submit(_get_json, f"{BASE_MOBILE}/stock/{code}/finance/annual")
+        return integration_future.result(), annual_future.result()
+
+
 def _fetch_fundamentals(code: str) -> dict:
     """네이버 통합 시세 + 연간 재무 → stock_tools 키와 같은 재무 dict."""
     out = {
@@ -378,8 +391,10 @@ def _fetch_fundamentals(code: str) -> dict:
         "source": "naver",
     }
 
+    # ① 통합 시세(현재 PER·추정 PER·PBR·업종)와 ② 연간 재무를 동시에 받는다.
+    integration, annual = _fetch_integration_and_annual(code)
+
     # ① 통합 시세: 현재 PER · 추정 PER · PBR (+ 업종 코드·같은 업종 종목)
-    integration = _get_json(f"{BASE_MOBILE}/stock/{code}/integration")
     if isinstance(integration, dict):
         out["name"] = integration.get("stockName") or out["name"]
         infos = {str(i.get("code")): i.get("value")
@@ -402,7 +417,6 @@ def _fetch_fundamentals(code: str) -> dict:
             out["industry_pe"] = _industry_pe(industry_code or code, peers)
 
     # ② 연간 재무: 영업이익률 · 부채비율 · 매출증가율(확정 연도끼리)
-    annual = _get_json(f"{BASE_MOBILE}/stock/{code}/finance/annual")
     info = (annual or {}).get("financeInfo") if isinstance(annual, dict) else None
     if isinstance(info, dict):
         titles = [t for t in (info.get("trTitleList") or []) if isinstance(t, dict)]

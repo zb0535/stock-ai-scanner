@@ -38,6 +38,24 @@ PARTIAL_TTL = 60        # 60초: 재무 지표가 비어 있는 결과 (제한�
 # 받으면 429(rate limited)로 막으므로 8개까지만 묶어 둔다(예전 6 → 지연의 절반이 병렬도였다).
 MAX_FETCH_WORKERS = 8
 
+# 스크리닝 최종 15종목 조회의 병렬도. 한국 종목은 네이버 JSON(종목당 5~10KB)만 오가서
+# 15개를 한 번에 띄워도 부담이 없지만, 미국 종목은 SEC companyfacts 원본이 커서
+# (Render 무료 512MB) 8개를 유지한다 — 그래서 티커 구성에 따라 병렬도를 고른다.
+SCREEN_FETCH_WORKERS = max(1, int(os.environ.get("SCREEN_FETCH_WORKERS", "15")))
+
+
+def screen_workers_for(tickers) -> int:
+    """스크리닝 15종목 조회에 쓸 병렬도 — 전부 한국 종목이면 더 넓게.
+
+    코스피 200 발굴은 후보가 모두 `.KS`/`.KQ`라 네이버 재무(종목당 약 2초, 캐시 전)
+    조회를 8개씩 두 바퀴 도는 대신 15개를 한 바퀴에 끝낸다. 미국 종목이 섞이면 SEC 원본
+    다운로드가 몰리지 않게 8개로 돌아간다.
+    """
+    items = [str(t or "").strip() for t in tickers or [] if str(t or "").strip()]
+    if items and all(naver_finance.is_korean_ticker(t) for t in items):
+        return max(MAX_FETCH_WORKERS, min(SCREEN_FETCH_WORKERS, len(items)))
+    return MAX_FETCH_WORKERS
+
 # ticker -> (저장 시각, 결과 dict)
 _METRICS_CACHE: dict[str, tuple[float, dict]] = {}
 # "ticker:period" -> (저장 시각, 일봉 DataFrame, 유지 시간)

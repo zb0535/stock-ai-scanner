@@ -346,7 +346,11 @@ class PriceTests(unittest.TestCase):
             def boom(tickers):
                 raise RuntimeError("network down")
 
-            with patch.object(history_store, "_fetch_prices_batch", side_effect=boom):
+            # 이 테스트는 **일봉 종가 조회가 죽었을 때**의 응답 모양을 본다. 실시간 시세는
+            # 별도 테스트가 덮으므로 여기서는 비운다(실제 시간외 시세가 값을 채우면 경로가 달라진다).
+            with patch.object(history_store, "_fetch_prices_batch", side_effect=boom), \
+                    patch.object(history_store.realtime_quotes, "get_prices",
+                                 lambda *a, **k: {}):
                 body = history_store.get_performance(db_path=db)
             self.assertEqual(body["summary"]["total_picks"], 1)
             self.assertEqual(body["summary"]["evaluated_picks"], 0)

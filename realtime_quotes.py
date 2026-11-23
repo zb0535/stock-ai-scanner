@@ -1,4 +1,4 @@
-"""실시간 현재가 오버레이 — 한국은 네이버 금융, 미국은 Finnhub `/quote`.
+"""실시간 현재가 오버레이 — 한국은 네이버 금융, 미국은 Finnhub `/quote` + Yahoo 시간외.
 
 왜 필요한가
 -----------
@@ -6,12 +6,20 @@
 RSI·MACD·볼린저)와 재무 지표는 하루 단위로만 바뀌므로 30분 캐시로 충분하지만, **현재가**는
 장중에 계속 움직인다. 그래서 이 모듈은 지표·재무는 건드리지 않고 `price`만 실시간으로 덮어쓴다.
 
+미국 종목은 두 소스를 함께 본다
+- 정규장(평일 09:30–16:00 ET): Finnhub `/quote`(`finnhub_quote`)가 실시간이다.
+- 프리·애프터마켓·주말: Finnhub는 직전 **정규장 종가**만 주므로 Yahoo chart 메타의
+  시간외 마지막 체결가(`extended_quotes`, `yahoo_prepost`)를 우선한다 — 토스증권처럼
+  한국 낮에도 시간외 가격을 보여주기 위해서다.
+- 둘 다 실패하면 호출부가 일봉 종가를 유지한다(`daily_close`).
+
 속도·쿼터 설계
 --------------
 - S&P 500(500종목)·코스피 200(200종목) **프리 스캔 단계에는 이 모듈을 부르지 않는다**.
   호출부가 최종 스크리닝 15종목(`/api/screen`)과 성적표 종목(`/api/performance`)에만 부른다.
 - 한국 종목은 네이버 polling이 쉼표 목록을 받으므로 15종목이 **요청 1회**로 끝난다.
-- 미국 종목은 Finnhub를 최대 8개 병렬로 부르되, 10초 캐시와 분당 50회 상한으로 쿼터를 지킨다.
+- 미국 종목은 Finnhub(최대 8개 병렬)와 Yahoo 시간외(최대 8개 병렬)를 **동시에** 띄운다 —
+  서로 기다리지 않고, 정규장에는 Finnhub가 프리·애프터에는 Yahoo가 값이 된다.
 - 이 모듈도 12초 인메모리 캐시를 둬서 같은 요청 안(또는 같은 순간의 여러 요청)의 중복 조회를 막는다.
 - 실패(타임아웃·429·0·파싱 불가)는 조용히 빼고 돌려준다 → 호출부는 일봉 종가를 유지한다.
 
@@ -21,7 +29,9 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
+import extended_quotes
 import finnhub_client
 import naver_finance
 
@@ -90,11 +100,8 @@ def get_prices(tickers, max_workers: int = QUOTE_WORKERS) -> dict[str, dict]:
         except Exception as exc:  # 네이버 장애가 스크리닝을 죽이지 않게
             logger.warning("네이버 실시간 시세 실패: %s: %s", type(exc).__name__, str(exc)[:160])
 
-    if others and finnhub_client.is_enabled():
-        try:
-            fresh.update(finnhub_client.get_quotes(others, max_workers=max_workers))
-        except Exception as exc:  # Finnhub 장애도 마찬가지
-            logger.warning("Finnhub 실시간 시세 실패: %s: %s", type(exc).__name__, str(exc)[:160])
+    if others and (finnhub_client.is_enabled() or extended_quotes.is_enabled()):
+        fresh.update(_us_quotes(others, max_workers=max_workers))
 
     with _LOCK:
         for sym in missing:
@@ -109,6 +116,54 @@ def get_price_map(tickers, max_workers: int = QUOTE_WORKERS) -> dict[str, float]
     """티커 → 현재가(float)만 필요한 호출부용 간편형(실패 종목은 키 없음)."""
     return {sym: float(quote["price"]) for sym, quote in
             get_prices(tickers, max_workers=max_workers).items() if quote.get("price")}
+
+
+def _us_quotes(symbols: list[str], max_workers: int = QUOTE_WORKERS) -> dict[str, dict]:
+    """미국 종목 시세 — Finnhub(정규장 실시간)와 Yahoo 시간외를 동시에 받아 고른다.
+
+    우선순위
+    - 정규장(평일 09:30–16:00 ET): Finnhub → Yahoo(시간외) → Yahoo(정규)
+    - 그 밖(프리·애프터마켓·주말): Yahoo(시간외) → Finnhub → Yahoo(정규)
+    두 조회는 병렬이라 서로의 지연을 더하지 않고, 각 소스의 예외는 그 소스만 비운다.
+    """
+    finnhub_quotes: dict[str, dict] = {}
+    extended: dict[str, dict] = {}
+    finnhub_ok = finnhub_client.is_enabled()
+    extended_ok = extended_quotes.is_enabled()
+    if not finnhub_ok and not extended_ok:
+        return {}
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="us-quote") as pool:
+        jobs = {}
+        if finnhub_ok:
+            jobs["finnhub"] = pool.submit(finnhub_client.get_quotes, symbols,
+                                           max_workers=max_workers)
+        if extended_ok:
+            jobs["extended"] = pool.submit(extended_quotes.get_quotes, symbols,
+                                           max_workers=max_workers)
+        for name, future in jobs.items():
+            try:
+                result = future.result() or {}
+            except Exception as exc:  # 한 소스 장애가 다른 소스·스크리닝을 막지 않는다
+                logger.warning("%s 시세 실패: %s: %s", name, type(exc).__name__, str(exc)[:160])
+                result = {}
+            if name == "finnhub":
+                finnhub_quotes = result
+            else:
+                extended = result
+
+    regular_session = extended_quotes.is_us_regular_session()
+    out: dict[str, dict] = {}
+    for sym in symbols:
+        ext_quote = extended.get(sym)
+        ext_only = ext_quote if (ext_quote or {}).get("session") == "extended" else None
+        if regular_session:
+            pick = finnhub_quotes.get(sym) or ext_only or ext_quote
+        else:
+            pick = ext_only or finnhub_quotes.get(sym) or ext_quote
+        if pick:
+            out[sym] = dict(pick)
+    return out
 
 
 def source_of(quote) -> str:

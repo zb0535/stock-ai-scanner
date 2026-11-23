@@ -24,6 +24,7 @@ import kospi200_scanner
 import naver_finance
 import history_store
 import realtime_quotes
+import extended_quotes
 import sector_pe
 from finnhub_client import status as finnhub_status
 
@@ -417,6 +418,7 @@ def health():
             "sector_pe_samples": sector_pe.sample_status(),
             "realtime": {"enabled": realtime_quotes.is_enabled(),
                          "ttl_sec": realtime_quotes.REALTIME_TTL},
+            "extended_quotes": extended_quotes.status(),
             "yahoo_guard": _yahoo_guard(),
             "errors_recent": recent_errors()}
 
@@ -778,7 +780,8 @@ def screen_stocks(req: ScreenRequest):
             _mark("realtime_ms", started)
 
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="screen") as pool:
-        rows_future = pool.submit(stock_tools.bounded_map, _screen_row, tickers)
+        rows_future = pool.submit(stock_tools.bounded_map, _screen_row, tickers,
+                                  stock_tools.screen_workers_for(tickers))
         quotes_future = pool.submit(_load_quotes)
         rows = rows_future.result()
         quotes_future.result()
