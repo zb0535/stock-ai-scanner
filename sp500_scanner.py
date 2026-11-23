@@ -64,7 +64,7 @@ HISTORY_PRIME_TTL = PRESCAN_TTL
 # 주요 전략 상위 후보의 지표를 미리 받아 30분 캐시에 넣어 두면 사용자 요청은 캐시만 읽는다.
 # SEC 원본이 커서(512MB Render) 동시 2개·30종목으로 제한한다 — KOSPI(네이버, 동시 3)보다 보수적이다.
 FUND_PREWARM_ENV = "SP500_FUND_PREWARM"
-FUND_PREWARM_LIMIT = max(0, int(os.environ.get("SP500_FUND_PREWARM_LIMIT", "30")))
+FUND_PREWARM_LIMIT = max(0, int(os.environ.get("SP500_FUND_PREWARM_LIMIT", "45")))
 FUND_PREWARM_WORKERS = max(1, int(os.environ.get("SP500_FUND_PREWARM_WORKERS", "2")))
 _FUND_PREWARM_LOCK = threading.Lock()
 _FUND_PREWARM_STATE: dict = {"thread": None, "last": 0.0, "warmed": 0}
@@ -487,22 +487,25 @@ def cache_status() -> dict:
 def _warm_candidate_metrics(rows: list[dict]) -> dict:
     """후보군의 지표·재무를 미리 받는다(네트워크 I/O, 백그라운드 스레드에서만 호출).
 
-    예열 대상은 주요 전략(가치·성장·모멘텀) 상위 후보의 합집합이다. 이미 캐시에 있는 종목은
-    건너뛰고, 동시 `FUND_PREWARM_WORKERS`개로 나눠 부른다.
+    예열 대상은 (전략 × 세부 조건) 조합의 상위 후보 합집합이다. 조건이 붙으면 순위가 달라져
+    (예: 'PER이 낮고 상승추세'는 가치 단독과 다른 종목을 고른다) 전략만으로는 놓친다.
+    이미 캐시에 있는 종목은 건너뛰고, 동시 `FUND_PREWARM_WORKERS`개로 나눠 부른다.
     반환: `{"targets", "warmed", "elapsed_sec"}`
     """
     started = time.time()
     targets: list[str] = []
+    intents_variants = (None, ["uptrend"], ["downtrend"], ["volume_surge"], ["golden_cross"])
     for strategy in ("value", "growth", "momentum"):
-        try:
-            ranked = rank_rows(rows, strategy, top_n=TOP_N)
-        except Exception as exc:
-            logger.warning("S&P 500 재무 예열 후보 계산 실패(%s): %s", strategy, type(exc).__name__)
-            continue
-        for row in ranked:
-            ticker = str(row.get("ticker") or "").strip()
-            if ticker and ticker not in targets:
-                targets.append(ticker)
+        for intents in intents_variants:
+            try:
+                ranked = rank_rows(rows, strategy, top_n=TOP_N, intents=intents)
+            except Exception as exc:
+                logger.warning("S&P 500 재무 예열 후보 계산 실패(%s): %s", strategy, type(exc).__name__)
+                continue
+            for row in ranked:
+                ticker = str(row.get("ticker") or "").strip()
+                if ticker and ticker not in targets:
+                    targets.append(ticker)
 
     pending = [t for t in targets if not stock_tools.has_metrics(t)][:FUND_PREWARM_LIMIT]
     warmed = 0

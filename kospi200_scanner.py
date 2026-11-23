@@ -208,23 +208,25 @@ def _wait_for_sp500(timeout: float | None = None) -> bool:
 def _warm_candidate_fundamentals(rows: list[dict]) -> dict:
     """후보군의 네이버 재무를 미리 받는다(네트워크 I/O, 백그라운드 스레드에서만 호출).
 
-    예열 대상을 고르는 기준: 주요 전략(가치·성장·모멘텀) 상위 후보의 합집합. 어떤 조건으로
-    발굴해도 상위 15개는 이 안에서 나오기 때문이다. 이미 캐시에 있으면 건너뛰고, 동시 3개로
-    나눠 부른다(네이버에 부담을 주지 않게).
+    예열 대상을 고르는 기준: (전략 × 세부 조건) 조합의 상위 후보 합집합. 조건이 붙으면 순위가
+    달라지므로(예: 'PER이 낮고 상승추세'는 가치 단독과 다른 종목을 고른다) 전략만으로는 놓친다.
+    이미 캐시에 있으면 건너뛰고, 동시 3개로 나눠 부른다(네이버에 부담을 주지 않게).
     반환: `{"targets", "warmed", "elapsed_sec"}`
     """
     started = time.time()
     targets: list[str] = []
+    intents_variants = (None, ["uptrend"], ["downtrend"], ["volume_surge"], ["golden_cross"])
     for strategy in ("value", "growth", "momentum"):
-        try:
-            ranked = sp500_scanner.rank_rows(rows, strategy, top_n=TOP_N)
-        except Exception as exc:  # 한 전략이 실패해도 나머지는 예열한다
-            logger.warning("코스피 재무 예열 후보 계산 실패(%s): %s", strategy, type(exc).__name__)
-            continue
-        for row in ranked:
-            ticker = str(row.get("ticker") or "").strip()
-            if ticker and ticker not in targets:
-                targets.append(ticker)
+        for intents in intents_variants:
+            try:
+                ranked = sp500_scanner.rank_rows(rows, strategy, top_n=TOP_N, intents=intents)
+            except Exception as exc:  # 한 전략이 실패해도 나머지는 예열한다
+                logger.warning("코스피 재무 예열 후보 계산 실패(%s): %s", strategy, type(exc).__name__)
+                continue
+            for row in ranked:
+                ticker = str(row.get("ticker") or "").strip()
+                if ticker and ticker not in targets:
+                    targets.append(ticker)
 
     pending = [t for t in targets if not naver_finance.has_fundamentals(t)][:FUND_PREWARM_LIMIT]
     warmed = 0
