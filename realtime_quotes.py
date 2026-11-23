@@ -134,7 +134,8 @@ def _us_quotes(symbols: list[str], max_workers: int = QUOTE_WORKERS) -> dict[str
     if not finnhub_ok and not extended_ok:
         return {}
 
-    if extended_quotes.is_us_regular_session():
+    regular_session = extended_quotes.is_us_regular_session()
+    if regular_session:
         order = [("finnhub", finnhub_ok), ("extended", extended_ok)]
     else:
         order = [("extended", extended_ok), ("finnhub", finnhub_ok)]
@@ -155,8 +156,13 @@ def _us_quotes(symbols: list[str], max_workers: int = QUOTE_WORKERS) -> dict[str
             logger.warning("%s 시세 실패: %s: %s", name, type(exc).__name__, str(exc)[:160])
             got = {}
         for sym, quote in (got or {}).items():
-            if sym in pending and quote:
-                out[sym] = dict(quote)
+            if sym not in pending or not quote:
+                continue
+            # 정규장 중에는 어제 시간외 체결가를 끌어오지 않는다 — 네이버가 Finnhub 실패 종목을
+            # 보충할 때는 정규장가(`session="regular"`)만 쓴다.
+            if regular_session and name == "extended" and quote.get("session") == "extended":
+                continue
+            out[sym] = dict(quote)
     return out
 
 

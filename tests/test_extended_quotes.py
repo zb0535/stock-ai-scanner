@@ -259,3 +259,31 @@ class MergePolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegularSessionFillTests(unittest.TestCase):
+    """정규장 중 네이버가 보충할 때는 정규장가만 쓴다(어제 시간외 체결가 금지)."""
+
+    def setUp(self):
+        realtime_quotes.clear_cache()
+        self.addCleanup(extended_quotes.clear_cache)
+
+    def test_extended_session_quote_is_not_used_as_regular_fill(self):
+        extended = {"MNST": {"price": 43.27, "source": "naver_prepost", "session": "extended"}}
+        with patch.object(realtime_quotes.finnhub_client, "is_enabled", return_value=True), \
+                patch.object(realtime_quotes.finnhub_client, "get_quotes", return_value={}), \
+                patch.object(realtime_quotes.extended_quotes, "is_enabled", return_value=True), \
+                patch.object(realtime_quotes.extended_quotes, "get_quotes", return_value=extended), \
+                patch.object(realtime_quotes.extended_quotes, "is_us_regular_session", return_value=True):
+            out = realtime_quotes.get_prices(["MNST"])
+        self.assertEqual(out, {})            # 일봉 종가가 남는다(잘못된 시간외가를 쓰지 않는다)
+
+    def test_regular_price_from_naver_fills_missing_finnhub(self):
+        extended = {"MNST": {"price": 43.69, "source": "naver_quote", "session": "regular"}}
+        with patch.object(realtime_quotes.finnhub_client, "is_enabled", return_value=True), \
+                patch.object(realtime_quotes.finnhub_client, "get_quotes", return_value={}), \
+                patch.object(realtime_quotes.extended_quotes, "is_enabled", return_value=True), \
+                patch.object(realtime_quotes.extended_quotes, "get_quotes", return_value=extended), \
+                patch.object(realtime_quotes.extended_quotes, "is_us_regular_session", return_value=True):
+            out = realtime_quotes.get_prices(["MNST"])
+        self.assertEqual(out["MNST"]["price"], 43.69)
