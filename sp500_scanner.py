@@ -30,6 +30,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import requests
@@ -56,6 +57,17 @@ DOWNLOAD_TIMEOUT = 25       # 청크 하나의 yfinance 타임아웃(초)
 # 스냅샷(PRESCAN_TTL 70분)과 같게 둔다. 그러면 스냅샷이 살아 있는 동안
 # `get_stock_metrics`·`_attach_chart`는 같은 일봉을 **다시 받지 않는다**.
 HISTORY_PRIME_TTL = PRESCAN_TTL
+
+# 발굴 후보의 재무 지표를 미리 받아 두는 작업(백그라운드).
+# 왜: `/api/screen`의 `rows_ms`는 종목당 재무 파이프라인(Yahoo t.info 차단 시 SEC companyfacts
+# 다운로드)을 기다리는 시간이다. Render에서 처음 보는 15종목이면 20초를 넘겼다. 예열 주기마다
+# 주요 전략 상위 후보의 지표를 미리 받아 30분 캐시에 넣어 두면 사용자 요청은 캐시만 읽는다.
+# SEC 원본이 커서(512MB Render) 동시 2개·30종목으로 제한한다 — KOSPI(네이버, 동시 3)보다 보수적이다.
+FUND_PREWARM_ENV = "SP500_FUND_PREWARM"
+FUND_PREWARM_LIMIT = max(0, int(os.environ.get("SP500_FUND_PREWARM_LIMIT", "30")))
+FUND_PREWARM_WORKERS = max(1, int(os.environ.get("SP500_FUND_PREWARM_WORKERS", "2")))
+_FUND_PREWARM_LOCK = threading.Lock()
+_FUND_PREWARM_STATE: dict = {"thread": None, "last": 0.0, "warmed": 0}
 
 # 스캔 결과에 남기는 지표 키(재무 지표는 프리 스캔에 없다).
 TECH_FIELDS = (
@@ -472,6 +484,78 @@ def cache_status() -> dict:
     }
 
 
+def _warm_candidate_metrics(rows: list[dict]) -> dict:
+    """후보군의 지표·재무를 미리 받는다(네트워크 I/O, 백그라운드 스레드에서만 호출).
+
+    예열 대상은 주요 전략(가치·성장·모멘텀) 상위 후보의 합집합이다. 이미 캐시에 있는 종목은
+    건너뛰고, 동시 `FUND_PREWARM_WORKERS`개로 나눠 부른다.
+    반환: `{"targets", "warmed", "elapsed_sec"}`
+    """
+    started = time.time()
+    targets: list[str] = []
+    for strategy in ("value", "growth", "momentum"):
+        try:
+            ranked = rank_rows(rows, strategy, top_n=TOP_N)
+        except Exception as exc:
+            logger.warning("S&P 500 재무 예열 후보 계산 실패(%s): %s", strategy, type(exc).__name__)
+            continue
+        for row in ranked:
+            ticker = str(row.get("ticker") or "").strip()
+            if ticker and ticker not in targets:
+                targets.append(ticker)
+
+    pending = [t for t in targets if not stock_tools.has_metrics(t)][:FUND_PREWARM_LIMIT]
+    warmed = 0
+    if pending:
+        try:
+            with ThreadPoolExecutor(max_workers=min(FUND_PREWARM_WORKERS, len(pending)),
+                                    thread_name_prefix="sp500-warm") as pool:
+                for _ in pool.map(stock_tools.get_stock_metrics, pending):
+                    warmed += 1
+        except Exception as exc:  # 예열 실패가 예열 루프를 죽이지 않는다
+            logger.warning("S&P 500 재무 예열 실패: %s: %s", type(exc).__name__, str(exc)[:120])
+    elapsed = round(time.time() - started, 1)
+    logger.info("S&P 500 재무 예열: 대상 %d종목 중 %d종목 새로 받음 %.1fs", len(pending), warmed, elapsed)
+    return {"targets": len(targets), "warmed": warmed, "elapsed_sec": elapsed}
+
+
+def _start_metric_prewarm(rows: list[dict]) -> bool:
+    """재무 예열을 백그라운드로 시작한다(이미 돌고 있으면 건너뛴다)."""
+    if (os.environ.get(FUND_PREWARM_ENV) or "1").strip() in ("0", "false", "no", "off"):
+        return False
+    if FUND_PREWARM_LIMIT <= 0 or not rows:
+        return False
+    with _FUND_PREWARM_LOCK:
+        thread = _FUND_PREWARM_STATE.get("thread")
+        if thread is not None and thread.is_alive():
+            return False
+
+        def _run() -> None:
+            try:
+                _FUND_PREWARM_STATE["warmed"] = _warm_candidate_metrics(list(rows))["warmed"]
+            finally:
+                _FUND_PREWARM_STATE["last"] = time.time()
+
+        worker = threading.Thread(target=_run, name="sp500-fund-prewarm", daemon=True)
+        _FUND_PREWARM_STATE["thread"] = worker
+        worker.start()
+    return True
+
+
+def fundamental_prewarm_status() -> dict:
+    """`GET /` 진단용 — 재무 예열 상태(종목 수·마지막 시간)."""
+    with _FUND_PREWARM_LOCK:
+        thread = _FUND_PREWARM_STATE.get("thread")
+        return {"enabled": (os.environ.get(FUND_PREWARM_ENV) or "1").strip()
+                           not in ("0", "false", "no", "off"),
+                "limit": FUND_PREWARM_LIMIT,
+                "workers": FUND_PREWARM_WORKERS,
+                "running": bool(thread is not None and thread.is_alive()),
+                "warmed_last": _FUND_PREWARM_STATE.get("warmed", 0),
+                "last_sec": (round(time.time() - _FUND_PREWARM_STATE["last"])
+                             if _FUND_PREWARM_STATE.get("last") else None)}
+
+
 def prewarm_once(max_age: float | None = None) -> dict:
     """한 번 예열한다 = 필요하면 스냅샷을 새로 만든다.
 
@@ -521,6 +605,7 @@ def prewarm_once(max_age: float | None = None) -> dict:
     if ok:
         logger.info("S&P 500 예열 완료: %d종목 캐시=%s %.1fs",
                     len(rows), result.get("cached"), elapsed)
+        _start_metric_prewarm(rows)   # 후보 재무를 백그라운드로 미리 받아 둔다
     else:
         logger.warning("S&P 500 예열 실패 → 직전 스냅샷(%d종목) 유지", len(rows))
     return {"ok": ok, "scanned": not result.get("cached"), "tickers": len(rows),

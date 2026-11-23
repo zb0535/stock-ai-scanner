@@ -672,6 +672,17 @@ def _metrics_ttl(payload: dict) -> float:
     return PARTIAL_TTL
 
 
+def has_metrics(ticker: str) -> bool:
+    """지표·재무 결과가 캐시에 살아 있는지(예열·중복 조회 판단용)."""
+    sym = (ticker or "").strip().upper()
+    if not sym:
+        return False
+    now = time.time()
+    with _CACHE_LOCK:
+        cached = _METRICS_CACHE.get(sym)
+    return bool(cached and now - cached[0] < _metrics_ttl(cached[1]))
+
+
 def _trend_text(price, ma20, ma60) -> str:
     """현재가·20일선·60일선 배열로 추세 문구를 만든다(실시간가 재판정에도 같은 문구를 쓴다)."""
     if ma20 is None or ma60 is None or price is None:

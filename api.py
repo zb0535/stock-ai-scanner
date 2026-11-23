@@ -413,6 +413,7 @@ def health():
             "finnhub": finnhub_status(),
             "storage_backend": history_store.storage_backend(),
             "sp500_cache": sp500_scanner.cache_status(),
+            "sp500_fund_prewarm": sp500_scanner.fundamental_prewarm_status(),
             "kospi200_cache": kospi200_scanner.cache_status(),
             "kospi200_fund_prewarm": kospi200_scanner.fundamental_prewarm_status(),
             "analysis_cache": analysis_cache_status(),

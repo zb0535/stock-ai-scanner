@@ -59,3 +59,26 @@ class FundamentalPrewarmTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Sp500MetricPrewarmTests(unittest.TestCase):
+    """S&P 500도 같은 방식으로 후보 지표를 미리 받는다(한도·동시성은 더 보수적)."""
+
+    def test_warms_union_and_skips_cached(self):
+        rows = [{"ticker": t} for t in ("AAA", "BBB", "CCC")]
+        with patch.object(kospi200_scanner.sp500_scanner, "rank_rows",
+                          side_effect=lambda rows, strategy, top_n=15: [{"ticker": "AAA"},
+                                                                        {"ticker": "BBB"}]), \
+                patch.object(kospi200_scanner.sp500_scanner.stock_tools, "has_metrics",
+                             side_effect=lambda t: t == "BBB"), \
+                patch.object(kospi200_scanner.sp500_scanner.stock_tools, "get_stock_metrics",
+                             return_value={}) as get_metrics:
+            out = kospi200_scanner.sp500_scanner._warm_candidate_metrics(rows)
+
+        self.assertEqual(out["targets"], 2)
+        self.assertEqual(out["warmed"], 1)
+        get_metrics.assert_called_once_with("AAA")
+
+    def test_switch_off_starts_nothing(self):
+        with patch.dict(os.environ, {"SP500_FUND_PREWARM": "0"}):
+            self.assertFalse(kospi200_scanner.sp500_scanner._start_metric_prewarm([{"ticker": "AAA"}]))
