@@ -462,9 +462,9 @@ def clear_positions(db_path: str | None = None) -> int:
 # --- 체결 ---------------------------------------------------------------------
 
 
-def record_trade(trade: dict, db_path: str | None = None) -> dict:
-    """체결 한 건을 남긴다(BUY/SELL). `amount_krw`는 원화 환산 금액(양수)."""
-    payload = {
+def _trade_payload(trade: dict) -> dict:
+    """체결 dict → DB 컬럼 순서가 고정된 payload."""
+    return {
         "run_id": trade.get("run_id") or "",
         "trade_date": trade.get("trade_date") or kst_today_str(),
         "traded_at": trade.get("traded_at") or _now(),
@@ -482,18 +482,106 @@ def record_trade(trade: dict, db_path: str | None = None) -> dict:
         "reason": (trade.get("reason") or "")[:400],
         "ai_source": trade.get("ai_source") or "",
     }
+
+
+def _insert_trade(conn, backend: str, payload: dict) -> int | None:
+    """이미 열린 연결(트랜잭션) 안에서 체결 한 행을 넣고 id를 돌려준다."""
     columns = ", ".join(payload)
     marks = ", ".join("?" for _ in payload)
+    values = tuple(payload.values())
+    if backend == "postgres":
+        row = conn.execute(
+            _sql(f"INSERT INTO {TABLE_TRADES} ({columns}) VALUES ({marks}) RETURNING id", backend),
+            values).fetchone()
+        return (row or {}).get("id") if isinstance(row, dict) else None
+    cur = conn.execute(f"INSERT INTO {TABLE_TRADES} ({columns}) VALUES ({marks})", values)
+    return getattr(cur, "lastrowid", None)
+
+
+def record_trade(trade: dict, db_path: str | None = None) -> dict:
+    """체결 한 건을 남긴다(BUY/SELL). `amount_krw`는 원화 환산 금액(양수)."""
+    payload = _trade_payload(trade)
     with _connection(db_path, write=True) as (conn, backend):
-        if backend == "postgres":
-            row = conn.execute(
-                f"INSERT INTO {TABLE_TRADES} ({columns}) VALUES ({marks}) RETURNING id",
-                tuple(payload.values())).fetchone()
-            payload["id"] = (row or {}).get("id") if isinstance(row, dict) else None
+        payload["id"] = _insert_trade(conn, backend, payload)
+    return payload
+
+
+def apply_buy(ticker: str, market: str, name: str, currency: str, shares: float, price: float,
+              fx_rate: float, cost_krw: float, reason: str, cash_after: float,
+              trade: dict, db_path: str | None = None) -> dict:
+    """매수 체결을 **한 트랜잭션으로** 반영한다(포지션 + 계좌 현금 + 체결 기록).
+
+    중간에 실패해도 포지션만 늘고 체결 기록이 비는(또는 그 반대의) 어긋난 상태가 남지 않는다.
+    """
+    sym = str(ticker or "").strip().upper()
+    shares = float(shares)
+    price = float(price)
+    cost_krw = float(cost_krw)
+    if not sym or shares <= 0 or price <= 0 or cost_krw <= 0:
+        raise ValueError("invalid_position")
+    if float(cash_after) < -0.01:
+        raise ValueError("cash_below_zero")
+
+    payload = _trade_payload(trade)
+    stamp = _now()
+    with _connection(db_path, write=True) as (conn, backend):
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE ticker = ?", backend), (sym,))
+        existing = _row(cur)
+        if existing:
+            total_shares = float(existing["shares"]) + shares
+            total_cost = float(existing["cost_krw"]) + cost_krw
+            avg_price = (float(existing["avg_price"]) * float(existing["shares"])
+                         + price * shares) / total_shares
+            fx = (float(existing["fx_rate"]) * float(existing["cost_krw"])
+                  + float(fx_rate) * cost_krw) / total_cost
+            conn.execute(
+                _sql(f"UPDATE {TABLE_POSITIONS} SET shares = ?, avg_price = ?, fx_rate = ?,"
+                     " cost_krw = ?, reason = ? WHERE ticker = ?", backend),
+                (total_shares, avg_price, fx, total_cost,
+                 (reason or existing.get("reason") or "")[:400], sym),
+            )
         else:
-            cur = conn.execute(f"INSERT INTO {TABLE_TRADES} ({columns}) VALUES ({marks})",
-                               tuple(payload.values()))
-            payload["id"] = getattr(cur, "lastrowid", None)
+            conn.execute(
+                _sql(f"INSERT INTO {TABLE_POSITIONS} (ticker, market, name, currency, shares,"
+                     " avg_price, fx_rate, cost_krw, reason, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     backend),
+                (sym, market, name or "", currency, shares, price, float(fx_rate), cost_krw,
+                 (reason or "")[:400], stamp),
+            )
+        conn.execute(_sql(f"UPDATE {TABLE_ACCOUNT} SET cash_krw = ?, updated_at = ? WHERE id = ?", backend),
+                     (round(float(cash_after), 2), stamp, ACCOUNT_ID))
+        payload["id"] = _insert_trade(conn, backend, payload)
+    return payload
+
+
+def apply_sell(ticker: str, shares: float, cost_krw_sold: float, cash_after: float,
+               trade: dict, db_path: str | None = None) -> dict:
+    """매도 체결을 한 트랜잭션으로 반영한다(포지션 축소/삭제 + 현금 증가 + 체결 기록)."""
+    sym = str(ticker or "").strip().upper()
+    shares = float(shares)
+    if not sym or shares <= 0:
+        raise ValueError("invalid_position")
+
+    payload = _trade_payload(trade)
+    stamp = _now()
+    with _connection(db_path, write=True) as (conn, backend):
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE ticker = ?", backend), (sym,))
+        position = _row(cur)
+        if not position:
+            raise ValueError("position_not_found")
+        remaining = round(float(position["shares"]) - shares, 8)
+        if remaining <= 0.0000001:
+            conn.execute(_sql(f"DELETE FROM {TABLE_POSITIONS} WHERE ticker = ?", backend), (sym,))
+        else:
+            kept_cost = max(0.0, round(float(position["cost_krw"]) - float(cost_krw_sold), 2))
+            conn.execute(
+                _sql(f"UPDATE {TABLE_POSITIONS} SET shares = ?, cost_krw = ? WHERE ticker = ?", backend),
+                (remaining, kept_cost, sym),
+            )
+        conn.execute(_sql(f"UPDATE {TABLE_ACCOUNT} SET cash_krw = ?, updated_at = ? WHERE id = ?", backend),
+                     (round(float(cash_after), 2), stamp, ACCOUNT_ID))
+        payload["id"] = _insert_trade(conn, backend, payload)
+        payload["remaining_shares"] = 0.0 if remaining <= 0.0000001 else remaining
     return payload
 
 

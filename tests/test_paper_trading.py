@@ -390,6 +390,66 @@ class AutoScheduleTests(PaperCase):
 
 
 # ---------------------------------------------------------------------------
+# 6.5 PostgreSQL SQL (실서버에서 물린 자리표시자 버그 회귀 방지)
+# ---------------------------------------------------------------------------
+
+
+class PostgresSqlTests(unittest.TestCase):
+    """psycopg는 `?`를 모른다 — 모든 문장이 `%s` 자리표시자로 나가야 한다.
+
+    2026-11-24 실서버(Neon)에서 체결 INSERT만 `?`인 채로 나가
+    `the query has 0 placeholders but 15 parameters were passed`로 매수가 기록되지 않았다.
+    """
+
+    class _Cursor:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+        def fetchall(self):
+            return []
+
+    class _Conn:
+        def __init__(self, row=None):
+            self.queries = []
+            self._row = row
+
+        def execute(self, query, params=None):
+            self.queries.append((query, params))
+            return PostgresSqlTests._Cursor(self._row)
+
+    def payload(self):
+        return paper_store._trade_payload({
+            "ticker": "AAPL", "market": "US", "side": "BUY", "shares": 1.5, "price": 100.0,
+            "currency": "USD", "fx_rate": 1300.0, "amount_krw": 195_000.0, "reason": "테스트",
+            "ai_source": "quant",
+        })
+
+    def test_trade_insert_uses_percent_placeholders(self):
+        conn = self._Conn(row={"id": 7})
+        trade_id = paper_store._insert_trade(conn, "postgres", self.payload())
+        query, params = conn.queries[0]
+        self.assertNotIn("?", query)
+        self.assertEqual(query.count("%s"), len(params))
+        self.assertIn("RETURNING id", query)
+        self.assertEqual(trade_id, 7)
+
+    def test_sqlite_keeps_question_marks(self):
+        conn = self._Conn()
+        paper_store._insert_trade(conn, "sqlite", self.payload())
+        query, params = conn.queries[0]
+        self.assertEqual(query.count("?"), len(params))
+        self.assertNotIn("%s", query)
+
+    def test_select_statements_use_percent_placeholders(self):
+        # 조회 경로도 같은 규칙이다(? 를 그대로 보내면 Postgres에서 죽는다).
+        query = paper_store._sql("SELECT * FROM paper_positions WHERE ticker = ?", "postgres")
+        self.assertEqual(query, "SELECT * FROM paper_positions WHERE ticker = %s")
+
+
+# ---------------------------------------------------------------------------
 # 7. 환율 폴백
 # ---------------------------------------------------------------------------
 

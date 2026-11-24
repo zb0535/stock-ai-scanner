@@ -379,7 +379,10 @@ def _quant_plan(candidates: list[dict], cash_krw: float, held: set[str],
 
 def _execute_sell(position: dict, price: float, fx_rate: float, fraction: float, reason: str,
                   run_id: str, source: str, db_path: str | None) -> dict:
-    """포지션 일부/전량 매도 체결. 원화 손익은 매수 시점 환율 기준 원가와 비교한다."""
+    """포지션 일부/전량 매도 체결. 원화 손익은 매수 시점 환율 기준 원가와 비교한다.
+
+    포지션 축소·현금 증가·체결 기록은 `paper_store.apply_sell`이 한 트랜잭션으로 처리한다.
+    """
     currency = position.get("currency") or "USD"
     rate = 1.0 if currency == "KRW" else fx_rate
     held = float(position["shares"])
@@ -389,36 +392,39 @@ def _execute_sell(position: dict, price: float, fx_rate: float, fraction: float,
     shares = min(shares, held)
 
     proceeds_krw = round(shares * float(price) * rate, 2)
-    cost_share = position["cost_krw"] * (shares / held) if held else 0.0
+    cost_share = round(position["cost_krw"] * (shares / held), 2) if held else 0.0
     realized = round(proceeds_krw - cost_share, 2)
+    cash_after = paper_store.get_account(db_path)["cash_krw"] + proceeds_krw
 
-    remaining = paper_store.reduce_position(position["ticker"], shares, db_path)
-    cash = paper_store.get_account(db_path)["cash_krw"] + proceeds_krw
-    paper_store.update_account({"cash_krw": cash}, db_path)
-    trade = paper_store.record_trade({
-        "run_id": run_id,
-        "trade_date": paper_store.kst_today_str(),
-        "ticker": position["ticker"],
-        "market": position.get("market") or market_of(position["ticker"]),
-        "name": position.get("name") or "",
-        "side": "SELL",
-        "shares": shares,
-        "price": float(price),
-        "currency": currency,
-        "fx_rate": rate,
-        "amount_krw": proceeds_krw,
-        "realized_pnl_krw": realized,
-        "reason": reason,
-        "ai_source": source,
-    }, db_path)
-    trade["remaining_shares"] = 0.0 if remaining is None else remaining["shares"]
-    return trade
+    return paper_store.apply_sell(
+        position["ticker"], shares, cost_share, cash_after,
+        {
+            "run_id": run_id,
+            "trade_date": paper_store.kst_today_str(),
+            "ticker": position["ticker"],
+            "market": position.get("market") or market_of(position["ticker"]),
+            "name": position.get("name") or "",
+            "side": "SELL",
+            "shares": shares,
+            "price": float(price),
+            "currency": currency,
+            "fx_rate": rate,
+            "amount_krw": proceeds_krw,
+            "realized_pnl_krw": realized,
+            "reason": reason,
+            "ai_source": source,
+        },
+        db_path,
+    )
 
 
 def _execute_buy(symbol: str, market: str, name: str, currency: str, price: float,
                  amount_krw: float, fx_rate: float, reason: str, run_id: str, source: str,
                  db_path: str | None) -> dict | None:
-    """매수 체결 — 현금 한도·최소 주문·수량 단위를 지키고, 불가능하면 None."""
+    """매수 체결 — 현금 한도·최소 주문·수량 단위를 지키고, 불가능하면 None.
+
+    포지션 추가·현금 차감·체결 기록은 `paper_store.apply_buy`가 한 트랜잭션으로 처리한다.
+    """
     account = paper_store.get_account(db_path)
     cash = float(account["cash_krw"])
     budget = min(float(amount_krw), cash)
@@ -437,25 +443,27 @@ def _execute_buy(symbol: str, market: str, name: str, currency: str, price: floa
     if cost_krw < MIN_ORDER_KRW or cost_krw > cash:
         return None
 
-    paper_store.add_position(symbol, market, currency, shares, price, rate, cost_krw,
-                             name=name, reason=reason, db_path=db_path)
-    paper_store.update_account({"cash_krw": round(cash - cost_krw, 2)}, db_path)
-    return paper_store.record_trade({
-        "run_id": run_id,
-        "trade_date": paper_store.kst_today_str(),
-        "ticker": symbol,
-        "market": market,
-        "name": name or "",
-        "side": "BUY",
-        "shares": shares,
-        "price": float(price),
-        "currency": currency,
-        "fx_rate": rate,
-        "amount_krw": cost_krw,
-        "realized_pnl_krw": None,
-        "reason": reason,
-        "ai_source": source,
-    }, db_path)
+    return paper_store.apply_buy(
+        symbol, market, name or "", currency, shares, price, rate, cost_krw,
+        reason, round(cash - cost_krw, 2),
+        {
+            "run_id": run_id,
+            "trade_date": paper_store.kst_today_str(),
+            "ticker": symbol,
+            "market": market,
+            "name": name or "",
+            "side": "BUY",
+            "shares": shares,
+            "price": float(price),
+            "currency": currency,
+            "fx_rate": rate,
+            "amount_krw": cost_krw,
+            "realized_pnl_krw": None,
+            "reason": reason,
+            "ai_source": source,
+        },
+        db_path,
+    )
 
 
 def _valuation(positions: list[dict], prices: dict, sources: dict, fx_rate: float) -> dict:
