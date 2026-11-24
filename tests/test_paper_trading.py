@@ -374,6 +374,12 @@ class AutoScheduleTests(PaperCase):
         self.assertEqual(info["market"], "KR")          # 오늘 15:40 한국이 다음
         self.assertTrue(info["at"].startswith("2026-11-24T15:40"))
 
+    def test_next_auto_says_catch_up_when_due_now(self):
+        account = self.account()          # 오늘 아직 아무 시장도 안 돌았다
+        info = paper_trading.next_auto_info(account, datetime(2026, 11, 24, 19, 30, tzinfo=KST))
+        self.assertEqual(info["market"], "KR")
+        self.assertIn("곧 자동 실행", info["label"])
+
     def test_next_auto_after_all_ran_today(self):
         account = self.account(us="2026-11-24", kr="2026-11-24")
         info = paper_trading.next_auto_info(account, datetime(2026, 11, 24, 20, 0, tzinfo=KST))

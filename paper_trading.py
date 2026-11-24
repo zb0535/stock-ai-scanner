@@ -840,6 +840,14 @@ def next_auto_info(account: dict, now: datetime | None = None) -> dict:
     current = now or datetime.now(KST)
     if current.tzinfo is None:
         current = current.replace(tzinfo=KST)
+    # 지금 시각이 이미 지난 실행 시각이고 오늘 아직 안 돌았으면, 다음 일정이 아니라 '곧 실행'이다
+    # (서버가 그 시각에 꺼져 있었다가 켜지면 자동 루프가 따라잡아 실행한다).
+    due_now = auto_due_markets(account, current)
+    if due_now:
+        label = "한국" if due_now[0] == "KR" else "미국"
+        return {"enabled": True, "market": due_now[0],
+                "at": current.isoformat(timespec="minutes"),
+                "label": f"{label} 시장 · 곧 자동 실행(오늘 몫 따라잡기)"}
     markets = normalize_markets(account.get("markets"))
     options = []
     for market, (hour, minute) in (("KR", KR_RUN_AT), ("US", US_RUN_AT)):
