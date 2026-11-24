@@ -11,6 +11,9 @@
 8. 폴백: AI가 실패하면 정량 점수 상위 종목으로 매수한다
 9. 자동 실행 시각: 한국 15:40·미국 06:20 KST 이후 시장별 하루 1회
 10. HTTP 표면: GET /api/paper/status, POST /api/paper/configure, POST /api/paper/run
+11. 거래 비용: 매수 예산에 수수료 포함(현금 음수 금지)·매도 수수료+증권거래세·실현손익 순액
+12. 순손익(net_pnl)·환차: 지금 팔 때의 순수취액으로 손절·익절을 판정하고 프롬프트에 전달
+13. DB 마이그레이션: 기존 SQLite 파일에 fee_krw 컬럼을 더해도 계좌·체결이 남는다
 
 실행: python -m unittest discover -s tests -v
 """
@@ -167,7 +170,7 @@ class RunTests(PaperCase):
         paper_trading.configure(initial_cash_krw=10_000_000, markets="ALL")
 
     def test_buy_respects_cash_limit(self):
-        """AI가 현금의 3배를 말해도 체결 합계는 현금을 넘지 않는다."""
+        """AI가 현금의 3배를 말해도 체결 합계(수수료 포함)는 현금을 넘지 않는다."""
         ai = self.ai({"market_note": "공격적", "sells": [], "buys": [
             {"ticker": "NVDA", "amount_krw": 20_000_000, "reason": "1위"},
             {"ticker": "AAPL", "amount_krw": 20_000_000, "reason": "2위"},
@@ -177,15 +180,17 @@ class RunTests(PaperCase):
             markets="US", force=True, ai_call=ai,
             candidate_fn=self.candidates({"US": [us("NVDA", 1000), us("AAPL", 200), us("MSFT", 400)]}),
             price_fn=self.prices({"NVDA": 1000, "AAPL": 200, "MSFT": 400}), fx_fn=self.fx())
-        spent = sum(trade["amount_krw"] for trade in result["buys"])
+        spent = sum(trade["settle_krw"] for trade in result["buys"])   # 원금 + 수수료
+        fees = sum(trade["fee_krw"] for trade in result["buys"])
         account = paper_store.get_account()
         self.assertEqual(len(result["buys"]), 3)
+        self.assertGreater(fees, 0)
         self.assertLessEqual(spent, 10_000_000 + 0.01)
         self.assertGreaterEqual(account["cash_krw"], 0)
         self.assertAlmostEqual(account["cash_krw"], 10_000_000 - spent, places=2)
         # 종목 비중 상한(총자산 30%)도 지켜진다.
         for trade in result["buys"]:
-            self.assertLessEqual(trade["amount_krw"], 3_000_000 + 1)
+            self.assertLessEqual(trade["settle_krw"], 3_000_000 + 1)
 
     def test_us_shares_rounded_to_four_decimals(self):
         ai = self.ai({"sells": [], "buys": [{"ticker": "AAPL", "amount_krw": 1_000_000, "reason": "x"}]})
@@ -193,10 +198,12 @@ class RunTests(PaperCase):
                           candidate_fn=self.candidates({"US": [us("AAPL", 211.37)]}),
                           price_fn=self.prices({"AAPL": 211.37}), fx_fn=self.fx(1300))
         position = paper_store.list_positions()[0]
-        # 1,000,000 / (211.37 * 1300) = 3.639261... → 3.6392주(소수점 4자리 버림)
-        self.assertEqual(position["shares"], 3.6392)
+        # 1,000,000은 수수료 포함 예산 → 원금 예산 1,000,000/1.0015 = 998,502.25
+        # / (211.37 * 1300) = 3.63384... → 3.6338주(소수점 4자리 버림)
+        self.assertEqual(position["shares"], 3.6338)
         self.assertEqual(position["currency"], "USD")
-        self.assertAlmostEqual(position["cost_krw"], round(3.6392 * 211.37 * 1300, 2), places=2)
+        principal = round(3.6338 * 211.37 * 1300, 2)
+        self.assertAlmostEqual(position["cost_krw"], round(principal * 1.0015, 2), places=2)
 
     def test_kr_shares_are_integer(self):
         ai = self.ai({"sells": [], "buys": [{"ticker": "005930.KS", "amount_krw": 1_000_000, "reason": "x"}]})
@@ -207,26 +214,32 @@ class RunTests(PaperCase):
         self.assertEqual(position["shares"], 14.0)          # 1,000,000 / 71,300 = 14.02 → 14주
         self.assertEqual(position["currency"], "KRW")
         self.assertEqual(position["fx_rate"], 1.0)
-        self.assertAlmostEqual(position["cost_krw"], 14 * 71_300, places=2)
+        # 원가 = 체결원금 998,200 + 매수 수수료 0.015%(149.73)
+        self.assertAlmostEqual(position["cost_krw"], 998_349.73, places=2)
 
     def test_krw_pnl_includes_fx_move(self):
         """달러 가격이 그대로여도 원/달러가 오르면 원화 수익이 난다."""
-        ai = self.ai({"sells": [], "buys": [{"ticker": "MSFT", "amount_krw": 2_600_000, "reason": "x"}]})
+        ai = self.ai({"sells": [], "buys": [{"ticker": "MSFT", "amount_krw": 2_604_000, "reason": "x"}]})
         paper_trading.run(markets="US", force=True, ai_call=ai,
                           candidate_fn=self.candidates({"US": [us("MSFT", 400)]}),
                           price_fn=self.prices({"MSFT": 400}), fx_fn=self.fx(1300))
         position = paper_store.list_positions()[0]
-        self.assertEqual(position["shares"], 5.0)           # 2,600,000 / (400*1300) = 5주
+        # 수수료 포함 예산 2,604,000 → 원금 예산 2,600,099 → 약 5주(소수점 4자리)
+        self.assertAlmostEqual(position["shares"], 5.0, places=3)
+        cost = position["cost_krw"]
+        self.assertAlmostEqual(cost, round(5.0001 * 400 * 1300 * 1.0015, 2), places=2)
 
         # 가격 그대로, 환율 1,300 → 1,430 (+10%)
         body = paper_trading.status(price_fn=self.prices({"MSFT": 400}), fx_fn=self.fx(1430))
         row = body["positions"][0]
-        self.assertAlmostEqual(row["market_value_krw"], 5 * 400 * 1430, places=2)
-        self.assertAlmostEqual(row["cost_krw"], 2_600_000, places=2)
-        self.assertAlmostEqual(row["pnl_pct"], 10.0, places=2)   # 환차만으로 +10%
+        value = round(position["shares"] * 400 * 1430, 2)
+        self.assertAlmostEqual(row["market_value_krw"], value, places=2)
+        self.assertAlmostEqual(row["cost_krw"], cost, places=2)
+        self.assertAlmostEqual(row["pnl_pct"], round((value - cost) / cost * 100, 2), places=2)
+        self.assertAlmostEqual(row["fx_change_pct"], 10.0, places=2)   # 환차만으로 +10%
+        total = value + (10_000_000 - cost)
         self.assertAlmostEqual(body["account"]["total_return_pct"],
-                               round((5 * 400 * 1430 + 7_400_000 - 10_000_000) / 10_000_000 * 100, 2),
-                               places=2)
+                               round((total - 10_000_000) / 10_000_000 * 100, 2), places=2)
 
     def test_stop_loss_sells_position(self):
         paper_store.add_position("AAPL", "US", "USD", 10.0, 200.0, 1300.0, 2_600_000.0)
@@ -238,9 +251,14 @@ class RunTests(PaperCase):
         sell = result["sells"][0]
         self.assertEqual(sell["side"], "SELL")
         self.assertEqual(sell["shares"], 10.0)
-        self.assertAlmostEqual(sell["realized_pnl_krw"], -260_000, places=2)   # -10%
+        # 총대금 2,340,000 - 미국 매도비용 0.15%(3,510) = 2,336,490 입금
+        self.assertAlmostEqual(sell["amount_krw"], 2_340_000, places=2)
+        self.assertAlmostEqual(sell["fee_krw"], 3_510, places=2)
+        self.assertAlmostEqual(sell["settle_krw"], 2_336_490, places=2)
+        self.assertAlmostEqual(sell["realized_pnl_krw"], -263_510, places=2)   # -10% + 수수료
         self.assertEqual(paper_store.list_positions(), [])
-        self.assertAlmostEqual(paper_store.get_account()["cash_krw"], 10_000_000 - 260_000, places=2)
+        self.assertAlmostEqual(paper_store.get_account()["cash_krw"],
+                               7_400_000 + 2_336_490, places=2)
 
     def test_take_profit_rule_sells(self):
         paper_store.add_position("005930.KS", "KR", "KRW", 10.0, 70_000.0, 1.0, 700_000.0)
@@ -249,7 +267,9 @@ class RunTests(PaperCase):
                                    candidate_fn=self.candidates({"KR": []}),
                                    price_fn=self.prices({"005930.KS": 90_000}), fx_fn=self.fx())
         self.assertEqual(len(result["sells"]), 1)
-        self.assertAlmostEqual(result["sells"][0]["realized_pnl_krw"], 200_000, places=2)
+        # 총대금 900,000 - 한국 매도비용 0.195%(1,755) = 898,245 → 실현 198,245
+        self.assertAlmostEqual(result["sells"][0]["fee_krw"], 1_755, places=2)
+        self.assertAlmostEqual(result["sells"][0]["realized_pnl_krw"], 198_245, places=2)
 
     def test_ai_partial_sell_keeps_fraction(self):
         paper_store.add_position("AAPL", "US", "USD", 10.0, 100.0, 1300.0, 1_300_000.0)
@@ -447,10 +467,184 @@ class ConcurrencyTests(PaperCase):
             "005930.KS", 4.0, 280_000.0, 400_000.0,
             {"ticker": "005930.KS", "market": "KR", "side": "SELL", "shares": 4.0,
              "price": 100_000.0, "currency": "KRW", "fx_rate": 1.0, "amount_krw": 400_000.0,
-             "realized_pnl_krw": 120_000.0},
+             "fee_krw": 780.0, "realized_pnl_krw": 119_220.0},
         )
         self.assertAlmostEqual(paper_store.get_account()["cash_krw"], 9_700_000, places=2)
         self.assertAlmostEqual(paper_store.list_positions()[0]["shares"], 6.0, places=4)
+        self.assertAlmostEqual(paper_store.recent_trades()[0]["fee_krw"], 780.0, places=2)
+
+
+# ---------------------------------------------------------------------------
+# 5.6 거래 비용 — 수수료(한국 0.015/0.195% · 미국 0.15%) · 증권거래세 · 환차
+# ---------------------------------------------------------------------------
+
+
+class FeeTests(PaperCase):
+    def setUp(self):
+        super().setUp()
+        paper_trading.configure(initial_cash_krw=10_000_000, markets="ALL")
+
+    def test_fee_policy_constants_match_the_korean_standard(self):
+        policy = paper_trading.fee_policy()
+        self.assertEqual(policy["KR"]["buy"]["total_pct"], 0.015)
+        self.assertEqual(policy["KR"]["sell"]["commission_pct"], 0.015)
+        self.assertEqual(policy["KR"]["sell"]["tax_pct"], 0.18)
+        self.assertEqual(policy["KR"]["sell"]["total_pct"], 0.195)
+        self.assertEqual(policy["US"]["buy"]["total_pct"], 0.15)
+        self.assertEqual(policy["US"]["sell"]["total_pct"], 0.15)
+        # 표(%)와 계산에 쓰는 비율이 어긋나지 않는다.
+        self.assertAlmostEqual(paper_trading.BUY_FEE_RATE["KR"] * 100, 0.015, places=9)
+        self.assertAlmostEqual(paper_trading.SELL_FEE_RATE["KR"] * 100, 0.195, places=9)
+        self.assertAlmostEqual(paper_trading.BUY_FEE_RATE["US"] * 100, 0.15, places=9)
+        self.assertAlmostEqual(paper_trading.SELL_FEE_RATE["US"] * 100, 0.15, places=9)
+        self.assertAlmostEqual(paper_trading.BUY_FEE_RATE["KR"] + paper_trading.SELL_TAX_RATE["KR"],
+                               paper_trading.SELL_FEE_RATE["KR"], places=9)
+
+    def test_buy_spends_principal_plus_fee_within_budget(self):
+        """현금 전부를 쓰라고 해도 원금+수수료가 현금을 넘지 않고, 잔고가 음수가 되지 않는다."""
+        ai = self.ai({"sells": [], "buys": [{"ticker": "005930.KS", "amount_krw": 10_000_000,
+                                               "reason": "전액"}]})
+        result = paper_trading.run(markets="KR", force=True, ai_call=ai,
+                                   candidate_fn=self.candidates({"KR": [kr("005930.KS", 71_300)]}),
+                                   price_fn=self.prices({"005930.KS": 71_300}), fx_fn=self.fx())
+        buy = result["buys"][0]
+        self.assertAlmostEqual(buy["settle_krw"], buy["amount_krw"] + buy["fee_krw"], places=2)
+        self.assertLessEqual(buy["settle_krw"], 10_000_000 + 0.01)
+        self.assertAlmostEqual(buy["fee_krw"], round(buy["amount_krw"] * 0.00015, 2), places=2)
+        account = paper_store.get_account()
+        self.assertGreaterEqual(account["cash_krw"], 0)
+        self.assertAlmostEqual(account["cash_krw"], 10_000_000 - buy["settle_krw"], places=2)
+        # 원가(수수료 포함)가 포지션에 그대로 들어간다.
+        self.assertAlmostEqual(paper_store.list_positions()[0]["cost_krw"], buy["settle_krw"], places=2)
+
+    def test_kr_sell_deducts_commission_and_tax(self):
+        paper_store.add_position("005930.KS", "KR", "KRW", 10.0, 70_000.0, 1.0, 700_000.0)
+        paper_store.update_account({"cash_krw": 9_300_000})
+        ai = self.ai({"sells": [{"ticker": "005930.KS", "fraction": 1.0, "reason": "정리"}], "buys": []})
+        result = paper_trading.run(markets="KR", force=True, ai_call=ai,
+                                   candidate_fn=self.candidates({"KR": []}),
+                                   price_fn=self.prices({"005930.KS": 100_000}), fx_fn=self.fx())
+        sell = result["sells"][0]
+        self.assertAlmostEqual(sell["amount_krw"], 1_000_000, places=2)      # 총 매도대금
+        self.assertAlmostEqual(sell["fee_krw"], 1_950, places=2)             # 0.195%
+        self.assertAlmostEqual(sell["settle_krw"], 998_050, places=2)        # 실제 입금
+        self.assertAlmostEqual(sell["realized_pnl_krw"], 298_050, places=2)  # 30만 원 - 비용
+        self.assertAlmostEqual(paper_store.get_account()["cash_krw"],
+                               9_300_000 + 998_050, places=2)
+
+    def test_us_sell_deducts_commission_and_fx_spread(self):
+        paper_store.add_position("AAPL", "US", "USD", 10.0, 100.0, 1300.0, 1_300_000.0)
+        paper_store.update_account({"cash_krw": 8_700_000})
+        ai = self.ai({"sells": [{"ticker": "AAPL", "fraction": 1.0, "reason": "정리"}], "buys": []})
+        result = paper_trading.run(markets="US", force=True, ai_call=ai,
+                                   candidate_fn=self.candidates({"US": []}),
+                                   price_fn=self.prices({"AAPL": 110}), fx_fn=self.fx(1300))
+        sell = result["sells"][0]
+        self.assertAlmostEqual(sell["amount_krw"], 1_430_000, places=2)
+        self.assertAlmostEqual(sell["fee_krw"], 2_145, places=2)             # 0.15%
+        self.assertAlmostEqual(sell["settle_krw"], 1_427_855, places=2)
+        self.assertAlmostEqual(sell["realized_pnl_krw"], 127_855, places=2)
+
+    def test_net_pnl_reflects_fx_loss_and_sell_cost(self):
+        """달러 가격이 그대로여도 환율이 내리면 순손실 — 수수료까지 더해 진다."""
+        paper_store.add_position("MSFT", "US", "USD", 10.0, 100.0, 1300.0, 1_300_000.0)
+        paper_store.update_account({"cash_krw": 8_700_000})
+        body = paper_trading.status(price_fn=self.prices({"MSFT": 100}), fx_fn=self.fx(1250))
+        row = body["positions"][0]
+        self.assertAlmostEqual(row["market_value_krw"], 1_250_000, places=2)
+        self.assertAlmostEqual(row["pnl_pct"], -3.85, places=2)              # 주가·환율만
+        self.assertAlmostEqual(row["fx_change_pct"], -3.85, places=2)        # 환차만
+        self.assertAlmostEqual(row["buy_fx_rate"], 1300.0, places=2)
+        self.assertAlmostEqual(row["sell_fee_krw"], 1_875, places=2)         # 0.15%
+        self.assertAlmostEqual(row["net_proceeds_krw"], 1_248_125, places=2)
+        self.assertAlmostEqual(row["net_pnl_krw"], -51_875, places=2)
+        self.assertAlmostEqual(row["net_pnl_pct"], round(-51_875 / 1_300_000 * 100, 2), places=2)
+        # 순손익은 항상 수수료만큼 손해 쪽이다.
+        self.assertLess(row["net_pnl_krw"], row["pnl_krw"])
+
+    def test_stop_loss_triggers_on_net_pnl_not_gross(self):
+        """주가만 보면 -7.9%라 손절 전이지만, 수수료·세금을 빼면 -8%를 넘어 팔린다."""
+        paper_store.add_position("005930.KS", "KR", "KRW", 10.0, 70_000.0, 1.0, 700_000.0)
+        paper_store.update_account({"cash_krw": 9_300_000})
+        flat = paper_trading.status(price_fn=self.prices({"005930.KS": 64_500}), fx_fn=self.fx())
+        row = flat["positions"][0]
+        self.assertGreater(row["pnl_pct"], -8.0)          # 주가 등락만 보면 아직 -8% 아님
+        self.assertLessEqual(row["net_pnl_pct"], -8.0)    # 수수료·세금 반영하면 넘는다
+
+        result = paper_trading.run(markets="KR", force=True,
+                                   ai_call=self.ai({"sells": [], "buys": []}),
+                                   candidate_fn=self.candidates({"KR": []}),
+                                   price_fn=self.prices({"005930.KS": 64_500}), fx_fn=self.fx())
+        self.assertEqual(len(result["sells"]), 1)
+        self.assertIn("순손익", result["sells"][0]["reason"])
+
+    def test_take_profit_rule_counts_fees_too(self):
+        """+25%에 딱 걸친 종목은 수수료를 빼면 익절 기준에 못 미쳐 팔지 않는다."""
+        paper_store.add_position("005930.KS", "KR", "KRW", 10.0, 70_000.0, 1.0, 700_000.0)
+        paper_store.update_account({"cash_krw": 9_300_000})
+        body = paper_trading.status(price_fn=self.prices({"005930.KS": 87_500}), fx_fn=self.fx())
+        self.assertAlmostEqual(body["positions"][0]["pnl_pct"], 25.0, places=2)
+        self.assertLess(body["positions"][0]["net_pnl_pct"], 25.0)
+
+        result = paper_trading.run(markets="KR", force=True,
+                                   ai_call=self.ai({"sells": [], "buys": []}),
+                                   candidate_fn=self.candidates({"KR": []}),
+                                   price_fn=self.prices({"005930.KS": 87_500}), fx_fn=self.fx())
+        self.assertEqual(result["sells"], [])
+
+    def test_prompt_tells_the_ai_the_fee_and_fx_numbers(self):
+        paper_store.add_position("MSFT", "US", "USD", 2.0, 100.0, 1300.0, 260_000.0)
+        paper_store.update_account({"cash_krw": 9_740_000})
+        body = paper_trading.status(price_fn=self.prices({"MSFT": 100}), fx_fn=self.fx(1280))
+        prompt = paper_trading.build_prompt(
+            paper_store.get_account(), ["US"], 9_740_000, 9_996_000,
+            body["positions"], {"US": [us("MSFT", 100)]},
+            {"rate": 1280.0, "source": "test"})
+        for key in ('"net_pnl_krw"', '"net_pnl_pct"', '"buy_fx_rate"', '"current_fx_rate"',
+                    '"fx_change_pct"', '"sell_fee_krw"', '"price_pnl_pct"'):
+            self.assertIn(key, prompt)
+        self.assertIn("0.195%", prompt)      # 한국 매도 비용 안내
+        self.assertIn("0.15%", prompt)       # 미국 매도 비용 안내
+        self.assertIn("환전 스프레드", prompt)
+
+    def test_status_exposes_fee_policy(self):
+        body = paper_trading.status(price_fn=self.prices({}), fx_fn=self.fx())
+        self.assertEqual(body["fee_policy"]["KR"]["sell"]["total_pct"], 0.195)
+        self.assertEqual(body["fee_policy"]["US"]["buy"]["total_pct"], 0.15)
+
+    def test_run_result_exposes_fee_policy_and_trade_fees(self):
+        ai = self.ai({"sells": [], "buys": [{"ticker": "AAPL", "amount_krw": 1_000_000, "reason": "x"}]})
+        result = paper_trading.run(markets="US", force=True, ai_call=ai,
+                                   candidate_fn=self.candidates({"US": [us("AAPL", 200)]}),
+                                   price_fn=self.prices({"AAPL": 200}), fx_fn=self.fx())
+        self.assertEqual(result["fee_policy"]["US"]["buy"]["total_pct"], 0.15)
+        self.assertGreater(result["buys"][0]["fee_krw"], 0)
+
+    def test_legacy_sqlite_file_gains_fee_column_without_losing_rows(self):
+        """기존 계좌·체결은 그대로 두고 fee_krw 컬럼만 안전하게 더한다."""
+        import history_store
+        import sqlite3
+
+        paper_store.add_position("005930.KS", "KR", "KRW", 10.0, 70_000.0, 1.0, 700_000.0)
+        paper_store.update_account({"cash_krw": 9_300_000})
+        paper_store.record_trade({"ticker": "005930.KS", "market": "KR", "side": "BUY",
+                                  "shares": 10.0, "price": 70_000.0, "currency": "KRW",
+                                  "fx_rate": 1.0, "amount_krw": 700_000.0})
+        before_trades = paper_store.recent_trades()
+        self.assertEqual(len(before_trades), 1)
+
+        # 컬럼이 없던 예전 스키마로 되돌린다.
+        with sqlite3.connect(history_store.get_db_path()) as conn:
+            conn.execute("ALTER TABLE paper_trades DROP COLUMN fee_krw")
+        paper_store._SQLITE_READY.discard(history_store.get_db_path())
+
+        trades = paper_store.recent_trades()
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["ticker"], "005930.KS")
+        self.assertEqual(trades[0]["fee_krw"], 0.0)              # 예전 체결은 0
+        self.assertAlmostEqual(trades[0]["settle_krw"], 700_000.0, places=2)
+        self.assertAlmostEqual(paper_store.get_account()["cash_krw"], 9_300_000, places=2)
+        self.assertEqual(len(paper_store.list_positions()), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +760,8 @@ class ApiTests(PaperCase):
         self.assertEqual(body["positions"], [])
         self.assertIn("equity_history", body)
         self.assertEqual(body["storage_backend"], "sqlite")
+        self.assertEqual(body["fee_policy"]["KR"]["sell"]["total_pct"], 0.195)
+        self.assertEqual(body["fee_policy"]["US"]["buy"]["total_pct"], 0.15)
 
     def test_configure_endpoint(self):
         response = self.client.post("/api/paper/configure",

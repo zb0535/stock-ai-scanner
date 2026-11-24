@@ -17,6 +17,16 @@
 - 미국 주식 수량은 **소수점 4자리**(토스증권 소수점 거래 방식), 한국 주식은 **1주 정수**.
 - 현금은 절대 음수가 되지 않는다: 매수 금액을 잔여 현금으로 자르고, 체결 후 잔고를 다시 확인한다.
 
+거래 비용
+---------
+- 실제 한국 개인투자자 기준이다(`FEE_POLICY` 상수).
+  - 한국: 매수 0.015% / 매도 0.015% + 증권거래세 0.18% = **0.195%**
+  - 미국: 수수료 0.1% + 환전 스프레드 0.05% = **0.15%** (매수·매도 동일)
+- 매수는 `체결원금 + 매수수수료 <= 현금`이 되도록 수량을 정하고, 포지션 원가(`cost_krw`)에
+  매수수수료를 넣는다. 매도는 `총매도대금 - (수수료+세금)`만 현금으로 들어오고,
+  `순수취액 - 원가`가 실현손익이다. 즉 손익은 언제나 **수수료·세금·환차를 뺀 순액**이다.
+- 매도 판단(손절·익절·AI)은 주가 등락률이 아니라 **지금 팔 때의 순수익률**(`net_pnl_pct`)을 기준으로 한다.
+
 자동 실행
 --------
 `auto_due_markets()`가 KST 시각과 `last_run_*_date`를 보고 오늘 아직 안 돈 시장을 알려준다.
@@ -61,6 +71,30 @@ MAX_POSITIONS = int(os.environ.get("PAPER_MAX_POSITIONS", "8"))
 MAX_POSITION_WEIGHT = float(os.environ.get("PAPER_MAX_POSITION_WEIGHT", "0.30"))
 MIN_ORDER_KRW = float(os.environ.get("PAPER_MIN_ORDER_KRW", "10000"))
 CANDIDATES_PER_MARKET = int(os.environ.get("PAPER_CANDIDATES", "10"))
+
+# --- 거래 비용(수수료·증권거래세·환전 스프레드) -------------------------------
+# 실제 한국 개인투자자 기준으로 맞춘 값이다. 화면 안내문·프롬프트·회계가 모두 이 표 하나를 쓴다.
+# - 한국: 매수 위탁수수료 0.015% / 매도 위탁수수료 0.015% + 증권거래세 0.18% = 0.195%
+#   (증권거래세는 매도에만 붙는다. 2026년 코스피 0.18% 기준.)
+# - 미국: 위탁수수료 0.1% + 원화↔달러 환전 스프레드 0.05% = 0.15% (매수·매도 동일)
+FEE_POLICY = {
+    "KR": {
+        "label": "한국 주식",
+        "currency": "KRW",
+        "buy": {"commission_pct": 0.015, "tax_pct": 0.0, "fx_spread_pct": 0.0, "total_pct": 0.015},
+        "sell": {"commission_pct": 0.015, "tax_pct": 0.18, "fx_spread_pct": 0.0, "total_pct": 0.195},
+    },
+    "US": {
+        "label": "미국 주식",
+        "currency": "USD",
+        "buy": {"commission_pct": 0.1, "tax_pct": 0.0, "fx_spread_pct": 0.05, "total_pct": 0.15},
+        "sell": {"commission_pct": 0.1, "tax_pct": 0.0, "fx_spread_pct": 0.05, "total_pct": 0.15},
+    },
+}
+# 위 표의 %를 소수 비율로. 계산은 이 두 표만 본다(FEE_POLICY와 어긋나지 않게 함께 고칠 것).
+BUY_FEE_RATE = {"KR": 0.000_15, "US": 0.001_5}
+SELL_FEE_RATE = {"KR": 0.001_95, "US": 0.001_5}
+SELL_TAX_RATE = {"KR": 0.001_8, "US": 0.0}
 AI_MAX_BUYS = 3
 
 # 자동 실행 시각(KST, 시:분). 정규장 마감 직후 + 여유.
@@ -140,6 +174,19 @@ def _round_shares(shares: float, currency: str) -> float:
 
 def _native_amount(shares: float, price: float) -> float:
     return round(float(shares) * float(price), 4)
+
+
+def fee_rates(market: str | None) -> tuple[float, float]:
+    """시장의 (매수 비용률, 매도 비용률). 모르는 시장은 미국 기준으로 본다."""
+    code = str(market or "").upper()
+    if code not in BUY_FEE_RATE:
+        code = "US"
+    return BUY_FEE_RATE[code], SELL_FEE_RATE[code]
+
+
+def fee_policy() -> dict:
+    """응답 JSON·화면 안내문에 싣는 수수료·세금 기준(사본)."""
+    return json.loads(json.dumps(FEE_POLICY))
 
 
 # --- 환율 -------------------------------------------------------------------
@@ -279,7 +326,13 @@ def build_prompt(account: dict, markets: list[str], cash_krw: float, total_value
             "ticker": item["ticker"], "name": item.get("name"), "market": item.get("market"),
             "shares": item["shares"], "avg_price": item.get("avg_price"),
             "currency": item.get("currency"), "current_price": item.get("current_price"),
-            "pnl_pct": item.get("pnl_pct"), "reason": item.get("reason") or "",
+            "price_pnl_pct": item.get("pnl_pct"), "cost_krw": item.get("cost_krw"),
+            "market_value_krw": item.get("market_value_krw"),
+            "buy_fx_rate": item.get("buy_fx_rate"), "current_fx_rate": item.get("fx_rate"),
+            "fx_change_pct": item.get("fx_change_pct"),
+            "sell_fee_krw": item.get("sell_fee_krw"),
+            "net_pnl_krw": item.get("net_pnl_krw"), "net_pnl_pct": item.get("net_pnl_pct"),
+            "reason": item.get("reason") or "",
         }
         for item in positions
     ]
@@ -288,9 +341,16 @@ def build_prompt(account: dict, markets: list[str], cash_krw: float, total_value
         "아래 '후보'는 서버가 스크리너(정량 점수 quant_score)로 추린 종목이고, '보유'는 지금 계좌다.",
         "규칙:",
         "- 매수는 **남은 현금 한도 안에서만** 한다. 원화 금액(amount_krw)으로만 말하라.",
+        "- amount_krw는 **수수료까지 포함한 그 종목에 쓸 총액**이다(서버가 수수료를 빼고 수량을 정한다).",
         "- 후보 목록에 없는 종목은 절대 사지 마라. 보유 목록에 없는 종목은 팔지 마라.",
         f"- 매수는 최대 {AI_MAX_BUYS}종목, 한 종목은 총자산의 {int(MAX_POSITION_WEIGHT * 100)}% 이하.",
         f"- 종목당 최소 주문 금액은 {int(MIN_ORDER_KRW):,}원이다(그보다 작게 쓰지 마라).",
+        "- 매도 비용: 한국은 수수료 0.015% + 증권거래세 0.18% = 0.195%, 미국은 수수료 0.1% + "
+        "환전 스프레드 0.05% = 0.15%가 매도대금에서 빠진다.",
+        "- 보유의 net_pnl_krw/net_pnl_pct는 **지금 전량 매도할 때의 순실현손익·순수익률**이다 "
+        "(매수 수수료가 든 원가, 매도 수수료·세금, 매수 환율 대비 현재 환율의 환차까지 모두 반영).",
+        "- price_pnl_pct는 주가 등락만 본 수익률이다. 매도 판단은 수수료·세금·환차를 반영한 "
+        "net_pnl_pct를 기준으로 하라. 미국 종목은 fx_change_pct(환율 변동)도 함께 보라.",
         "- 수익률이 나쁘거나 근거가 약해지면 보유 종목을 팔아 현금을 만들어도 된다.",
         "- 제공된 수치에 없는 가격·지표를 지어내지 마라.",
         "",
@@ -382,11 +442,19 @@ def _quant_plan(candidates: list[dict], cash_krw: float, held: set[str],
 
 def _execute_sell(position: dict, price: float, fx_rate: float, fraction: float, reason: str,
                   run_id: str, source: str, db_path: str | None) -> dict:
-    """포지션 일부/전량 매도 체결. 원화 손익은 매수 시점 환율 기준 원가와 비교한다.
+    """포지션 일부/전량 매도 체결 — 수수료·증권거래세를 뺀 **순수취액**이 현금으로 들어온다.
+
+    - 총 매도대금 `gross_krw` = 주가 × 수량 × 현재환율
+    - 매도 비용 `fee_krw` = gross × 매도 비용률(한국 0.195% · 미국 0.15%)
+    - 실제 입금 `net_krw` = gross - fee
+    - `realized_pnl_krw` = net - (매도 비중 × 포지션 원가). 원가에는 매수 수수료가 들어 있어
+      이 값이 곧 **수수료·세금·환차를 모두 반영한 순손익**이다.
 
     포지션 축소·현금 증가·체결 기록은 `paper_store.apply_sell`이 한 트랜잭션으로 처리한다.
     """
     currency = position.get("currency") or "USD"
+    market = position.get("market") or market_of(position["ticker"])
+    _, sell_fee_rate = fee_rates(market)
     rate = 1.0 if currency == "KRW" else fx_rate
     held = float(position["shares"])
     shares = _round_shares(held * fraction, currency)
@@ -394,24 +462,28 @@ def _execute_sell(position: dict, price: float, fx_rate: float, fraction: float,
         shares = held  # 너무 작은 비율이면 전량으로 올린다(0주 체결 방지)
     shares = min(shares, held)
 
-    proceeds_krw = round(shares * float(price) * rate, 2)
+    gross_krw = round(shares * float(price) * rate, 2)
+    fee_krw = round(gross_krw * sell_fee_rate, 2)
+    net_krw = round(gross_krw - fee_krw, 2)
     cost_share = round(position["cost_krw"] * (shares / held), 2) if held else 0.0
-    realized = round(proceeds_krw - cost_share, 2)
+    realized = round(net_krw - cost_share, 2)
 
     return paper_store.apply_sell(
-        position["ticker"], shares, cost_share, proceeds_krw,
+        position["ticker"], shares, cost_share, net_krw,
         {
             "run_id": run_id,
             "trade_date": paper_store.kst_today_str(),
             "ticker": position["ticker"],
-            "market": position.get("market") or market_of(position["ticker"]),
+            "market": market,
             "name": position.get("name") or "",
             "side": "SELL",
             "shares": shares,
             "price": float(price),
             "currency": currency,
             "fx_rate": rate,
-            "amount_krw": proceeds_krw,
+            "amount_krw": gross_krw,
+            "fee_krw": fee_krw,
+            "settle_krw": net_krw,
             "realized_pnl_krw": realized,
             "reason": reason,
             "ai_source": source,
@@ -425,29 +497,44 @@ def _execute_buy(symbol: str, market: str, name: str, currency: str, price: floa
                  db_path: str | None) -> dict | None:
     """매수 체결 — 현금 한도·최소 주문·수량 단위를 지키고, 불가능하면 None.
 
+    **수수료까지 예산 안에서 계산한다**: `amount_krw`는 이 종목에 쓸 수 있는 총액(수수료 포함)이고,
+    `체결원금 + 매수수수료 <= 현금`이 되도록 수량을 정한다. 원가(`cost_krw`)는 원금과 매수수수료의
+    합이라, 나중에 매도하면 `순수취액 - 원가`가 바로 수수료를 뺀 실현손익이 된다.
+
     포지션 추가·현금 차감·체결 기록은 `paper_store.apply_buy`가 한 트랜잭션으로 처리한다.
     """
     account = paper_store.get_account(db_path)
     cash = float(account["cash_krw"])
+    buy_fee_rate, _ = fee_rates(market)
     budget = min(float(amount_krw), cash)
     rate = 1.0 if currency == "KRW" else float(fx_rate)
     if budget < MIN_ORDER_KRW or price <= 0:
         return None
-    shares = _round_shares(budget / (price * rate), currency)
+
+    def _fill(budget_krw: float) -> tuple[float, float, float, float]:
+        """예산 → (주수, 원금, 수수료, 총지출). 주수가 0이면 모두 0."""
+        principal_budget = budget_krw / (1.0 + buy_fee_rate)
+        qty = _round_shares((principal_budget / (price * rate)) - 1e-12, currency)
+        if qty <= 0:
+            return 0.0, 0.0, 0.0, 0.0
+        principal = round(qty * price * rate, 2)
+        fee = round(principal * buy_fee_rate, 2)
+        return qty, principal, fee, round(principal + fee, 2)
+
+    shares, principal_krw, fee_krw, settle_krw = _fill(budget)
     if shares <= 0:
         return None
-    cost_krw = round(shares * price * rate, 2)
-    if cost_krw > cash:  # 반올림·환율 변동 대비 마지막 방어선
-        shares = _round_shares((cash / (price * rate)) - 1e-9, currency)
-        if shares <= 0:
+    if settle_krw > cash:  # 반올림·환율 변동 대비 마지막 방어선
+        shares, principal_krw, fee_krw, settle_krw = _fill(cash)
+        if shares <= 0 or settle_krw > cash:
             return None
-        cost_krw = round(shares * price * rate, 2)
-    if cost_krw < MIN_ORDER_KRW or cost_krw > cash:
+    if settle_krw < MIN_ORDER_KRW:
         return None
+    cost_krw = round(principal_krw + fee_krw, 2)
 
     return paper_store.apply_buy(
         symbol, market, name or "", currency, shares, price, rate, cost_krw,
-        reason, -cost_krw,
+        reason, -settle_krw,
         {
             "run_id": run_id,
             "trade_date": paper_store.kst_today_str(),
@@ -459,7 +546,9 @@ def _execute_buy(symbol: str, market: str, name: str, currency: str, price: floa
             "price": float(price),
             "currency": currency,
             "fx_rate": rate,
-            "amount_krw": cost_krw,
+            "amount_krw": principal_krw,
+            "fee_krw": fee_krw,
+            "settle_krw": settle_krw,
             "realized_pnl_krw": None,
             "reason": reason,
             "ai_source": source,
@@ -475,33 +564,50 @@ def _valuation(positions: list[dict], prices: dict, sources: dict, fx_rate: floa
     for position in positions:
         symbol = position["ticker"]
         currency = position.get("currency") or ("KRW" if market_of(symbol) == "KR" else "USD")
+        market = position.get("market") or market_of(symbol)
+        _, sell_fee_rate = fee_rates(market)
         rate = 1.0 if currency == "KRW" else fx_rate
         price = _num(prices.get(symbol))
         price_source = sources.get(symbol) or ("stored_cost" if price is None else "daily_close")
         if price is None or price <= 0:
             price = _num(position.get("avg_price")) or 0.0
             price_source = "avg_price_fallback"
+        cost_krw = round(position["cost_krw"], 2)
         market_value = round(position["shares"] * price * rate, 2)
-        pnl_krw = round(market_value - position["cost_krw"], 2)
-        pnl_pct = (round(pnl_krw / position["cost_krw"] * 100, 2)
-                   if position["cost_krw"] > 0 else None)
+        # 지금 전량 팔면: 매도 수수료·세금을 뺀 순수취액, 그 원가 대비 순손익.
+        sell_fee = round(market_value * sell_fee_rate, 2)
+        net_proceeds = round(market_value - sell_fee, 2)
+        net_pnl = round(net_proceeds - cost_krw, 2)
+        pnl_krw = round(market_value - cost_krw, 2)
+        pnl_pct = round(pnl_krw / cost_krw * 100, 2) if cost_krw > 0 else None
+        net_pnl_pct = round(net_pnl / cost_krw * 100, 2) if cost_krw > 0 else None
+        buy_fx = _num(position.get("fx_rate")) or 1.0
+        fx_change_pct = (round((rate / buy_fx - 1.0) * 100, 2)
+                         if currency == "USD" and buy_fx > 0 else None)
         stock_value += market_value
         rows.append({
             "ticker": symbol,
             "name": position.get("name") or naver_finance.static_display_name(symbol) or symbol,
-            "market": position.get("market") or market_of(symbol),
+            "market": market,
             "currency": currency,
             "shares": round(position["shares"], 4) if currency != "KRW" else int(position["shares"]),
             "avg_price": round(position["avg_price"], 4),
             "current_price": round(price, 4),
             "price_source": price_source,
             "fx_rate": round(rate, 2),
+            "buy_fx_rate": round(buy_fx, 2),
+            "fx_change_pct": fx_change_pct,
             "avg_price_krw": round(position["avg_price"] * (1.0 if currency == "KRW"
                                                             else position["fx_rate"]), 2),
             "market_value_krw": market_value,
-            "cost_krw": round(position["cost_krw"], 2),
+            "cost_krw": cost_krw,
             "pnl_krw": pnl_krw,
             "pnl_pct": pnl_pct,
+            "sell_fee_pct": round(sell_fee_rate * 100, 4),
+            "sell_fee_krw": sell_fee,
+            "net_proceeds_krw": net_proceeds,
+            "net_pnl_krw": net_pnl,
+            "net_pnl_pct": net_pnl_pct,
             "reason": position.get("reason") or "",
             "opened_at": position.get("opened_at"),
         })
@@ -618,22 +724,26 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
             candidates[market] = []
             notes.append(f"{market} 후보 수집 실패 — 이번 실행에서는 매수 판단을 건너뜁니다.")
 
-    # --- 2) 매도 판단: 규칙(손절·익절) 먼저 ---
+    # --- 2) 매도 판단: 규칙(손절·익절) 먼저 — 수수료·세금·환차를 반영한 순손익으로 본다 ---
     rule_sells: list[dict] = []
     ai_sells: list[dict] = []
     for position in positions:
         view = view_by_ticker.get(position["ticker"])
         if not view or view["current_price"] <= 0:
             continue
-        pnl_pct = view.get("pnl_pct")
+        pnl_pct = view.get("net_pnl_pct")      # 수수료·세금·환차 반영 순수익률
         if pnl_pct is None:
             continue
+        gross_pct = view.get("pnl_pct")
+        gross_note = f", 주가 {gross_pct:+.1f}%" if gross_pct is not None else ""
         if pnl_pct <= STOP_LOSS_PCT:
             rule_sells.append({"ticker": position["ticker"], "fraction": 1.0,
-                               "reason": f"손절 기준({STOP_LOSS_PCT:.0f}%) 도달 — 평가손익 {pnl_pct:.1f}%"})
+                               "reason": f"손절 기준({STOP_LOSS_PCT:.0f}%) 도달 — 수수료·세금 반영 "
+                                         f"순손익 {pnl_pct:.1f}%{gross_note}"})
         elif pnl_pct >= TAKE_PROFIT_PCT:
             rule_sells.append({"ticker": position["ticker"], "fraction": 1.0,
-                               "reason": f"익절 기준(+{TAKE_PROFIT_PCT:.0f}%) 도달 — 평가손익 {pnl_pct:.1f}%"})
+                               "reason": f"익절 기준(+{TAKE_PROFIT_PCT:.0f}%) 도달 — 수수료·세금 반영 "
+                                         f"순손익 {pnl_pct:.1f}%{gross_note}"})
 
     # --- 3) AI 판단(매도·매수) ---
     ai_source = "quant"
@@ -769,6 +879,7 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
         "strategy": strategy,
         "ai_source": ai_source,
         "fx": fx,
+        "fee_policy": fee_policy(),
         "sells": sells,
         "buys": buys,
         "skipped": skipped,
@@ -828,6 +939,7 @@ def status(db_path: str | None = None, price_fn=None, fx_fn=None,
         "equity_history": paper_store.equity_history(limit_equity, db_path),
         "auto_schedule": schedule,
         "next_auto": next_auto_info(account),
+        "fee_policy": fee_policy(),
         "as_of": paper_store._now(),
         "storage_backend": paper_store.storage_backend(db_path),
     }

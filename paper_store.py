@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_TRADES} (
     currency          TEXT    NOT NULL DEFAULT 'USD',
     fx_rate           REAL    NOT NULL DEFAULT 1,
     amount_krw        REAL    NOT NULL,
+    fee_krw           REAL    NOT NULL DEFAULT 0,
     realized_pnl_krw  REAL,
     reason            TEXT    NOT NULL DEFAULT '',
     ai_source         TEXT    NOT NULL DEFAULT ''
@@ -155,6 +156,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_TRADES} (
     currency         TEXT    NOT NULL DEFAULT 'USD',
     fx_rate          DOUBLE PRECISION NOT NULL DEFAULT 1,
     amount_krw       DOUBLE PRECISION NOT NULL,
+    fee_krw          DOUBLE PRECISION NOT NULL DEFAULT 0,
     realized_pnl_krw DOUBLE PRECISION,
     reason           TEXT    NOT NULL DEFAULT '',
     ai_source        TEXT    NOT NULL DEFAULT ''
@@ -174,6 +176,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_EQUITY} (
 _WRITE_LOCK = threading.Lock()
 _PG_READY: set[str] = set()
 _PG_LOCK = threading.Lock()
+_SQLITE_READY: set[str] = set()
+_SQLITE_LOCK = threading.Lock()
 
 
 # --- 연결 ---------------------------------------------------------------------
@@ -199,8 +203,32 @@ def _ensure_pg_schema(conn, key: str) -> None:
             return
         for statement in _split_statements(_PG_SCHEMA):
             conn.execute(statement)
+        # 이미 돌고 있는 실서버 테이블에는 `CREATE TABLE IF NOT EXISTS`가 컬럼을 더하지 않는다.
+        # 기존 계좌·체결을 지우지 않고 수수료 컬럼만 덧붙인다(기본 0 = 예전 체결은 수수료 미기록).
+        conn.execute(f"ALTER TABLE {TABLE_TRADES} ADD COLUMN IF NOT EXISTS fee_krw "
+                     "DOUBLE PRECISION NOT NULL DEFAULT 0")
         conn.commit()
         _PG_READY.add(key)
+
+
+def _ensure_sqlite_schema(conn, key: str) -> None:
+    """SQLite 스키마 + 기존 파일용 컬럼 마이그레이션(`PRAGMA table_info`로 확인 후 ADD COLUMN)."""
+    if key in _SQLITE_READY:
+        return
+    with _SQLITE_LOCK:
+        if key in _SQLITE_READY:
+            return
+        conn.executescript(_SQLITE_SCHEMA)
+        columns = set()
+        for row in conn.execute(f"PRAGMA table_info({TABLE_TRADES})").fetchall() or []:
+            try:
+                columns.add(str(row[1]))
+            except (IndexError, KeyError, TypeError):
+                columns.add(str(dict(row).get("name")))
+        if "fee_krw" not in columns:
+            conn.execute(f"ALTER TABLE {TABLE_TRADES} ADD COLUMN fee_krw REAL NOT NULL DEFAULT 0")
+            conn.commit()
+        _SQLITE_READY.add(key)
 
 
 def _split_statements(sql: str) -> list[str]:
@@ -237,7 +265,7 @@ def _connection(db_path: str | None = None, write: bool = False):
     with lock:
         conn = history_store._connect(db_path)
         try:
-            conn.executescript(_SQLITE_SCHEMA)
+            _ensure_sqlite_schema(conn, db_path or history_store.get_db_path())
             yield conn, "sqlite"
             if write:
                 conn.commit()
@@ -477,6 +505,7 @@ def _trade_payload(trade: dict) -> dict:
         "currency": str(trade.get("currency") or "USD").upper(),
         "fx_rate": float(trade.get("fx_rate") or 1.0),
         "amount_krw": abs(float(trade.get("amount_krw") or 0.0)),
+        "fee_krw": abs(float(trade.get("fee_krw") or 0.0)),
         "realized_pnl_krw": (None if trade.get("realized_pnl_krw") is None
                              else float(trade.get("realized_pnl_krw"))),
         "reason": (trade.get("reason") or "")[:400],
@@ -577,6 +606,7 @@ def apply_buy(ticker: str, market: str, name: str, currency: str, shares: float,
             raise ValueError("cash_below_zero")
         payload["id"] = _insert_trade(conn, backend, payload)
         payload["cash_krw"] = cash
+        payload["settle_krw"] = round(abs(float(cash_delta)), 2)
     return payload
 
 
@@ -610,6 +640,7 @@ def apply_sell(ticker: str, shares: float, cost_krw_sold: float, cash_delta: flo
             raise ValueError("cash_update_failed")
         payload["id"] = _insert_trade(conn, backend, payload)
         payload["cash_krw"] = cash
+        payload["settle_krw"] = round(float(cash_delta), 2)
         payload["remaining_shares"] = 0.0 if remaining <= 0.0000001 else remaining
     return payload
 
@@ -624,6 +655,10 @@ def recent_trades(limit: int = 40, db_path: str | None = None) -> list[dict]:
         row["price"] = float(row.get("price") or 0.0)
         row["fx_rate"] = float(row.get("fx_rate") or 1.0)
         row["amount_krw"] = float(row.get("amount_krw") or 0.0)
+        # 수수료 컬럼이 없던 시절 체결은 0이다(마이그레이션 기본값).
+        row["fee_krw"] = float(row.get("fee_krw") or 0.0)
+        sign = 1.0 if str(row.get("side") or "").upper() == "BUY" else -1.0
+        row["settle_krw"] = round(row["amount_krw"] + sign * row["fee_krw"], 2)
         if row.get("realized_pnl_krw") is not None:
             row["realized_pnl_krw"] = float(row["realized_pnl_krw"])
     return rows

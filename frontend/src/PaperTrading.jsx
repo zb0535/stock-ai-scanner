@@ -53,6 +53,44 @@ const sharesLabel = (row) =>
     ? `${Number(row.shares).toLocaleString("ko-KR")}주`
     : `${Number(row.shares).toLocaleString(undefined, { maximumFractionDigits: 4 })}주`;
 
+// 서버가 주는 수수료·세금 기준(`fee_policy`)을 사람이 읽는 문장으로.
+const feeRow = (policy, market, side) => {
+  const row = policy?.[market]?.[side];
+  if (!row) return null;
+  const parts = [`수수료 ${row.commission_pct}%`];
+  if (Number(row.tax_pct) > 0) parts.push(`증권거래세 ${row.tax_pct}%`);
+  if (Number(row.fx_spread_pct) > 0) parts.push(`환전 스프레드 ${row.fx_spread_pct}%`);
+  return { total: row.total_pct, detail: parts.join(" + ") };
+};
+
+function FeePolicyNote({ policy }) {
+  if (!policy?.KR || !policy?.US) return null;
+  const krBuy = feeRow(policy, "KR", "buy");
+  const krSell = feeRow(policy, "KR", "sell");
+  const usBuy = feeRow(policy, "US", "buy");
+  const usSell = feeRow(policy, "US", "sell");
+  return (
+    <div className="paper-fee-note">
+      <strong>거래 비용 반영</strong>
+      {krBuy && (
+        <span>
+          🇰🇷 매수 <b>{krBuy.total}%</b> · 매도 <b>{krSell?.total}%</b>
+          <em> ({krSell?.detail})</em>
+        </span>
+      )}
+      {usBuy && (
+        <span>
+          🇺🇸 매수 <b>{usBuy.total}%</b> · 매도 <b>{usSell?.total}%</b>
+          <em> ({usBuy.detail})</em>
+        </span>
+      )}
+      <em className="paper-fee-rule">
+        매도 판단(손절/익절)은 주가 등락이 아니라 수수료·세금·환차를 모두 뺀 순수익률 기준입니다.
+      </em>
+    </div>
+  );
+}
+
 // 서버 시각(ISO)을 KST "11-24 18:57"로 — 브라우저 시간대와 무관하게 같은 표기를 쓴다.
 const kstDateTime = (iso) => {
   if (!iso) return "-";
@@ -171,6 +209,7 @@ export default function PaperTradingView() {
   const positions = data?.positions || [];
   const trades = data?.trades || [];
   const schedule = data?.auto_schedule || [];
+  const feePolicy = data?.fee_policy || null;
 
   const chart = useMemo(
     () =>
@@ -242,6 +281,8 @@ export default function PaperTradingView() {
           </span>
           {data?.next_auto?.label && <span className="sched">다음: {data.next_auto.label}</span>}
         </div>
+
+        <FeePolicyNote policy={feePolicy} />
       </section>
 
       {error && <div className="error">⚠️ {error}</div>}
@@ -278,6 +319,7 @@ export default function PaperTradingView() {
                   <span>{sharesLabel(trade)}</span>
                   <span>{nativePrice(trade.price, trade.currency)}</span>
                   <span>{won(trade.amount_krw)}</span>
+                  <em className="sub">수수료 {won(trade.fee_krw)}</em>
                 </div>
               ))}
             </div>
@@ -292,6 +334,7 @@ export default function PaperTradingView() {
                   <span className={retClass(trade.realized_pnl_krw)}>
                     {won(trade.realized_pnl_krw)}
                   </span>
+                  <em className="sub">수수료 {won(trade.fee_krw)}</em>
                 </div>
               ))}
             </div>
@@ -359,6 +402,7 @@ export default function PaperTradingView() {
             매일 1회 자동 매매 (한국 15:40 · 미국 06:20 KST)
           </label>
         </div>
+        <FeePolicyNote policy={feePolicy} />
         <div className="paper-form-actions">
           <button type="button" className="run-btn" onClick={() => saveSettings(false)} disabled={saving}>
             {saving ? "저장 중..." : "설정 저장"}
@@ -405,7 +449,10 @@ export default function PaperTradingView() {
         <div className="score-head">
           <div>
             <h3 className="score-title">📦 보유 종목 ({positions.length})</h3>
-            <p className="score-sub">평가액·손익은 현재 환율로 원화 환산한 값입니다(환차 포함).</p>
+            <p className="score-sub">
+              평가액·손익은 현재 환율로 원화 환산한 값입니다(환차 포함). ‘매도 시 순손익’은 지금 전량 매도할 때
+              수수료·세금을 뺀 실제 손익입니다.
+            </p>
           </div>
         </div>
         {positions.length === 0 ? (
@@ -421,6 +468,7 @@ export default function PaperTradingView() {
                   <th>현재가</th>
                   <th>평가액</th>
                   <th>평가손익</th>
+                  <th>매도 시 순손익</th>
                   <th>AI 매수 사유</th>
                 </tr>
               </thead>
@@ -448,6 +496,16 @@ export default function PaperTradingView() {
                     <td>
                       <span className={`ret ${retClass(row.pnl_pct)}`}>{pct(row.pnl_pct)}</span>
                       <em className={`sub ${retClass(row.pnl_krw)}`}>{won(row.pnl_krw)}</em>
+                      {row.currency === "USD" && row.fx_change_pct !== null && row.fx_change_pct !== undefined && (
+                        <em className={`sub ${retClass(row.fx_change_pct)}`}>
+                          환율 {pct(row.fx_change_pct)}
+                        </em>
+                      )}
+                    </td>
+                    <td>
+                      <span className={`ret ${retClass(row.net_pnl_pct)}`}>{pct(row.net_pnl_pct)}</span>
+                      <em className={`sub ${retClass(row.net_pnl_krw)}`}>{won(row.net_pnl_krw)}</em>
+                      <em className="sub">수수료 {won(row.sell_fee_krw)}</em>
                     </td>
                     <td className="reason" title={row.reason}>
                       {row.reason || "-"}
@@ -480,6 +538,7 @@ export default function PaperTradingView() {
                   <th>수량</th>
                   <th>체결가</th>
                   <th>금액</th>
+                  <th>수수료·세금</th>
                   <th>실현 손익</th>
                   <th>근거</th>
                 </tr>
@@ -500,6 +559,10 @@ export default function PaperTradingView() {
                     <td>{sharesLabel(trade)}</td>
                     <td>{nativePrice(trade.price, trade.currency)}</td>
                     <td>{won(trade.amount_krw)}</td>
+                    <td className={trade.fee_krw ? "" : "sub"}>
+                      {won(trade.fee_krw)}
+                      <em className="sub">{trade.side === "BUY" ? "지출" : "입금"} {won(trade.settle_krw)}</em>
+                    </td>
                     <td>
                       {trade.realized_pnl_krw === null || trade.realized_pnl_krw === undefined ? (
                         "-"
@@ -521,8 +584,9 @@ export default function PaperTradingView() {
       </section>
 
       <p className="paper-disclaimer">
-        ※ 모의투자입니다. 실제 주문이 나가지 않으며, 체결은 서버가 조회한 현재가로 기록됩니다. 과거 수익률이
-        미래 수익을 보장하지 않습니다.
+        ※ 모의투자입니다. 실제 주문이 나가지 않으며, 체결은 서버가 조회한 현재가로 기록됩니다. 매수·매도에는
+        수수료·증권거래세·환전 스프레드가 붙어 현금과 손익에 그대로 반영됩니다. 과거 수익률이 미래 수익을
+        보장하지 않습니다.
       </p>
     </div>
   );
