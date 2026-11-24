@@ -390,6 +390,64 @@ class AutoScheduleTests(PaperCase):
 
 
 # ---------------------------------------------------------------------------
+# 5.5 동시 실행·현금 원자성 (실서버에서 자동·수동 실행이 겹쳐 초과 매수한 자리)
+# ---------------------------------------------------------------------------
+
+
+class ConcurrencyTests(PaperCase):
+    def test_second_run_is_rejected_while_one_is_running(self):
+        """자동 실행과 수동 실행이 겹치면 두 번째는 기다리지 않고 건너뛴다."""
+        acquired = paper_trading._RUN_LOCK.acquire(blocking=False)
+        self.assertTrue(acquired)
+        try:
+            result = paper_trading.run(markets="KR", force=True,
+                                       ai_call=self.ai({"buys": []}),
+                                       candidate_fn=self.candidates({}), price_fn=self.prices({}),
+                                       fx_fn=self.fx())
+        finally:
+            paper_trading._RUN_LOCK.release()
+        self.assertEqual(result.get("skipped"), "already_running")
+        self.assertEqual(paper_store.list_positions(), [])
+
+    def test_store_refuses_overdraft_and_leaves_no_position(self):
+        with self.assertRaises(ValueError) as ctx:
+            paper_store.apply_buy(
+                "AAPL", "US", "Apple", "USD", 100.0, 200.0, 1300.0, 26_000_000.0, "과다 매수",
+                -26_000_000.0,
+                {"ticker": "AAPL", "market": "US", "side": "BUY", "shares": 100.0,
+                 "price": 200.0, "currency": "USD", "fx_rate": 1300.0, "amount_krw": 26_000_000.0},
+            )
+        self.assertIn("cash_below_zero", str(ctx.exception))
+        self.assertEqual(paper_store.list_positions(), [])
+        self.assertEqual(paper_store.recent_trades(), [])
+        self.assertEqual(paper_store.get_account()["cash_krw"], 10_000_000)
+
+    def test_cash_debits_accumulate_across_fills(self):
+        for ticker in ("AAPL", "MSFT"):
+            paper_store.apply_buy(
+                ticker, "US", ticker, "USD", 1.0, 200.0, 1300.0, 260_000.0, "테스트",
+                -260_000.0,
+                {"ticker": ticker, "market": "US", "side": "BUY", "shares": 1.0, "price": 200.0,
+                 "currency": "USD", "fx_rate": 1300.0, "amount_krw": 260_000.0},
+            )
+        account = paper_store.get_account()
+        self.assertAlmostEqual(account["cash_krw"], 10_000_000 - 520_000, places=2)
+        self.assertEqual(len(paper_store.recent_trades()), 2)
+
+    def test_sell_adds_proceeds_to_cash(self):
+        paper_store.add_position("005930.KS", "KR", "KRW", 10.0, 70_000.0, 1.0, 700_000.0)
+        paper_store.update_account({"cash_krw": 9_300_000})
+        paper_store.apply_sell(
+            "005930.KS", 4.0, 280_000.0, 400_000.0,
+            {"ticker": "005930.KS", "market": "KR", "side": "SELL", "shares": 4.0,
+             "price": 100_000.0, "currency": "KRW", "fx_rate": 1.0, "amount_krw": 400_000.0,
+             "realized_pnl_krw": 120_000.0},
+        )
+        self.assertAlmostEqual(paper_store.get_account()["cash_krw"], 9_700_000, places=2)
+        self.assertAlmostEqual(paper_store.list_positions()[0]["shares"], 6.0, places=4)
+
+
+# ---------------------------------------------------------------------------
 # 6.5 PostgreSQL SQL (실서버에서 물린 자리표시자 버그 회귀 방지)
 # ---------------------------------------------------------------------------
 

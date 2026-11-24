@@ -87,6 +87,9 @@ STRATEGY_CRITERIA = {
 }
 
 AUTO_STATE: dict = {"started": False, "last_check": None, "last_run": None, "last_error": None}
+# 같은 순간에 자동 실행과 수동 실행이 겹치면 두 실행이 같은 현금을 보고 각자 매수해
+# 시드머니를 넘겨 살 수 있다(실서버에서 확인). 실행은 프로세스 안에서 하나만 돈다.
+_RUN_LOCK = threading.Lock()
 _AUTO_STOP = threading.Event()
 _AUTO_THREAD: threading.Thread | None = None
 _AUTO_FAILURES: dict[tuple[str, str], int] = {}
@@ -394,10 +397,9 @@ def _execute_sell(position: dict, price: float, fx_rate: float, fraction: float,
     proceeds_krw = round(shares * float(price) * rate, 2)
     cost_share = round(position["cost_krw"] * (shares / held), 2) if held else 0.0
     realized = round(proceeds_krw - cost_share, 2)
-    cash_after = paper_store.get_account(db_path)["cash_krw"] + proceeds_krw
 
     return paper_store.apply_sell(
-        position["ticker"], shares, cost_share, cash_after,
+        position["ticker"], shares, cost_share, proceeds_krw,
         {
             "run_id": run_id,
             "trade_date": paper_store.kst_today_str(),
@@ -445,7 +447,7 @@ def _execute_buy(symbol: str, market: str, name: str, currency: str, price: floa
 
     return paper_store.apply_buy(
         symbol, market, name or "", currency, shares, price, rate, cost_krw,
-        reason, round(cash - cost_krw, 2),
+        reason, -cost_krw,
         {
             "run_id": run_id,
             "trade_date": paper_store.kst_today_str(),
@@ -537,7 +539,30 @@ def _position_views(positions: list[dict], price_fn, fx_rate: float) -> dict:
 def run(markets=None, force: bool = False, trigger: str = "manual", db_path: str | None = None,
         ai_call=None, price_fn=None, candidate_fn=None, fx_fn=None,
         now: datetime | None = None) -> dict:
-    """AI 모의투자 1회 실행 — 매도 → 매수 → 스냅샷.
+    """AI 모의투자 1회 실행(매도 → 매수 → 스냅샷). 동시에 두 번 돌지 않는다.
+
+    이미 다른 실행이 돌고 있으면 기다리지 않고 `skipped: "already_running"`을 돌려준다 —
+    두 실행이 같은 현금을 보고 각자 매수하면 시드머니를 넘겨 살 수 있기 때문이다.
+    """
+    if not _RUN_LOCK.acquire(blocking=False):
+        return {
+            "ok": True, "skipped": "already_running",
+            "markets": normalize_markets(markets),
+            "message": "다른 AI 매매가 실행 중입니다. 끝나면 결과가 계좌에 반영됩니다.",
+            "ran_at": paper_store._now(),
+        }
+    try:
+        return _run_locked(markets=markets, force=force, trigger=trigger, db_path=db_path,
+                           ai_call=ai_call, price_fn=price_fn, candidate_fn=candidate_fn,
+                           fx_fn=fx_fn, now=now)
+    finally:
+        _RUN_LOCK.release()
+
+
+def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
+                db_path: str | None = None, ai_call=None, price_fn=None, candidate_fn=None,
+                fx_fn=None, now: datetime | None = None) -> dict:
+    """실제 실행 본체(`run`이 락을 잡고 부른다).
 
     `markets`: "ALL"/"US"/"KR" 또는 목록. 비우면 계좌 설정을 따른다.
     `force`: False면 오늘 이미 돈 시장은 건너뛴다(자동 실행 중복 방지).

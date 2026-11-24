@@ -506,12 +506,37 @@ def record_trade(trade: dict, db_path: str | None = None) -> dict:
     return payload
 
 
+def _apply_cash_delta(conn, backend: str, delta: float, stamp: str) -> float | None:
+    """현금을 **원자적으로** 더한다(음수면 잔고 부족 시 실패). 새 잔고 또는 None.
+
+    절대값을 덮어쓰지 않고 `cash_krw + delta`로 계산하므로, 자동 실행과 수동 실행이 겹쳐도
+    한쪽의 차감이 다른 쪽에 의해 지워지지 않는다(현금 초과 매수 방지).
+    """
+    amount = round(float(delta), 2)
+    if amount < 0:
+        cur = conn.execute(
+            _sql(f"UPDATE {TABLE_ACCOUNT} SET cash_krw = cash_krw + ?, updated_at = ?"
+                 " WHERE id = ? AND cash_krw + ? >= 0", backend),
+            (amount, stamp, ACCOUNT_ID, amount))
+    else:
+        cur = conn.execute(
+            _sql(f"UPDATE {TABLE_ACCOUNT} SET cash_krw = cash_krw + ?, updated_at = ? WHERE id = ?",
+                 backend),
+            (amount, stamp, ACCOUNT_ID))
+    if int(getattr(cur, "rowcount", 0) or 0) == 0:
+        return None
+    row = _row(conn.execute(
+        _sql(f"SELECT cash_krw FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (ACCOUNT_ID,)))
+    return round(float((row or {}).get("cash_krw") or 0.0), 2)
+
+
 def apply_buy(ticker: str, market: str, name: str, currency: str, shares: float, price: float,
-              fx_rate: float, cost_krw: float, reason: str, cash_after: float,
+              fx_rate: float, cost_krw: float, reason: str, cash_delta: float,
               trade: dict, db_path: str | None = None) -> dict:
     """매수 체결을 **한 트랜잭션으로** 반영한다(포지션 + 계좌 현금 + 체결 기록).
 
-    중간에 실패해도 포지션만 늘고 체결 기록이 비는(또는 그 반대의) 어긋난 상태가 남지 않는다.
+    `cash_delta`는 보통 `-cost_krw`다. 잔고보다 많이 차감하려 하면 `cash_below_zero`로
+    실패하고 포지션도 남기지 않는다.
     """
     sym = str(ticker or "").strip().upper()
     shares = float(shares)
@@ -519,8 +544,7 @@ def apply_buy(ticker: str, market: str, name: str, currency: str, shares: float,
     cost_krw = float(cost_krw)
     if not sym or shares <= 0 or price <= 0 or cost_krw <= 0:
         raise ValueError("invalid_position")
-    if float(cash_after) < -0.01:
-        raise ValueError("cash_below_zero")
+    get_account(db_path)  # 계좌 행이 없으면 먼저 만든다(현금 UPDATE가 0건이 되지 않게)
 
     payload = _trade_payload(trade)
     stamp = _now()
@@ -548,19 +572,22 @@ def apply_buy(ticker: str, market: str, name: str, currency: str, shares: float,
                 (sym, market, name or "", currency, shares, price, float(fx_rate), cost_krw,
                  (reason or "")[:400], stamp),
             )
-        conn.execute(_sql(f"UPDATE {TABLE_ACCOUNT} SET cash_krw = ?, updated_at = ? WHERE id = ?", backend),
-                     (round(float(cash_after), 2), stamp, ACCOUNT_ID))
+        cash = _apply_cash_delta(conn, backend, cash_delta, stamp)
+        if cash is None:  # 잔고 부족 → 트랜잭션 전체 취소(포지션도 남지 않는다)
+            raise ValueError("cash_below_zero")
         payload["id"] = _insert_trade(conn, backend, payload)
+        payload["cash_krw"] = cash
     return payload
 
 
-def apply_sell(ticker: str, shares: float, cost_krw_sold: float, cash_after: float,
+def apply_sell(ticker: str, shares: float, cost_krw_sold: float, cash_delta: float,
                trade: dict, db_path: str | None = None) -> dict:
     """매도 체결을 한 트랜잭션으로 반영한다(포지션 축소/삭제 + 현금 증가 + 체결 기록)."""
     sym = str(ticker or "").strip().upper()
     shares = float(shares)
     if not sym or shares <= 0:
         raise ValueError("invalid_position")
+    get_account(db_path)
 
     payload = _trade_payload(trade)
     stamp = _now()
@@ -578,9 +605,11 @@ def apply_sell(ticker: str, shares: float, cost_krw_sold: float, cash_after: flo
                 _sql(f"UPDATE {TABLE_POSITIONS} SET shares = ?, cost_krw = ? WHERE ticker = ?", backend),
                 (remaining, kept_cost, sym),
             )
-        conn.execute(_sql(f"UPDATE {TABLE_ACCOUNT} SET cash_krw = ?, updated_at = ? WHERE id = ?", backend),
-                     (round(float(cash_after), 2), stamp, ACCOUNT_ID))
+        cash = _apply_cash_delta(conn, backend, cash_delta, stamp)
+        if cash is None:  # 계좌 행이 없을 수 없다 — 있으면 실패로 본다
+            raise ValueError("cash_update_failed")
         payload["id"] = _insert_trade(conn, backend, payload)
+        payload["cash_krw"] = cash
         payload["remaining_shares"] = 0.0 if remaining <= 0.0000001 else remaining
     return payload
 
