@@ -26,6 +26,8 @@ import history_store
 import realtime_quotes
 import extended_quotes
 import sector_pe
+import paper_store
+import paper_trading
 from finnhub_client import status as finnhub_status
 
 logger = logging.getLogger("api")
@@ -97,9 +99,17 @@ async def lifespan(_app: FastAPI):
     sp500_scanner.start_prewarm()
     # 코스피 200은 60초 뒤 시작해 S&P 500(8초 뒤) 첫 스캔과 겹치지 않게 한다(메모리 피크 분리).
     kospi200_scanner.start_prewarm()
+    # AI 모의투자: 계좌 스키마를 확인하고, 매일 1회(한국 15:40·미국 06:20 KST) 자동 매매 루프를 건다.
+    # DB가 잠시 죽어 있어도 서버는 뜨고, 자동 루프는 5분마다 다시 시도한다(PAPER_AUTO=0으로 끔).
+    try:
+        paper_store.init_store()
+    except Exception as exc:  # 저장소 장애가 기동을 막지 않게
+        logger.warning("모의투자 계좌 초기화 실패: %s: %s", type(exc).__name__, str(exc)[:200])
+    paper_trading.start_auto(ai_call=_paper_ai_call)
     try:
         yield
     finally:
+        paper_trading.stop_auto()
         sp500_scanner.stop_prewarm()
         kospi200_scanner.stop_prewarm()
 
@@ -421,6 +431,7 @@ def health():
             "realtime": {"enabled": realtime_quotes.is_enabled(),
                          "ttl_sec": realtime_quotes.REALTIME_TTL},
             "extended_quotes": extended_quotes.status(),
+            "paper_auto": paper_trading.auto_status(),
             "yahoo_guard": _yahoo_guard(),
             "errors_recent": recent_errors()}
 
@@ -1058,3 +1069,124 @@ def get_stock_detail(ticker: str):
 
     return _json_safe({"ticker": sym, "name": name, "currency": currency,
                        "levels": levels, "quarters": quarters, "price_source": price_source})
+
+
+# --- AI 모의투자(페이퍼 트레이딩) ------------------------------------------------
+# 계좌·포지션·체결·수익률 스냅샷은 paper_store(성적표와 같은 DB, 별도 테이블)에,
+# 매매 로직(환율·후보·매도/매수 판단·현금 한도)은 paper_trading에 있다. 여기서는
+# Gemini 호출을 paper_trading에 넘겨 주고(ai_call), HTTP 표면만 만든다.
+
+
+def _gemini_text(prompt: str) -> str | None:
+    """모의투자 판단용 Gemini 호출 — 모델·타임아웃·예산 규칙은 스크리닝 분석과 같은 것을 쓴다.
+
+    실패하면 None을 돌려주고, 호출부(paper_trading)는 정량 점수 폴백으로 내려간다.
+    """
+    queue = list(_gemini_model_plan())
+    deadline = time.time() + GEMINI_TOTAL_BUDGET_MS / 1000.0
+    thinking_budget = GEMINI_THINKING_BUDGET
+    while queue:
+        model, budget_ms = queue.pop(0)
+        remaining_ms = int((deadline - time.time()) * 1000)
+        if remaining_ms < 3000:
+            break
+        try:
+            client = _gemini_client(min(budget_ms, remaining_ms))
+            config = types.GenerateContentConfig(temperature=0)
+            if thinking_budget is not None:
+                try:
+                    config.thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
+                except Exception:  # 사고 설정을 모르는 SDK — 기본값으로 둔다
+                    pass
+            res = client.models.generate_content(model=model, contents=prompt, config=config)
+            text = (getattr(res, "text", "") or "").strip()
+            if text:
+                return text
+        except Exception as exc:
+            logger.warning("모의투자 Gemini 실패(%s) → %s: %s", model, type(exc).__name__, str(exc)[:200])
+            if _thinking_rejected(exc) and thinking_budget is not None:
+                thinking_budget = None
+                queue.insert(0, (model, budget_ms))
+                continue
+            if not _retryable_gemini_error(exc):
+                break
+            time.sleep(0.3)
+    return None
+
+
+def _paper_ai_call(prompt: str) -> str | None:
+    """paper_trading에 넘기는 AI 판단 함수(자동 루프에서도 같은 함수를 쓴다)."""
+    return _gemini_text(prompt)
+
+
+class PaperConfigureRequest(BaseModel):
+    """`POST /api/paper/configure` — 시드머니·시장·전략·자동 실행 설정/리셋.
+
+    - `initial_cash_krw`: 원화 시드머니(10만~10억). `reset` 없이 바꾸면 현금에서 차감/추가된다.
+    - `markets`: "ALL"(한국+미국) | "US" | "KR".
+    - `strategy`: momentum | value | oversold | balanced.
+    - `auto_enabled`: 매일 1회 자동 매매(한국 15:40 · 미국 06:20 KST).
+    - `reset`: true면 보유·체결·스냅샷을 지우고 새 시드머니로 다시 시작.
+    """
+
+    initial_cash_krw: float | None = None
+    markets: str | None = None
+    strategy: str | None = None
+    auto_enabled: bool | None = None
+    reset: bool = False
+
+
+class PaperRunRequest(BaseModel):
+    """`POST /api/paper/run` — AI 매매 1회 실행.
+
+    `force=false`(기본)면 오늘 이미 돈 시장은 건너뛴다. 사용자가 버튼으로 직접 돌릴 때는
+    클라이언트가 `force=true`를 보낸다. `markets`를 주면 그 시장만 판단한다.
+    """
+
+    force: bool = False
+    markets: str | None = None
+
+
+@app.get("/api/paper/status")
+def paper_status(trades: int = 40, history: int = 180):
+    """AI 모의투자 계좌 요약·보유 포지션(평가손익)·체결 내역·수익률 추이."""
+    try:
+        return paper_trading.status(limit_trades=trades, limit_equity=history)
+    except Exception as exc:
+        logger.exception("모의투자 상태 조회 실패: %s", exc)
+        raise HTTPException(status_code=503, detail="paper_storage_unavailable")
+
+
+@app.post("/api/paper/configure")
+def paper_configure(req: PaperConfigureRequest):
+    """시드머니 설정·계좌 리셋·시장/전략/자동 실행 설정."""
+    try:
+        result = paper_trading.configure(
+            initial_cash_krw=req.initial_cash_krw,
+            markets=req.markets,
+            strategy=req.strategy,
+            auto_enabled=req.auto_enabled,
+            reset=req.reset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("모의투자 설정 실패: %s", exc)
+        raise HTTPException(status_code=503, detail="paper_storage_unavailable")
+    return {"ok": True, **result, "status": paper_trading.status()}
+
+
+@app.post("/api/paper/run")
+def paper_run(req: PaperRunRequest | None = None):
+    """AI 일일 매매 1회 실행 — 매도(손절·익절·AI) → 매수(현금 한도) → 스냅샷.
+
+    응답에는 실행 결과(`result`: 매수/매도 체결·건너뛴 이유·요약)와 갱신된 `status`가 함께 온다.
+    """
+    payload = req or PaperRunRequest()
+    try:
+        result = paper_trading.run(markets=payload.markets, force=payload.force,
+                                   trigger="manual", ai_call=_paper_ai_call)
+    except Exception as exc:
+        logger.exception("모의투자 실행 실패: %s", exc)
+        raise HTTPException(status_code=503, detail="paper_run_failed")
+    return {"ok": True, "result": result, "status": paper_trading.status()}

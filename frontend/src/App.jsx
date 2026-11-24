@@ -11,6 +11,7 @@ import {
   ReferenceLine,
 } from "recharts";
 import "./App.css";
+import PaperTradingView from "./PaperTrading";
 
 const API_BASE = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/+$/, "");
 
@@ -111,6 +112,8 @@ const PRESETS = [
 
 
 export default function App() {
+  // 최상위 화면: AI 스크리너 / 🤖 AI 모의투자
+  const [view, setView] = useState("screener");
   const [tickers, setTickers] = useState([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [tab, setTab] = useState(null);   // 빠른 선택(인기·반도체·빅테크·한국), null이면 시장 전체 목록
@@ -410,6 +413,31 @@ export default function App() {
   return (
     <div className="shell">
       <div className="page">
+        <nav className="app-tabs" role="tablist" aria-label="화면 선택">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === "screener"}
+            className={`app-tab ${view === "screener" ? "active" : ""}`}
+            onClick={() => setView("screener")}
+          >
+            📊 AI 스크리너
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === "paper"}
+            className={`app-tab ${view === "paper" ? "active" : ""}`}
+            onClick={() => setView("paper")}
+          >
+            🤖 AI 모의투자
+          </button>
+        </nav>
+
+        {view === "paper" ? (
+          <PaperTradingView />
+        ) : (
+          <>
         <header className="header">
           <div className="badge">AI QUANT SCREENER</div>
           <h1>한국·미국 주식 차트 · 재무 AI 스크리너</h1>
@@ -767,6 +795,8 @@ export default function App() {
                 </table>
               </div>
             </details>
+          </>
+        )}
           </>
         )}
       </div>

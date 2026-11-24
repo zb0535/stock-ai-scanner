@@ -111,6 +111,32 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   - ⚠️ Render 무료 플랜은 영구 디스크가 없어 재배포·재시작 시 이력 파일이 초기화된다.
     위 `DATABASE_URL`(Neon 등 무료 PostgreSQL)을 넣으면 재배포에도 이력이 남는다.
     굳이 파일로 유지하려면 Render Persistent Disk를 붙이고 `HISTORY_DB_PATH=/var/data/recommendations.db`처럼 지정한다.
+- **🤖 AI 모의투자(페이퍼 트레이딩)**(`paper_store.py` · `paper_trading.py`): 스크리너 결과로 AI가
+  **원화 통합 계좌**에서 한국·미국 주식을 가상으로 사고팔아 수익률을 추적한다. 실제 주문은 나가지 않는다.
+  - 계좌: 시드머니 **기본 10,000,000원**(10만~10억, 언제든 설정/리셋). 현금·총자산·수익률은 모두 `₩`,
+    미국 종목은 달러로 체결하고 **체결 시점의 USD/KRW 환율**을 포지션에 저장해 원화 원가를 고정한다.
+    평가는 현재 환율로 다시 계산하므로 **환차손익도 수익률에 들어간다**. 환율은 네이버 금융(하나은행 고시)
+    → Yahoo `KRW=X` → 고정 1,350원 순으로 폴백하고, 응답의 `fx_source`에 어느 경로였는지 남긴다.
+  - 수량: **미국은 소수점 4자리**(토스증권 소수점 거래 방식), **한국은 1주 정수**.
+  - 투자 시장: `ALL`(한국+미국, 기본) / `US` / `KR`. 전략: `balanced`(기본)·`momentum`·`value`·`oversold`.
+  - 매도: 손절 **-8%** · 익절 **+25%** 규칙과 Gemini 판단(전량/부분 `fraction`)으로 현금을 만든다.
+  - 매수: 대상 시장의 스크리너 상위 후보(S&P 500 · 코스피 200, 정량 점수·`signals`·재무·뉴스)를 Gemini에
+    넘겨 종목·원화 금액을 받는다. **남은 현금을 넘겨 살 수 없고**(요청 금액을 현금으로 자르고 체결 후
+    잔고를 다시 검증), 한 종목은 총자산의 **30%**, 최대 **8종목**, 최소 주문 **1만 원**이다.
+    Gemini가 죽거나 429·해석 실패면 **정량 점수 상위 3종목 균등 배분 폴백**으로 매매를 계속한다.
+  - 자동 실행: 서버 백그라운드 루프가 **한국 장 마감 후 15:40 KST**·**미국 장 마감 후 06:20 KST**에
+    시장별 **하루 1회**(`last_run_kr_date`·`last_run_us_date`) 실행한다. 서버가 그 시각에 꺼져 있었다면
+    다시 켜진 뒤 1회 따라잡고, `PAPER_AUTO=0`으로 끌 수 있으며, `force` 없이 같은 날 다시 부르면
+    `skipped: "already_ran_today"`로 건너뛴다.
+  - API: `GET /api/paper/status`(계좌 요약·보유 포지션 평가손익·체결 내역·일별 수익률 추이·자동 실행 일정),
+    `POST /api/paper/configure`(`initial_cash_krw`·`markets`·`strategy`·`auto_enabled`·`reset`),
+    `POST /api/paper/run`(`force`·`markets`, 실행 결과 + 갱신된 status).
+  - 저장: 기존 `recommendations`(성적표) 테이블은 그대로 두고 `paper_account`·`paper_positions`·
+    `paper_trades`·`paper_equity_history` 네 테이블을 새로 만든다(`DATABASE_URL`이 있으면 PostgreSQL,
+    없으면 같은 SQLite 파일).
+  - 웹 UI 상단에 **🤖 AI 모의투자** 탭: 총 자산·총 수익률·시드머니 카드, 시드머니/시장/전략/자동 실행 설정과
+    계좌 초기화, `▶ 지금 AI 매매 1회 실행`, 보유 종목 표(수량·평단가·현재가·평가손익·AI 사유),
+    최근 매매 내역, 수익률 추이 차트(Recharts).
 - Yahoo Finance `t.info`가 서버 IP에서 막히면(429/401) **SEC EDGAR 공시(XBRL)** 에서
   PER·매출성장률·영업이익률·부채비율을 계산해 채운다(API 키 불필요).
 - SEC 공시에도 값이 없으면(예: us-gaap 태그가 없는 외국 ADR `TSM`) **Finnhub**
@@ -179,7 +205,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드 검증, 359개)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자 검증, 513개)
 
 ## 환경변수
 | 이름 | 설명 |
@@ -196,4 +222,11 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `GEMINI_TOTAL_BUDGET_MS` | AI 분석 단계 전체 예산(기본 45000ms). 넘으면 정량 점수 폴백으로 응답 |
 | `GEMINI_FALLBACK_MODEL` | 주 모델이 과부하·타임아웃일 때 2순위로 부를 모델(기본 `gemini-3.8-flash`) |
 | `GEMINI_THINKING_BUDGET` | Gemini 사고 토큰 예산(기본 `0`=끔, 빠름). `-1`이면 모델 자동 |
+| `PAPER_AUTO` | AI 모의투자 자동 실행(기본 켜짐). `0`이면 끔 |
+| `PAPER_AUTO_INTERVAL` | 자동 실행 확인 주기(초, 기본 300) |
+| `PAPER_STOP_LOSS_PCT` / `PAPER_TAKE_PROFIT_PCT` | 모의투자 손절·익절 기준(기본 -8 / +25) |
+| `PAPER_MAX_POSITION_WEIGHT` / `PAPER_MAX_POSITIONS` | 한 종목 비중 상한(기본 0.30) · 최대 보유 종목 수(기본 8) |
+| `PAPER_MIN_ORDER_KRW` | 모의투자 최소 주문 금액(기본 10000원) |
+| `PAPER_CANDIDATES` | 시장별 매수 후보 수(기본 10종목) |
+| `PAPER_USDKRW` | 환율 조회가 모두 실패할 때 쓰는 고정 USD/KRW(기본 1350) |
 | `SEC_EDGAR_FALLBACK` / `FINNHUB_FALLBACK` | Yahoo `t.info` 대체 경로 스위치(기본 켜짐). `0`이면 끔 |
