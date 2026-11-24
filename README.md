@@ -130,7 +130,10 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     `skipped: "already_ran_today"`로 건너뛴다.
   - API: `GET /api/paper/status`(계좌 요약·보유 포지션 평가손익·체결 내역·일별 수익률 추이·자동 실행 일정),
     `POST /api/paper/configure`(`initial_cash_krw`·`markets`·`strategy`·`auto_enabled`·`reset`),
-    `POST /api/paper/run`(`force`·`markets`, 실행 결과 + 갱신된 status).
+    `POST /api/paper/run`(`force`·`markets`, 실행 결과 + 갱신된 status). 실행은 한 번에 하나만
+    돌고(`_RUN_LOCK`), 자동 실행과 수동 실행이 겹치면 두 번째는 `skipped: "already_running"`을 받는다.
+    현금은 `cash_krw + ?`로 원자 증감해 잔고보다 많이 차감하려 하면 체결 전체가 취소된다
+    (포지션·체결이 반쪽만 남지 않는다).
   - 저장: 기존 `recommendations`(성적표) 테이블은 그대로 두고 `paper_account`·`paper_positions`·
     `paper_trades`·`paper_equity_history` 네 테이블을 새로 만든다(`DATABASE_URL`이 있으면 PostgreSQL,
     없으면 같은 SQLite 파일).
@@ -205,7 +208,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자 검증, 513개)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자 검증, 520개)
 
 ## 환경변수
 | 이름 | 설명 |
