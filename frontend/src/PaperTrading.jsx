@@ -53,17 +53,14 @@ const sharesLabel = (row) =>
     ? `${Number(row.shares).toLocaleString("ko-KR")}주`
     : `${Number(row.shares).toLocaleString(undefined, { maximumFractionDigits: 4 })}주`;
 
+// 서버 시각(ISO)을 KST "11-24 18:57"로 — 브라우저 시간대와 무관하게 같은 표기를 쓴다.
 const kstDateTime = (iso) => {
   if (!iso) return "-";
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return String(iso);
-  return date.toLocaleString("ko-KR", {
-    timeZone: "Asia/Seoul",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  const kst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${pad(kst.getUTCMonth() + 1)}-${pad(kst.getUTCDate())} ${pad(kst.getUTCHours())}:${pad(kst.getUTCMinutes())}`;
 };
 
 export default function PaperTradingView() {
