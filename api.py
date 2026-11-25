@@ -25,6 +25,7 @@ import naver_finance
 import history_store
 import realtime_quotes
 import extended_quotes
+import fcm
 import sector_pe
 import paper_store
 import paper_trading
@@ -432,6 +433,7 @@ def health():
                          "ttl_sec": realtime_quotes.REALTIME_TTL},
             "extended_quotes": extended_quotes.status(),
             "paper_auto": paper_trading.auto_status(),
+            "fcm": fcm.status(),
             "yahoo_guard": _yahoo_guard(),
             "errors_recent": recent_errors()}
 
@@ -1180,7 +1182,8 @@ def paper_configure(req: PaperConfigureRequest):
 def paper_run(req: PaperRunRequest | None = None):
     """AI 일일 매매 1회 실행 — 매도(손절·익절·AI) → 매수(현금 한도) → 스냅샷.
 
-    응답에는 실행 결과(`result`: 매수/매도 체결·건너뛴 이유·요약)와 갱신된 `status`가 함께 온다.
+    응답에는 실행 결과(`result`: 매수/매도 체결·건너뛴 이유·요약·`push` 발송 결과)와 갱신된
+    `status`가 함께 온다. 체결이 있으면 등록된 기기로 FCM 푸시가 바로 나간다.
     """
     payload = req or PaperRunRequest()
     try:
@@ -1190,3 +1193,77 @@ def paper_run(req: PaperRunRequest | None = None):
         logger.exception("모의투자 실행 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_run_failed")
     return {"ok": True, "result": result, "status": paper_trading.status()}
+
+
+# --- 체결 푸시 알림(FCM) ------------------------------------------------------
+
+
+class FcmRegisterRequest(BaseModel):
+    """`POST /api/paper/fcm/register` — 앱이 받은 FCM 토큰 저장/갱신(알림 켜기).
+
+    `enabled=false`를 같이 보내면 같은 요청으로 토큰을 지운다(알림 끄기).
+    """
+
+    token: str | None = None
+    platform: str | None = None
+    enabled: bool | None = None
+
+
+@app.post("/api/paper/fcm/register")
+def paper_fcm_register(req: FcmRegisterRequest):
+    """기기 토큰을 저장한다 — 체결이 나면 이 기기들로 푸시가 간다."""
+    token = (req.token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="empty_token")
+    platform = (req.platform or "android").strip() or "android"
+    try:
+        if req.enabled is False:
+            paper_store.remove_fcm_token(token)
+            return {"ok": True, "registered": False, "tokens": paper_store.count_fcm_tokens()}
+        paper_store.register_fcm_token(token, platform)
+        count = paper_store.count_fcm_tokens()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("FCM 토큰 저장 실패: %s", exc)
+        raise HTTPException(status_code=503, detail="paper_storage_unavailable")
+    logger.info("FCM 토큰 등록(%s) — 등록 기기 %d대", platform, count)
+    return {"ok": True, "registered": True, "tokens": count,
+            "push_configured": fcm.is_configured()}
+
+
+@app.delete("/api/paper/fcm/register")
+def paper_fcm_unregister(token: str | None = None):
+    """토큰을 지운다(알림 끄기). `token`을 비우면 등록된 모든 기기를 지운다."""
+    try:
+        if token and token.strip():
+            removed = paper_store.remove_fcm_token(token.strip())
+        else:
+            removed = paper_store.remove_fcm_tokens(
+                [row["token"] for row in paper_store.list_fcm_tokens()])
+        count = paper_store.count_fcm_tokens()
+    except Exception as exc:
+        logger.exception("FCM 토큰 삭제 실패: %s", exc)
+        raise HTTPException(status_code=503, detail="paper_storage_unavailable")
+    return {"ok": True, "removed": removed, "tokens": count}
+
+
+@app.get("/api/paper/fcm/status")
+def paper_fcm_status():
+    """푸시 설정 여부와 등록 기기 수 — 앱 설정 항목·배포 점검용(키 본문은 노출하지 않는다)."""
+    try:
+        return {"ok": True, **fcm.status()}
+    except Exception as exc:
+        logger.exception("FCM 상태 조회 실패: %s", exc)
+        raise HTTPException(status_code=503, detail="paper_storage_unavailable")
+
+
+@app.post("/api/paper/fcm/test")
+def paper_fcm_test():
+    """등록된 기기로 테스트 푸시 1건(체결·계좌에는 영향 없음)."""
+    try:
+        result = fcm.send_test()
+    except Exception as exc:
+        logger.exception("테스트 푸시 실패: %s", exc)
+        raise HTTPException(status_code=503, detail="push_failed")
+    return {"ok": result.get("sent", 0) > 0 or not result.get("configured", False), **result}

@@ -152,6 +152,22 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   - 웹 UI 상단에 **🤖 AI 모의투자** 탭: 총 자산·총 수익률·시드머니 카드, 시드머니/시장/전략/자동 실행 설정과
     계좌 초기화, `▶ 지금 AI 매매 1회 실행`, 보유 종목 표(수량·평단가·현재가·평가손익·**매도 시 순손익**·AI 사유),
     최근 매매 내역(**수수료·세금** 열), 적용 중인 수수료·세금 기준 안내, 수익률 추이 차트(Recharts).
+  - **체결 푸시 알림(FCM)**(`fcm.py`): 매수·매도가 체결되면 **DB 커밋 직후** 등록된 안드로이드 기기로
+    알림이 간다(1초 컷). 단건은 `🤖 AI 매수 체결 · 현대글로비스` / `1주 · ₩201,470 (수수료 ₩30)`,
+    매도는 `순손익 +₩12,300 (+4.2%)`(수수료·세금·환차 반영 순손익), 다건은
+    `🤖 AI 모의투자 3건 체결` / `현대글로비스 외 2건 매수 · 총 ₩681,572`. `data`에
+    `{"screen":"paper","market":"KR"}`을 넣어 알림을 탭하면 앱이 🤖 AI 모의투자 화면으로 열린다.
+    - 키는 **환경변수 `FIREBASE_SERVICE_ACCOUNT_JSON`**(JSON 문자열 전체 또는 base64) 또는
+      `FIREBASE_CREDENTIALS_PATH`(파일 경로)로만 넣는다. 서비스 계정 JSON은 `.gitignore`의
+      `*firebase-adminsdk*.json`·`*service-account*.json`으로 커밋을 막아 두었다.
+    - 키가 없거나 초기화에 실패해도 서버는 살아 있고, 발송만 `configured:false`로 건너뛴다(매매는 정상).
+      발송은 별도 스레드에서 최대 12초만 기다려 FCM이 느려도 실행 락을 붙잡지 않는다.
+    - `UnregisteredError`·`InvalidArgumentError`(앱 삭제·재설치·토큰 회전) 토큰은 `paper_fcm_tokens`에서
+      자동 삭제한다. 토큰은 계좌 초기화(`reset`)에도 남는다(기기 등록은 계좌와 별개).
+    - API: `POST /api/paper/fcm/register`(`{"token":"...","platform":"android"}`, `enabled:false`면 삭제),
+      `DELETE /api/paper/fcm/register?token=...`(토큰 생략 시 전체 삭제), `GET /api/paper/fcm/status`,
+      `POST /api/paper/fcm/test`(등록 기기로 테스트 푸시 1건, 체결·계좌에는 영향 없음).
+      토큰은 `paper_fcm_tokens`(token PRIMARY KEY, platform, updated_at) 테이블에 저장된다.
 - Yahoo Finance `t.info`가 서버 IP에서 막히면(429/401) **SEC EDGAR 공시(XBRL)** 에서
   PER·매출성장률·영업이익률·부채비율을 계산해 채운다(API 키 불필요).
 - SEC 공시에도 값이 없으면(예: us-gaap 태그가 없는 외국 ADR `TSM`) **Finnhub**
@@ -220,7 +236,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자(수수료·세금·환차 포함) 검증, 532개)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자(수수료·세금·환차 포함)·FCM 체결 푸시 검증, 560개)
 
 ## 환경변수
 | 이름 | 설명 |
@@ -244,4 +260,6 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `PAPER_MIN_ORDER_KRW` | 모의투자 최소 주문 금액(기본 10000원) |
 | `PAPER_CANDIDATES` | 시장별 매수 후보 수(기본 10종목) |
 | `PAPER_USDKRW` | 환율 조회가 모두 실패할 때 쓰는 고정 USD/KRW(기본 1350) |
+| `FIREBASE_SERVICE_ACCOUNT_JSON` | 체결 푸시(FCM) 서비스 계정 JSON 문자열 전체 또는 base64(선택). 없으면 푸시만 건너뜀 |
+| `FIREBASE_CREDENTIALS_PATH` | `FIREBASE_SERVICE_ACCOUNT_JSON` 대신 쓸 서비스 계정 JSON 파일 경로(선택) |
 | `SEC_EDGAR_FALLBACK` / `FINNHUB_FALLBACK` | Yahoo `t.info` 대체 경로 스위치(기본 켜짐). `0`이면 끔 |

@@ -49,6 +49,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import extended_quotes
+import fcm
 import history_store
 import kospi200_scanner
 import naver_finance
@@ -644,7 +645,7 @@ def _position_views(positions: list[dict], price_fn, fx_rate: float) -> dict:
 
 def run(markets=None, force: bool = False, trigger: str = "manual", db_path: str | None = None,
         ai_call=None, price_fn=None, candidate_fn=None, fx_fn=None,
-        now: datetime | None = None) -> dict:
+        now: datetime | None = None, push_fn=None) -> dict:
     """AI 모의투자 1회 실행(매도 → 매수 → 스냅샷). 동시에 두 번 돌지 않는다.
 
     이미 다른 실행이 돌고 있으면 기다리지 않고 `skipped: "already_running"`을 돌려준다 —
@@ -660,21 +661,21 @@ def run(markets=None, force: bool = False, trigger: str = "manual", db_path: str
     try:
         return _run_locked(markets=markets, force=force, trigger=trigger, db_path=db_path,
                            ai_call=ai_call, price_fn=price_fn, candidate_fn=candidate_fn,
-                           fx_fn=fx_fn, now=now)
+                           fx_fn=fx_fn, now=now, push_fn=push_fn)
     finally:
         _RUN_LOCK.release()
 
 
 def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
                 db_path: str | None = None, ai_call=None, price_fn=None, candidate_fn=None,
-                fx_fn=None, now: datetime | None = None) -> dict:
+                fx_fn=None, now: datetime | None = None, push_fn=None) -> dict:
     """실제 실행 본체(`run`이 락을 잡고 부른다).
 
     `markets`: "ALL"/"US"/"KR" 또는 목록. 비우면 계좌 설정을 따른다.
     `force`: False면 오늘 이미 돈 시장은 건너뛴다(자동 실행 중복 방지).
     `ai_call(prompt) -> str|dict|None`, `price_fn(tickers) -> (prices, sources)`,
-    `candidate_fn(market, criteria) -> list[dict]`, `fx_fn() -> {"rate","source"}`는
-    테스트·대체 경로용 주입점이다.
+    `candidate_fn(market, criteria) -> list[dict]`, `fx_fn() -> {"rate","source"}`,
+    `push_fn(sells, buys, db_path) -> dict`는 테스트·대체 경로용 주입점이다.
     """
     price_fn = price_fn or default_prices
     candidate_fn = candidate_fn or default_candidates
@@ -858,6 +859,17 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
         else:
             skipped.append({"ticker": symbol, "reason": "수량이 0이 되어 체결하지 않음"})
 
+    # --- 6.5) 체결 푸시: 실제 체결이 1건 이상일 때만 등록된 기기로 바로 보낸다 ---
+    # 발송은 fcm 안에서 예외·시간 초과를 흡수하므로, 여기서 실패해도 매매·기록은 그대로 끝난다.
+    push: dict | None = None
+    if sells or buys:
+        sender = push_fn or (lambda s, b, p: fcm.notify_fills(s, b, p))
+        try:
+            push = sender(sells, buys, db_path)
+        except Exception as exc:  # 주입된 발송기까지 막아 둔다
+            logger.warning("체결 푸시 생략(%s: %s)", type(exc).__name__, str(exc)[:200])
+            push = {"sent": 0, "failed": 0, "error": "push_failed"}
+
     # --- 7) 스냅샷·실행 기록 ---
     final_positions = paper_store.list_positions(db_path)
     final_views = _position_views(final_positions, price_fn, fx_rate)
@@ -886,6 +898,7 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
         "notes": [note for note in notes if note],
         "summary": summary,
         "positions_count": len(final_positions),
+        "push": push,
         "ran_at": paper_store._now(),
     }
     logger.info("모의투자 실행 %s(%s): 매도 %d · 매수 %d · 총자산 ₩%.0f(%s%%) · AI %s",

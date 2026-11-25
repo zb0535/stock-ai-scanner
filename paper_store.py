@@ -32,6 +32,7 @@ TABLE_ACCOUNT = "paper_account"
 TABLE_POSITIONS = "paper_positions"
 TABLE_TRADES = "paper_trades"
 TABLE_EQUITY = "paper_equity_history"
+TABLE_FCM_TOKENS = "paper_fcm_tokens"
 
 ACCOUNT_ID = 1
 
@@ -110,6 +111,12 @@ CREATE TABLE IF NOT EXISTS {TABLE_EQUITY} (
     return_pct      REAL,
     recorded_at     TEXT
 );
+
+CREATE TABLE IF NOT EXISTS {TABLE_FCM_TOKENS} (
+    token      TEXT PRIMARY KEY,
+    platform   TEXT NOT NULL DEFAULT '',
+    updated_at TEXT
+);
 """
 
 # PostgreSQL: AUTOINCREMENT 대신 SERIAL, REAL 대신 DOUBLE PRECISION.
@@ -170,6 +177,12 @@ CREATE TABLE IF NOT EXISTS {TABLE_EQUITY} (
     stock_value_krw DOUBLE PRECISION NOT NULL,
     return_pct      DOUBLE PRECISION,
     recorded_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS {TABLE_FCM_TOKENS} (
+    token      TEXT PRIMARY KEY,
+    platform   TEXT NOT NULL DEFAULT '',
+    updated_at TEXT
 );
 """
 
@@ -716,6 +729,70 @@ def clear_equity(db_path: str | None = None) -> int:
     with _connection(db_path, write=True) as (conn, backend):
         cur = conn.execute(f"DELETE FROM {TABLE_EQUITY}")
         return int(getattr(cur, "rowcount", 0) or 0)
+
+
+# --- FCM 토큰(체결 푸시 알림 기기) ---------------------------------------------
+
+
+def register_fcm_token(token: str, platform: str = "android",
+                       db_path: str | None = None) -> dict:
+    """앱이 받은 FCM 토큰을 저장하거나 갱신한다(토큰 하나 = 기기 하나).
+
+    같은 토큰이 다시 오면 `updated_at`만 새로 쓴다(재설치·앱 실행마다 동기화해도 행이 늘지 않음).
+    """
+    clean = str(token or "").strip()
+    if not clean:
+        raise ValueError("empty_token")
+    if len(clean) > 4096:
+        raise ValueError("token_too_long")
+    stamp = _now()
+    payload = {"token": clean, "platform": str(platform or "").strip()[:32], "updated_at": stamp}
+    with _connection(db_path, write=True) as (conn, backend):
+        conn.execute(
+            _sql(f"INSERT INTO {TABLE_FCM_TOKENS} (token, platform, updated_at)"
+                 " VALUES (?, ?, ?)"
+                 " ON CONFLICT (token) DO UPDATE SET platform = excluded.platform,"
+                 " updated_at = excluded.updated_at", backend),
+            (payload["token"], payload["platform"], payload["updated_at"]),
+        )
+    return payload
+
+
+def remove_fcm_token(token: str, db_path: str | None = None) -> int:
+    """토큰 하나를 지운다(알림 끄기·만료 정리). 지운 행 수를 돌려준다."""
+    clean = str(token or "").strip()
+    if not clean:
+        return 0
+    with _connection(db_path, write=True) as (conn, backend):
+        cur = conn.execute(_sql(f"DELETE FROM {TABLE_FCM_TOKENS} WHERE token = ?", backend), (clean,))
+        return int(getattr(cur, "rowcount", 0) or 0)
+
+
+def remove_fcm_tokens(tokens: list[str], db_path: str | None = None) -> int:
+    """여러 토큰을 한 번에 지운다(만료 토큰 일괄 정리)."""
+    removed = 0
+    for token in list(dict.fromkeys(str(t or "").strip() for t in tokens or [])):
+        if token:
+            removed += remove_fcm_token(token, db_path)
+    return removed
+
+
+def list_fcm_tokens(db_path: str | None = None) -> list[dict]:
+    """등록된 기기 토큰(최신 순)."""
+    with _connection(db_path) as (conn, backend):
+        cur = conn.execute(_sql(
+            f"SELECT token, platform, updated_at FROM {TABLE_FCM_TOKENS}"
+            " ORDER BY updated_at DESC", backend))
+        rows = _rows(cur)
+    return [{"token": str(row.get("token") or ""),
+             "platform": str(row.get("platform") or ""),
+             "updated_at": row.get("updated_at")} for row in rows]
+
+
+def count_fcm_tokens(db_path: str | None = None) -> int:
+    with _connection(db_path) as (conn, backend):
+        row = _row(conn.execute(_sql(f"SELECT COUNT(*) AS n FROM {TABLE_FCM_TOKENS}", backend)))
+    return int((row or {}).get("n") or 0)
 
 
 # --- 초기화 -------------------------------------------------------------------

@@ -7,3 +7,7 @@ frontend/dist/
 
 # 추천 이력 SQLite(로컬 데이터)
 data/
+
+# Firebase 서비스 계정 비공개 키 — 절대 커밋 금지(환경변수 FIREBASE_SERVICE_ACCOUNT_JSON로만 주입)
+*firebase-adminsdk*.json
+*service-account*.json
