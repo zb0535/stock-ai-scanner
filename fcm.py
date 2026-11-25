@@ -344,8 +344,12 @@ def _dispatch(title: str, body: str, data: dict, db_path: str | None) -> dict:
     ready = is_configured()
     if not ready:
         logger.info("FCM 미설정(%s) — 푸시를 건너뜁니다", _INIT_ERROR or "not_configured")
+        try:
+            registered = paper_store.count_fcm_tokens(db_path)
+        except Exception:
+            registered = 0
         return {"configured": False, "reason": _INIT_ERROR or "not_configured",
-                "sent": 0, "failed": 0, "removed": 0, "tokens": 0}
+                "sent": 0, "failed": 0, "removed": 0, "tokens": registered}
     try:
         tokens = [row["token"] for row in paper_store.list_fcm_tokens(db_path)]
     except Exception as exc:
