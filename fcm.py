@@ -150,6 +150,12 @@ def status(db_path: str | None = None) -> dict:
         "project_id": _PROJECT_ID,
         "channel_id": CHANNEL_ID,
     }
+    # 배포 환경에 firebase-admin이 실제로 설치됐는지(키를 넣기 전에 확인할 수 있게) 버전만 노출한다.
+    try:
+        import firebase_admin as _sdk
+        out["sdk"] = getattr(_sdk, "__version__", "installed")
+    except Exception:
+        out["sdk"] = None
     if not configured:
         out["reason"] = _INIT_ERROR or "not_configured"
     try:
