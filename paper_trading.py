@@ -119,6 +119,7 @@ AUTO_START_GRACE_SEC = 120
 STATUS_TTL = float(os.environ.get("PAPER_STATUS_TTL", "25"))
 STATUS_STALE_SEC = float(os.environ.get("PAPER_STATUS_STALE", "180"))
 STATUS_WARM_DELAY = float(os.environ.get("PAPER_STATUS_WARM_DELAY", "20"))
+STATUS_WARM_INTERVAL = float(os.environ.get("PAPER_STATUS_WARM_INTERVAL", "60"))
 _STATUS_CACHE: dict[str, dict] = {}       # 키 -> {"ts": float, "snapshot": dict}
 _STATUS_LOCK = threading.Lock()
 _STATUS_BUILD_LOCK = threading.Lock()
@@ -1164,10 +1165,7 @@ def _snapshot(db_path: str | None = None, price_fn=None, fx_fn=None, limit_trade
 
 
 def warm_status_cache(delay: float | None = None) -> None:
-    """기동 직후 상태 스냅샷을 미리 만들어 둔다 — 서버가 방금 떠도 첫 탭이 바로 뜼다.
-
-    데모 스레드라 실패해도 서버는 계속 돈다. `PAPER_STATUS_PREWARM=0`이면 끔.
-    """
+    """상태 스냅샷을 한 번 미리 만들어 둔다(테스트·수동용). 계속 돌리려면 `start_status_warm`."""
     if (os.environ.get("PAPER_STATUS_PREWARM") or "1").strip() in ("0", "false", "False"):
         return
     if not _status_cache_enabled():
@@ -1177,16 +1175,49 @@ def warm_status_cache(delay: float | None = None) -> None:
     def _work() -> None:
         if wait > 0:
             time.sleep(wait)
-        try:
-            with _STATUS_BUILD_LOCK:
-                if _cached_snapshot(None) is None:
-                    _store_snapshot(None, _build_snapshot())
-                logger.info("모의투자 상태 스냅샷 예열 완료")
-        except Exception as exc:  # 예열 실패는 첫 요청이 다시 시도한다
-            logger.warning("모의투자 상태 예열 실패: %s: %s",
-                           type(exc).__name__, str(exc)[:160])
+        _warm_once()
 
     threading.Thread(target=_work, name="paper-status-warm", daemon=True).start()
+
+
+def _warm_once() -> bool:
+    """캐시가 비었거나 TTL이 지났으면 스냅샷을 새로 만들어 둔다. 실패는 삼킨다."""
+    try:
+        with _STATUS_BUILD_LOCK:
+            item = _cached_snapshot(None)
+            age = time.time() - float(item.get("ts") or 0.0) if item else None
+            if age is not None and age < STATUS_TTL:
+                return False
+            _store_snapshot(None, _build_snapshot())
+            return True
+    except Exception as exc:  # 예열 실패는 다음 요청·다음 주기가 다시 시도한다
+        logger.warning("모의투자 상태 예열 실패: %s: %s", type(exc).__name__, str(exc)[:160])
+        return False
+
+
+def start_status_warm(delay: float | None = None, interval: float | None = None) -> bool:
+    """기동 뒤 상태 스냅샷을 **주기적으로** 미리 채운다 — 앱을 열 때마다 기다리지 않게.
+
+    기본은 20초 뒤 시작해 `PAPER_STATUS_WARM_INTERVAL`(60초)마다 한 번. 백그라운드에서
+    만들어 두므로 사용자 요청은 캐시를 바로 받는다(가장 오래된 값도 1분 안쪽).
+    `PAPER_STATUS_PREWARM=0`이면 시작하지 않는다 — 단위 테스트·로컬 실행용.
+    """
+    if (os.environ.get("PAPER_STATUS_PREWARM") or "1").strip() in ("0", "false", "False"):
+        return False
+    if not _status_cache_enabled():
+        return False
+    wait = STATUS_WARM_DELAY if delay is None else max(0.0, float(delay))
+    period = max(5.0, STATUS_WARM_INTERVAL if interval is None else float(interval))
+
+    def _loop() -> None:
+        if wait > 0:
+            time.sleep(wait)
+        while True:
+            _warm_once()
+            time.sleep(period)
+
+    threading.Thread(target=_loop, name="paper-status-warm", daemon=True).start()
+    return True
 
 
 def status(db_path: str | None = None, price_fn=None, fx_fn=None,

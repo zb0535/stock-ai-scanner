@@ -154,7 +154,8 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     동안 재사용한다. 미국↔한국 탭을 오가면 즉시(캐시 적중 시 1ms 미만) 응답하고, 25초가 지나
     `PAPER_STATUS_STALE`(기본 180초) 안이면 옛 값을 먼저 주고 뒤에서 새로 채운다. `run`·`configure`
     (초기화 포함)는 캐시를 즉시 버려 매매 직후엔 항상 최신 값이다. 서버 기동 뒤에는
-    `PAPER_STATUS_WARM_DELAY`(기본 20초) 뒤 상태 스냅샷을 미리 만들어 두므로 첫 탭도 바로 뜼다.
+    20초 뒤부터 `PAPER_STATUS_WARM_INTERVAL`(기본 60초)마다 상태 스냅샷을 백그라운드에서
+    새로 채워 두므로 앱을 언제 열어도 기다리지 않는다(가장 오래된 값도 1분 안쪽).
     두 계좌의 계좌·보유·체결·스냅샷은 **한 문장씩** 읽어(윈도 함수로 계좌별 LIMIT) 원격 DB 왕복도
     9번에서 6번으로 줄였다. 응답의 `cache`(적중·나이·TTL)와
     `timings`(DB·환율·시세·전체 ms)로 어느 단계가 느린지 바로 알 수 있다. 예전에는 status 한 번에
@@ -281,7 +282,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `PAPER_STATUS_TTL` | 모의투자 상태 스냅샷 캐시 유효 시간(초, 기본 25). `0`이면 매번 새로 계산 |
 | `PAPER_STATUS_STALE` | 상태 스냅샷이 만료된 뒤에도 옛 값을 먼저 내주는 한도(초, 기본 180). 그 안에는 백그라운드에서 새로 채운다 |
 | `PAPER_STATUS_CACHE` | 상태 스냅샷 캐시 스위치(기본 켜짐). `0`이면 캐시 없이 매번 계산 |
-| `PAPER_STATUS_PREWARM` / `PAPER_STATUS_WARM_DELAY` | 기동 후 상태 스냅샷 예열(기본 켜짐) · 예열 시작까지 지연(초, 기본 20) |
+| `PAPER_STATUS_PREWARM` / `PAPER_STATUS_WARM_DELAY` / `PAPER_STATUS_WARM_INTERVAL` | 기동 후 상태 스냅샷 예열(기본 켜짐) · 예열 시작까지 지연(초, 기본 20) · 다시 채우는 주기(초, 기본 60) |
 | `PAPER_USDKRW` | 환율 조회가 모두 실패할 때 쓰는 고정 USD/KRW(기본 1350) |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | 체결 푸시(FCM) 서비스 계정 JSON 문자열 전체 또는 base64(선택). 없으면 푸시만 건너뜀 |
 | `FIREBASE_CREDENTIALS_PATH` | `FIREBASE_SERVICE_ACCOUNT_JSON` 대신 쓸 서비스 계정 JSON 파일 경로(선택) |

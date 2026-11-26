@@ -392,28 +392,6 @@ class StatusEndpointTests(StatusCase):
         self.assertEqual(us["comparison"], kr["comparison"])
         self.assertEqual(kr["market"], "KR")
 
-    def test_prewarm_fills_cache_before_first_request(self):
-        with patch.object(paper_trading, "default_prices", self.prices({})), \
-             patch.object(paper_trading, "get_usd_krw", self.fx()):
-            paper_trading.warm_status_cache(delay=0)
-            deadline = time.time() + 2.0
-            body = None
-            while time.time() < deadline:
-                body = paper_trading.status(db_path=self.db_path, market="KR")
-                if body["cache"]["hit"]:
-                    break
-                time.sleep(0.02)
-        self.assertIsNotNone(body)
-        self.assertTrue(body["cache"]["hit"], "예열된 스냅샷을 바로 쓴다")
-
-    def test_prewarm_switch_off(self):
-        with patch.dict(os.environ, {"PAPER_STATUS_PREWARM": "0"}), \
-             patch.object(paper_trading, "default_prices", self.prices({})), \
-             patch.object(paper_trading, "get_usd_krw", self.fx()):
-            paper_trading.warm_status_cache(delay=0)
-            time.sleep(0.2)
-        self.assertIsNone(paper_trading._cached_snapshot(self.db_path))
-
     def test_status_after_configure_shows_new_value(self):
         with patch.object(paper_trading, "get_usd_krw", self.fx()):
             self.client.get("/api/paper/status?market=KR")
@@ -423,6 +401,81 @@ class StatusEndpointTests(StatusCase):
             body = self.client.get("/api/paper/status?market=KR").json()
         self.assertEqual(body["account"]["cash_krw"], 3_000_000)
         self.assertEqual(response.json()["status"]["account"]["cash_krw"], 3_000_000)
+
+# ---------------------------------------------------------------------------
+# 6. 기동 예열 — 사용자가 앱을 열 때 캐시가 이미 차 있게
+# ---------------------------------------------------------------------------
+
+
+class PrewarmTests(StatusCase):
+    def setUp(self):
+        super().setUp()
+        self.patches = [
+            patch.object(paper_trading, "default_prices", self.prices({})),
+            patch.object(paper_trading, "get_usd_krw", self.fx()),
+        ]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_prewarm_fills_cache_before_first_request(self):
+        paper_trading.warm_status_cache(delay=0)
+        deadline = time.time() + 2.0
+        while time.time() < deadline and paper_trading._cached_snapshot(None) is None:
+            time.sleep(0.02)
+        self.assertIsNotNone(paper_trading._cached_snapshot(None), "예열이 스냅샷을 만든다")
+        body = paper_trading.status(market="KR")
+        self.assertTrue(body["cache"]["hit"], "예열된 스냅샷을 바로 쓴다")
+
+    def test_prewarm_switch_off(self):
+        with patch.dict(os.environ, {"PAPER_STATUS_PREWARM": "0"}):
+            paper_trading.warm_status_cache(delay=0)
+            self.assertFalse(paper_trading.start_status_warm(delay=0, interval=5))
+            time.sleep(0.2)
+        self.assertIsNone(paper_trading._cached_snapshot(None))
+
+    def test_periodic_warm_builds_at_start(self):
+        builds = []
+        original = paper_trading._build_snapshot
+
+        def counting(*args, **kwargs):
+            builds.append(1)
+            return original(*args, **kwargs)
+
+        with patch.object(paper_trading, "_build_snapshot", counting):
+            self.assertTrue(paper_trading.start_status_warm(delay=0, interval=5))
+            deadline = time.time() + 2.0
+            while time.time() < deadline and paper_trading._cached_snapshot(None) is None:
+                time.sleep(0.02)
+        self.assertTrue(builds, "예열 루프가 스냅샷을 만든다")
+        self.assertIsNotNone(paper_trading._cached_snapshot(None))
+
+    def test_warm_once_rebuilds_expired_snapshot(self):
+        builds = []
+        original = paper_trading._build_snapshot
+
+        def counting(*args, **kwargs):
+            builds.append(1)
+            return original(*args, **kwargs)
+
+        with patch.object(paper_trading, "_build_snapshot", counting):
+            paper_trading.status(use_cache=True)          # 1번째
+            with patch.object(paper_trading, "STATUS_TTL", -1.0):
+                self.assertTrue(paper_trading._warm_once())   # 만료 → 2번째
+        self.assertEqual(len(builds), 2)
+
+    def test_warm_skips_when_snapshot_is_fresh(self):
+        builds = []
+        original = paper_trading._build_snapshot
+
+        def counting(*args, **kwargs):
+            builds.append(1)
+            return original(*args, **kwargs)
+
+        with patch.object(paper_trading, "_build_snapshot", counting):
+            paper_trading.status(use_cache=True)
+            paper_trading._warm_once()
+        self.assertEqual(len(builds), 1, "방금 만든 스냅샷은 다시 만들지 않는다")
 
 
 if __name__ == "__main__":

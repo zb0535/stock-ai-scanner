@@ -108,8 +108,9 @@ async def lifespan(_app: FastAPI):
     except Exception as exc:  # 저장소 장애가 기동을 막지 않게
         logger.warning("모의투자 계좌 초기화 실패: %s: %s", type(exc).__name__, str(exc)[:200])
     paper_trading.start_auto(ai_call=_paper_ai_call)
-    # 첫 탭부터 빠르게: 20여 초 뒤(헬스체크·예열과 겹치지 않게) 상태 스냅샷을 미리 만든다.
-    paper_trading.warm_status_cache()
+    # 첫 탭부터 빠르게: 20초 뒤 상태 스냅샷을 만들고, 이후 60초마다 새로 채워 둔다
+    # (사용자가 앱을 열면 캐시를 바로 받는다 — 가장 오래된 값도 1분 안쪽).
+    paper_trading.start_status_warm()
     try:
         yield
     finally:
