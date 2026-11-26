@@ -1155,10 +1155,16 @@ class PaperRunRequest(BaseModel):
 
 
 @app.get("/api/paper/status")
-def paper_status(trades: int = 40, history: int = 180, market: str = "US"):
-    """한 계좌의 요약·보유·체결·수익률 + 미국·한국 두 계좌 비교 요약(`accounts`)."""
+def paper_status(trades: int = 40, history: int = 180, market: str = "US", fresh: bool = False):
+    """한 계좌의 요약·보유·체결·수익률 + 미국·한국 두 계좌 비교 요약(`accounts`).
+
+    두 계좌 평가를 한 벌로 계산해 `PAPER_STATUS_TTL`(기본 25초) 동안 재사용한다 — 앱이
+    미국↔한국 탭을 오가도 시세·DB를 다시 부르지 않아 바로 응답한다. `fresh=true`면 캐시를
+    건너뛰고 새로 계산한다(진단용). 매매·설정 직후엔 캐시가 자동으로 버려진다.
+    """
     try:
-        return paper_trading.status(limit_trades=trades, limit_equity=history, market=market)
+        return paper_trading.status(limit_trades=trades, limit_equity=history, market=market,
+                                    use_cache=False if fresh else None)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -1184,7 +1190,7 @@ def paper_configure(req: PaperConfigureRequest):
     except Exception as exc:
         logger.exception("모의투자 설정 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_storage_unavailable")
-    return {"ok": True, **result, "status": paper_trading.status(market=market)}
+    return {"ok": True, **result, "status": paper_trading.status(market=market, use_cache=False)}
 
 
 @app.post("/api/paper/run")
@@ -1204,7 +1210,7 @@ def paper_run(req: PaperRunRequest | None = None):
     except Exception as exc:
         logger.exception("모의투자 실행 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_run_failed")
-    return {"ok": True, "result": result, "status": paper_trading.status(market=market)}
+    return {"ok": True, "result": result, "status": paper_trading.status(market=market, use_cache=False)}
 
 
 # --- 체결 푸시 알림(FCM) ------------------------------------------------------

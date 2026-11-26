@@ -52,6 +52,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import extended_quotes
@@ -113,6 +114,15 @@ ACCOUNT_FLAGS = {"US": "🇺🇸", "KR": "🇰🇷"}
 ACCOUNT_ORDER = ("KR", "US")   # 같은 시각에 둘 다 밀려 있으면 한국을 먼저 처리한다
 AUTO_INTERVAL_SEC = int(os.environ.get("PAPER_AUTO_INTERVAL", "300"))
 AUTO_START_GRACE_SEC = 120
+
+# 상태 스냅샷 캐시(탭 전환·새로고침) — 계좌 두 개를 한 번에 평가한 결과를 잠시 재사용한다.
+STATUS_TTL = float(os.environ.get("PAPER_STATUS_TTL", "25"))
+STATUS_STALE_SEC = float(os.environ.get("PAPER_STATUS_STALE", "180"))
+_STATUS_CACHE: dict[str, dict] = {}       # 키 -> {"ts": float, "snapshot": dict}
+_STATUS_LOCK = threading.Lock()
+_STATUS_BUILD_LOCK = threading.Lock()
+_STATUS_REFRESHING: set[str] = set()
+_STATUS_GENERATION = 0                    # 매매·설정으로 캐시를 비울 때마다 +1(진행 중 갱신 무효화)
 
 # --- 환율 -------------------------------------------------------------------
 DEFAULT_USD_KRW = float(os.environ.get("PAPER_USDKRW", "1350"))
@@ -711,6 +721,8 @@ def run(market=None, force: bool = False, trigger: str = "manual", db_path: str 
                            ai_call=ai_call, price_fn=price_fn, candidate_fn=candidate_fn,
                            fx_fn=fx_fn, now=now, push_fn=push_fn)
     finally:
+        # 매매가 끝나면 상태 스냅샷은 반드시 새로 만든다(체결 직후 탭은 최신 값이어야 한다).
+        invalidate_status_cache(db_path)
         _RUN_LOCK.release()
 
 
@@ -957,60 +969,225 @@ def _run_locked(market=None, force: bool = False, trigger: str = "manual",
 # --- 상태 -------------------------------------------------------------------
 
 
-def status(db_path: str | None = None, price_fn=None, fx_fn=None,
-           limit_trades: int = 40, limit_equity: int = 180, market: str | None = None) -> dict:
-    """한 계좌의 상세(보유·체결·수익률) + **두 계좌를 나란히 비교하는 요약**.
+def _status_cache_enabled() -> bool:
+    """`PAPER_STATUS_CACHE=0`이면 캐시 없이 매번 새로 계산한다(진단·테스트 스위치)."""
+    return (os.environ.get("PAPER_STATUS_CACHE") or "1").strip() not in ("0", "false", "False")
 
-    반환: `market`이 지정한 계좌(기본 미국)의 `account`·`positions`·`trades`·`equity_history`와
-    함께, `accounts`(US·KR 각각의 총자산·수익률·현금·보유 수·마지막 실행일)와 앱이
-    순서대로 그리기 쉬운 `comparison` 목록을 담는다.
+
+def _cache_key(db_path: str | None) -> str:
+    return str(db_path or "default")
+
+
+def _cached_snapshot(db_path: str | None) -> dict | None:
+    with _STATUS_LOCK:
+        return _STATUS_CACHE.get(_cache_key(db_path))
+
+
+def _store_snapshot(db_path: str | None, snapshot: dict) -> None:
+    with _STATUS_LOCK:
+        _STATUS_CACHE[_cache_key(db_path)] = {"ts": time.time(), "snapshot": snapshot}
+
+
+def invalidate_status_cache(db_path: str | None = None) -> None:
+    """상태 스냅샷 캐시를 지운다 — 매매·설정 변경 직후엔 항상 최신 값을 보여야 한다."""
+    global _STATUS_GENERATION
+    with _STATUS_LOCK:
+        _STATUS_GENERATION += 1   # 이전에 시작한 백그라운드 갱신은 결과를 버린다
+        if db_path is None:
+            _STATUS_CACHE.clear()
+        else:
+            _STATUS_CACHE.pop(_cache_key(db_path), None)
+
+
+def _timed_call(fn, *args) -> tuple[object, Exception | None, float]:
+    """함수 하나를 부르고 (결과, 예외, 소요 ms)를 돌려준다(단계별 소요 측정용)."""
+    start = time.perf_counter()
+    try:
+        return fn(*args), None, (time.perf_counter() - start) * 1000
+    except Exception as exc:  # 호출부가 단계별로 흡수한다
+        return None, exc, (time.perf_counter() - start) * 1000
+
+
+def _build_snapshot(db_path: str | None = None, price_fn=None, fx_fn=None,
+                    limit_trades: int = 40, limit_equity: int = 180) -> dict:
+    """두 계좌의 평가 스냅샷 한 벌 — DB 1회 · 환율/시세 병렬 · 계좌별 평가.
+
+    단계별 소요(ms)를 `timings`에 남긴다 — 탭 전환이 느릴 때 어느 단계인지 응답만 보고 안다.
+    `price_fn`/`fx_fn`은 테스트·대체 경로 주입점이다(없으면 실시간 시세·네이버 환율).
     """
-    scope = account_scope(market)
-    account_id = account_id_of(scope)
-    paper_store.init_store(db_path)
-    fx = (fx_fn or get_usd_krw)()
-    fx_rate = float(fx["rate"])
+    started = time.perf_counter()
+    data = paper_store.snapshot(limit_trades=limit_trades, limit_equity=limit_equity,
+                                db_path=db_path)
+    db_ms = (time.perf_counter() - started) * 1000
 
-    accounts = {aid: paper_store.get_account(aid, db_path) for aid in paper_store.ACCOUNTS}
-    raw_positions = {aid: paper_store.list_positions(db_path, aid) for aid in paper_store.ACCOUNTS}
-    # 두 계좌의 종목을 한 번에 평가한다(시세 호출을 두 배로 늘리지 않는다).
     tickers: list[str] = []
     for aid in paper_store.ACCOUNTS:
-        for row in raw_positions[aid]:
+        for row in data["positions"][aid]:
             if row["ticker"] not in tickers:
                 tickers.append(row["ticker"])
+
+    # 환율과 시세는 서로 상관이 없다 — 같이 부른다(순차 1.5초 → 병렬 1초 안쪽).
+    fx: object = None
+    fx_error: Exception | None = None
+    fx_ms = 0.0
     prices: dict = {}
     sources: dict = {}
-    if tickers:
-        try:
-            prices, sources = (price_fn or default_prices)(tickers) or ({}, {})
-        except Exception as exc:  # 시세 장애 → 원가 평가로 계속
-            logger.warning("모의투자 평가 시세 실패: %s: %s", type(exc).__name__, str(exc)[:160])
-    views = {aid: _valuation(raw_positions[aid], prices or {}, sources or {}, fx_rate)
+    price_error: Exception | None = None
+    prices_ms = 0.0
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="paper-status") as pool:
+        fx_future = pool.submit(_timed_call, fx_fn or get_usd_krw)
+        price_future = (pool.submit(_timed_call, price_fn or default_prices, tickers)
+                        if tickers else None)
+        fx, fx_error, fx_ms = fx_future.result()
+        if price_future is not None:
+            got, price_error, prices_ms = price_future.result()
+            if isinstance(got, tuple) and len(got) == 2:  # (가격, 출처)
+                prices = got[0] or {}
+                sources = got[1] or {}
+
+    if fx_error is not None:
+        logger.warning("모의투자 환율 조회 실패: %s: %s",
+                       type(fx_error).__name__, str(fx_error)[:160])
+    if not isinstance(fx, dict) or not _num(fx.get("rate")):
+        fx = {"rate": DEFAULT_USD_KRW, "source": "fixed_fallback"}
+    if price_error is not None:  # 시세 장애 → 원가 평가로 계속(응답은 정상)
+        logger.warning("모의투자 평가 시세 실패: %s: %s",
+                       type(price_error).__name__, str(price_error)[:160])
+
+    fx_rate = float(fx["rate"])
+    views = {aid: _valuation(data["positions"][aid], prices, sources, fx_rate)
              for aid in paper_store.ACCOUNTS}
-    today = paper_store.kst_today_str()
 
     rows: dict[str, dict] = {}
     for aid in paper_store.ACCOUNTS:
-        acct = accounts[aid]
+        account = data["accounts"][aid]
         mkt = paper_store.account_market(aid)
-        summary = _summary(acct, acct["cash_krw"], views[aid]["stock_value_krw"])
+        summary = _summary(account, account["cash_krw"], views[aid]["stock_value_krw"])
         rows[mkt] = {
             **summary,
             "account_id": aid,
             "market": mkt,
             "label": account_label(mkt),
-            "positions_count": len(raw_positions[aid]),
-            "realized_pnl_krw": paper_store.realized_pnl(db_path, aid),
-            "strategy": acct["strategy"],
-            "strategy_label": paper_store.STRATEGY_LABELS.get(acct["strategy"], acct["strategy"]),
-            "auto_enabled": acct["auto_enabled"],
-            "last_run_date": acct.get(f"last_run_{mkt.lower()}_date"),
+            "positions_count": len(data["positions"][aid]),
+            "realized_pnl_krw": data["realized"][aid],
+            "strategy": account["strategy"],
+            "strategy_label": paper_store.STRATEGY_LABELS.get(account["strategy"],
+                                                              account["strategy"]),
+            "auto_enabled": account["auto_enabled"],
+            "last_run_date": account.get(f"last_run_{mkt.lower()}_date"),
         }
 
+    return {
+        "rows": rows,
+        "views": views,
+        "accounts": data["accounts"],
+        "positions": data["positions"],
+        "trades": data["trades"],
+        "equity": data["equity"],
+        "fx": fx,
+        "fx_rate": fx_rate,
+        "today": paper_store.kst_today_str(),
+        "storage_backend": data["storage_backend"],
+        "as_of": paper_store._now(),
+        "timings": {
+            "db_ms": round(db_ms, 1),
+            "fx_ms": round(fx_ms, 1),
+            "prices_ms": round(prices_ms, 1),
+            "total_ms": round((time.perf_counter() - started) * 1000, 1),
+        },
+    }
+
+
+def _refresh_in_background(key: str, db_path: str | None, price_fn, fx_fn,
+                          limit_trades: int, limit_equity: int) -> None:
+    """만료된 스냅샷을 뒤에서 새로 만든다(기다리던 요청은 옛 값을 바로 받는다)."""
+    with _STATUS_LOCK:
+        if key in _STATUS_REFRESHING:
+            return
+        _STATUS_REFRESHING.add(key)
+        generation = _STATUS_GENERATION
+
+    def _work() -> None:
+        try:
+            with _STATUS_BUILD_LOCK:
+                snapshot = _build_snapshot(db_path, price_fn, fx_fn, limit_trades, limit_equity)
+                with _STATUS_LOCK:  # 만드는 사이 매매·설정이 있었다면 옛 상태를 덮어쓰지 않는다
+                    stale = generation != _STATUS_GENERATION
+                if not stale:
+                    _store_snapshot(db_path, snapshot)
+        except Exception as exc:  # 백그라운드 실패는 응답을 막지 않는다
+            logger.warning("모의투자 상태 백그라운드 갱신 실패: %s: %s",
+                           type(exc).__name__, str(exc)[:160])
+        finally:
+            with _STATUS_LOCK:
+                _STATUS_REFRESHING.discard(key)
+
+    threading.Thread(target=_work, name="paper-status-refresh", daemon=True).start()
+
+
+def _snapshot(db_path: str | None = None, price_fn=None, fx_fn=None, limit_trades: int = 40,
+              limit_equity: int = 180, use_cache: bool = True) -> tuple[dict, bool, float]:
+    """`(스냅샷, 캐시 적중 여부, 캐시 나이 초)`.
+
+    - `STATUS_TTL`(25초) 안이면 그대로 재사용 — 미국↔한국 탭을 오가도 즉시 응답.
+    - `STATUS_STALE_SEC`(3분) 안이면 옛 값을 먼저 주고 백그라운드에서 새로 채운다.
+    - 동시에 여러 요청이 들어와도 만드는 일은 한 번(`_STATUS_BUILD_LOCK`).
+    """
+    key = _cache_key(db_path)
+    if use_cache:
+        item = _cached_snapshot(db_path)
+        if item:
+            age = max(0.0, time.time() - float(item.get("ts") or 0.0))
+            if age < STATUS_TTL:
+                return item["snapshot"], True, age
+            if age < STATUS_STALE_SEC:
+                _refresh_in_background(key, db_path, price_fn, fx_fn, limit_trades, limit_equity)
+                return item["snapshot"], True, age
+    seen = _cached_snapshot(db_path) if use_cache else None  # 락 대기 중 새 결과 구분용
+    with _STATUS_LOCK:
+        generation = _STATUS_GENERATION
+    with _STATUS_BUILD_LOCK:
+        if use_cache:
+            item = _cached_snapshot(db_path)
+            if item is not None and item is not seen:
+                age = max(0.0, time.time() - float(item.get("ts") or 0.0))
+                if age < STATUS_TTL:
+                    return item["snapshot"], True, age
+        snapshot = _build_snapshot(db_path, price_fn, fx_fn, limit_trades, limit_equity)
+        with _STATUS_LOCK:  # 계산 중 매매·설정이 있었으면 이 결과는 버린다(다음 요청이 새로 만든다)
+            stale = generation != _STATUS_GENERATION
+        if price_fn is None and fx_fn is None and not stale:
+            # 주입된 대체 경로 결과는 캐시에 남기지 않는다
+            _store_snapshot(db_path, snapshot)
+        return snapshot, False, 0.0
+
+
+def status(db_path: str | None = None, price_fn=None, fx_fn=None,
+           limit_trades: int = 40, limit_equity: int = 180, market: str | None = None,
+           use_cache: bool | None = None) -> dict:
+    """한 계좌의 상세(보유·체결·수익률) + **두 계좌를 나란히 비교하는 요약**.
+
+    반환: `market`이 지정한 계좌(기본 미국)의 `account`·`positions`·`trades`·`equity_history`와
+    함께, `accounts`(US·KR 각각의 총자산·수익률·현금·보유 수·마지막 실행일)와 앱이
+    순서대로 그리기 쉬운 `comparison` 목록을 담는다.
+
+    두 계좌의 평가를 **한 번에** 만들어 `STATUS_TTL`(기본 25초) 동안 재사용한다 — 앱이
+    미국↔한국 탭을 오갈 때마다 시세·DB를 다시 부르지 않는다. `use_cache=False`면 새로
+    계산한다(매매·설정 직후 응답). `cache`·`timings`가 어느 단계가 얼마나 걸렸는지 알려준다.
+    """
+    scope = account_scope(market)
+    account_id = account_id_of(scope)
+    if use_cache is None:
+        use_cache = _status_cache_enabled() and price_fn is None and fx_fn is None
+    snapshot, cache_hit, cache_age = _snapshot(
+        db_path, price_fn, fx_fn, limit_trades, limit_equity, use_cache=bool(use_cache))
+
+    accounts = snapshot["accounts"]
+    rows = snapshot["rows"]
+    views = snapshot["views"]
+    today = snapshot["today"]
     account = accounts[account_id]
     summary = _summary(account, account["cash_krw"], views[account_id]["stock_value_krw"])
-    trades = paper_store.recent_trades(limit_trades, db_path, account_id)
     schedule = [
         {"market": mkt, "account_id": aid, "label": f"{ACCOUNT_NAMES[mkt]} 장 마감 후",
          "at": f"{RUN_AT[mkt][0]:02d}:{RUN_AT[mkt][1]:02d}",
@@ -1027,29 +1204,31 @@ def status(db_path: str | None = None, price_fn=None, fx_fn=None,
             "markets": scope,
             "label": account_label(scope),
             "strategy": account["strategy"],
-            "strategy_label": paper_store.STRATEGY_LABELS.get(account["strategy"], account["strategy"]),
+            "strategy_label": paper_store.STRATEGY_LABELS.get(account["strategy"],
+                                                              account["strategy"]),
             "auto_enabled": account["auto_enabled"],
             "last_run_date": account.get("last_run_date"),
             "last_run_us_date": account.get("last_run_us_date"),
             "last_run_kr_date": account.get("last_run_kr_date"),
             "realized_pnl_krw": rows[scope]["realized_pnl_krw"],
-            "fx_rate": round(fx_rate, 2),
-            "fx_source": fx.get("source"),
+            "fx_rate": round(snapshot["fx_rate"], 2),
+            "fx_source": snapshot["fx"].get("source"),
             "created_at": account.get("created_at"),
             "updated_at": account.get("updated_at"),
         },
         "positions": views[account_id]["positions"],
-        "trades": trades,
-        "equity_history": paper_store.equity_history(limit_equity, db_path, account_id),
+        "trades": snapshot["trades"][account_id],
+        "equity_history": snapshot["equity"][account_id],
         "accounts": rows,
         "comparison": [rows["US"], rows["KR"]],
         "auto_schedule": schedule,
         "next_auto": next_auto_info(account),
         "fee_policy": fee_policy(),
-        "as_of": paper_store._now(),
-        "storage_backend": paper_store.storage_backend(db_path),
+        "as_of": snapshot["as_of"],
+        "storage_backend": snapshot["storage_backend"],
+        "cache": {"hit": cache_hit, "age_sec": round(cache_age, 1), "ttl_sec": STATUS_TTL},
+        "timings": snapshot["timings"],
     }
-
 
 def next_auto_info(account: dict, now: datetime | None = None) -> dict:
     """계좌 하나의 다음 자동 실행 예정(오늘 남은 것 또는 내일 것) — 화면 안내용."""
@@ -1121,6 +1300,7 @@ def configure(account: str | None = None, initial_cash_krw=None, markets=None, s
             patch["auto_enabled"] = 1 if auto_enabled else 0
         if patch:
             updated = paper_store.update_account(patch, db_path, account_id)
+        invalidate_status_cache(db_path)  # 초기화 직후 탭은 초기 상태를 보여야 한다
         return {"ok": True, "reset": True, "market": scope, "account": updated}
 
     patch = {}
@@ -1136,6 +1316,7 @@ def configure(account: str | None = None, initial_cash_krw=None, markets=None, s
     if auto_enabled is not None:
         patch["auto_enabled"] = 1 if auto_enabled else 0
     updated = paper_store.update_account(patch, db_path, account_id) if patch else current
+    invalidate_status_cache(db_path)  # 설정 변경(시드·전략·자동 실행)도 즉시 반영
     return {"ok": True, "reset": False, "market": scope, "account": updated}
 
 
@@ -1246,6 +1427,7 @@ def auto_status() -> dict:
 def clear_caches() -> None:
     """테스트용 캐시 초기화."""
     reset_fx_cache()
+    invalidate_status_cache()
     _AUTO_FAILURES.clear()
     if extended_quotes and hasattr(extended_quotes, "clear_cache"):
         try:

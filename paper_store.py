@@ -905,6 +905,33 @@ def apply_sell(ticker: str, shares: float, cost_krw_sold: float, cash_delta: flo
     return payload
 
 
+def _normalize_trade(row: dict) -> dict:
+    """체결 한 행 — 수량·금액을 float로, 정산 금액(`settle_krw`)을 계산해 붙인다."""
+    out = dict(row)
+    out["shares"] = float(out.get("shares") or 0.0)
+    out["price"] = float(out.get("price") or 0.0)
+    out["fx_rate"] = float(out.get("fx_rate") or 1.0)
+    out["amount_krw"] = float(out.get("amount_krw") or 0.0)
+    # 수수료 컬럼이 없던 시절 체결은 0이다(마이그레이션 기본값).
+    out["fee_krw"] = float(out.get("fee_krw") or 0.0)
+    sign = 1.0 if str(out.get("side") or "").upper() == "BUY" else -1.0
+    out["settle_krw"] = round(out["amount_krw"] + sign * out["fee_krw"], 2)
+    if out.get("realized_pnl_krw") is not None:
+        out["realized_pnl_krw"] = float(out["realized_pnl_krw"])
+    return out
+
+
+def _normalize_equity_row(row: dict) -> dict:
+    """수익률 스냅샷 한 행 — 금액을 float로."""
+    out = dict(row)
+    out["total_value_krw"] = float(out.get("total_value_krw") or 0.0)
+    out["cash_krw"] = float(out.get("cash_krw") or 0.0)
+    out["stock_value_krw"] = float(out.get("stock_value_krw") or 0.0)
+    if out.get("return_pct") is not None:
+        out["return_pct"] = float(out["return_pct"])
+    return out
+
+
 def recent_trades(limit: int = 40, db_path: str | None = None,
                   account_id: Any = ACCOUNT_US) -> list[dict]:
     aid = normalize_account_id(account_id)
@@ -913,18 +940,7 @@ def recent_trades(limit: int = 40, db_path: str | None = None,
         cur = conn.execute(_sql(f"SELECT * FROM {TABLE_TRADES} WHERE account_id = ?"
                                 " ORDER BY id DESC LIMIT ?", backend), (aid, n))
         rows = _rows(cur)
-    for row in rows:
-        row["shares"] = float(row.get("shares") or 0.0)
-        row["price"] = float(row.get("price") or 0.0)
-        row["fx_rate"] = float(row.get("fx_rate") or 1.0)
-        row["amount_krw"] = float(row.get("amount_krw") or 0.0)
-        # 수수료 컬럼이 없던 시절 체결은 0이다(마이그레이션 기본값).
-        row["fee_krw"] = float(row.get("fee_krw") or 0.0)
-        sign = 1.0 if str(row.get("side") or "").upper() == "BUY" else -1.0
-        row["settle_krw"] = round(row["amount_krw"] + sign * row["fee_krw"], 2)
-        if row.get("realized_pnl_krw") is not None:
-            row["realized_pnl_krw"] = float(row["realized_pnl_krw"])
-    return rows
+    return [_normalize_trade(row) for row in rows]
 
 
 def realized_pnl(db_path: str | None = None, account_id: Any = ACCOUNT_US) -> float:
@@ -993,13 +1009,7 @@ def equity_history(limit: int = 180, db_path: str | None = None,
             backend), (aid, n))
         rows = _rows(cur)
     rows.reverse()  # 오래된 날짜부터(차트 x축)
-    for row in rows:
-        row["total_value_krw"] = float(row.get("total_value_krw") or 0.0)
-        row["cash_krw"] = float(row.get("cash_krw") or 0.0)
-        row["stock_value_krw"] = float(row.get("stock_value_krw") or 0.0)
-        if row.get("return_pct") is not None:
-            row["return_pct"] = float(row["return_pct"])
-    return rows
+    return [_normalize_equity_row(row) for row in rows]
 
 
 def clear_equity(db_path: str | None = None, account_id: Any = ACCOUNT_US) -> int:
@@ -1111,6 +1121,98 @@ def init_store(db_path: str | None = None, account_id: Any = None) -> dict:
             record_equity(kst_today_str(), account["cash_krw"], account["cash_krw"], 0.0, 0.0,
                           db_path, aid)
     return get_account(account_id or ACCOUNT_US, db_path)
+
+
+def snapshot(limit_trades: int = 40, limit_equity: int = 180,
+             db_path: str | None = None) -> dict:
+    """두 계좌의 화면 데이터를 **DB 연결 1회**로 모아 온다(`/api/paper/status`용).
+
+    왜 필요한가
+    -----------
+    상태 화면 하나가 계좌별 조회 함수(`get_account`·`list_positions`·`realized_pnl`·
+    `recent_trades`·`equity_history`)를 5번씩 부르고 `init_store`까지 거치면 연결을
+    **14번** 열었다. 렌더 무료 인스턴스에서 Neon PostgreSQL까지 연결 한 번이 1초 안팎이라
+    탭을 누를 때마다 **약 19초**를 기다렸다. 화면이 한 번에 그리는 것을 같은 연결·같은
+    시점에서 읽어 연결을 1번으로 줄인다.
+
+    반환: `accounts`·`positions`·`realized`·`trades`·`equity`를 `account_id` 키로 나눈 dict와
+    `storage_backend`·`queried_at`. 값의 모양은 개별 조회 함수와 같다(정규화 동일).
+    계좌 행·시드 스냅샷이 없으면 이 연결 안에서 만들어 둔다(기존 `init_store`와 같은 결과).
+    """
+    trades_n = max(1, min(int(limit_trades or 40), 500))
+    equity_n = max(1, min(int(limit_equity or 180), 1000))
+    columns = ("id", "market_scope", "initial_cash_krw", "cash_krw", "markets", "strategy",
+               "auto_enabled", "last_run_date", "last_run_us_date", "last_run_kr_date",
+               "created_at", "updated_at")
+    with _connection(db_path, write=True) as (conn, backend):
+        # 1) 두 계좌 행을 보장한다(이미 있으면 그대로 — 기존 get_account와 같은 결과).
+        for aid in ACCOUNTS:
+            default = _default_account(aid)
+            conn.execute(
+                _sql(f"INSERT INTO {TABLE_ACCOUNT} ({', '.join(columns)})"
+                     f" VALUES ({', '.join('?' for _ in columns)})"
+                     " ON CONFLICT (id) DO NOTHING", backend),
+                tuple(default[column] for column in columns),
+            )
+        accounts_raw = {int(row["id"]): row for row in
+                        _rows(conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT}", backend)))}
+
+        # 2) 보유 종목 — 두 계좌 모두 한 요청으로(account_id로 나뉨).
+        positions: dict[int, list[dict]] = {aid: [] for aid in ACCOUNTS}
+        for row in _rows(conn.execute(_sql(
+                f"SELECT * FROM {TABLE_POSITIONS} ORDER BY account_id, id", backend))):
+            aid = normalize_account_id(row.get("account_id"))
+            positions.setdefault(aid, []).append(_normalize_position(row))
+
+        # 3) 계좌별 실현손익 합계 — 한 요청으로 묶는다.
+        realized: dict[int, float] = {aid: 0.0 for aid in ACCOUNTS}
+        for row in _rows(conn.execute(_sql(
+                f"SELECT account_id, COALESCE(SUM(realized_pnl_krw), 0) AS total"
+                f" FROM {TABLE_TRADES} WHERE side = 'SELL' GROUP BY account_id", backend))):
+            aid = normalize_account_id(row.get("account_id"))
+            realized[aid] = round(float(row.get("total") or 0.0), 2)
+
+        # 4) 최근 체결과 수익률 스냅샷 — 계좌별 LIMIT이라 계좌마다 한 번씩.
+        trades: dict[int, list[dict]] = {}
+        equity: dict[int, list[dict]] = {}
+        for aid in ACCOUNTS:
+            trades[aid] = [_normalize_trade(row) for row in _rows(conn.execute(_sql(
+                f"SELECT * FROM {TABLE_TRADES} WHERE account_id = ?"
+                " ORDER BY id DESC LIMIT ?", backend), (aid, trades_n)))]
+            rows = _rows(conn.execute(_sql(
+                f"SELECT * FROM {TABLE_EQUITY} WHERE account_id = ?"
+                " ORDER BY date DESC LIMIT ?", backend), (aid, equity_n)))
+            rows.reverse()  # 오래된 날짜부터(차트 x축)
+            equity[aid] = [_normalize_equity_row(row) for row in rows]
+            if not equity[aid]:
+                # 스냅샷이 하나도 없는 계좌는 시드 시점을 남긴다(기존 init_store 동작).
+                account = _normalize_account(accounts_raw.get(aid) or _default_account(aid))
+                conn.execute(
+                    _sql(f"INSERT INTO {TABLE_EQUITY} (account_id, date, total_value_krw, cash_krw,"
+                         " stock_value_krw, return_pct, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                         " ON CONFLICT (account_id, date) DO UPDATE SET"
+                         " total_value_krw = excluded.total_value_krw, cash_krw = excluded.cash_krw,"
+                         " stock_value_krw = excluded.stock_value_krw, return_pct = excluded.return_pct,"
+                         " recorded_at = excluded.recorded_at", backend),
+                    (aid, kst_today_str(), account["cash_krw"], account["cash_krw"], 0.0, 0.0,
+                     _now()),
+                )
+                seeded = _rows(conn.execute(_sql(
+                    f"SELECT * FROM {TABLE_EQUITY} WHERE account_id = ?"
+                    " ORDER BY date DESC LIMIT ?", backend), (aid, equity_n)))
+                seeded.reverse()
+                equity[aid] = [_normalize_equity_row(row) for row in seeded]
+
+    return {
+        "accounts": {aid: _normalize_account(accounts_raw.get(aid) or _default_account(aid))
+                     for aid in ACCOUNTS},
+        "positions": {aid: positions.get(aid, []) for aid in ACCOUNTS},
+        "realized": {aid: realized.get(aid, 0.0) for aid in ACCOUNTS},
+        "trades": {aid: trades.get(aid, []) for aid in ACCOUNTS},
+        "equity": {aid: equity.get(aid, []) for aid in ACCOUNTS},
+        "storage_backend": backend,
+        "queried_at": _now(),
+    }
 
 
 def as_int_krw(value: Any) -> int:

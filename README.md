@@ -147,8 +147,15 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     `POST /api/paper/configure`(`market`·`initial_cash_krw`·`strategy`·`auto_enabled`·`reset` — 그 계좌에만 적용),
     `POST /api/paper/run`(`market`·`force`, 그 계좌만 매매, 실행 결과 + 갱신된 status). 실행은 한 번에 하나만
     돌고(`_RUN_LOCK`), 자동 실행과 수동 실행이 겹치면 두 번째는 `skipped: "already_running"`을 받는다.
-    현금은 `cash_krw + ?`로 원자 증감해 잔고보다 많이 차감하려 하면 체결 전체가 취소된다
+    현금은 `cash_krw + ?`로 원자 증감해 잔고보다 많이 차감하려 하면 체결 전체이 취소된다
     (포지션·체결이 반쪽만 남지 않는다).
+  - **status 응답 속도**: 두 계좌의 화면 데이터를 `paper_store.snapshot`으로 **DB 연결 1회**로 읽고,
+    환율·보유 종목 시세를 **병렬**로 받아 한 벌의 평가 스냅샷을 만든 뒤 `PAPER_STATUS_TTL`(기본 25초)
+    동안 재사용한다. 미국↔한국 탭을 오가면 즉시(캐시 적중 시 1ms 미만) 응답하고, 25초가 지나
+    `PAPER_STATUS_STALE`(기본 180초) 안이면 옛 값을 먼저 주고 뒤에서 새로 채운다. `run`·`configure`
+    (초기화 포함)는 캐시를 즉시 버려 매매 직후엔 항상 최신 값이다. 응답의 `cache`(적중·나이·TTL)와
+    `timings`(DB·환율·시세·전체 ms)로 어느 단계가 느린지 바로 알 수 있다. 예전에는 status 한 번에
+    연결을 14번 열어 탭 전환마다 **약 19초**를 기다렸다(렌더→Neon 연결 1회가 1초 안팎).
   - 저장: 기존 `recommendations`(성적표) 테이블은 그대로 두고 `paper_account`·`paper_positions`·
     `paper_trades`·`paper_equity_history` 네 테이블을 새로 만든다(`DATABASE_URL`이 있으면 PostgreSQL,
     없으면 같은 SQLite 파일). 세 테이블 모두 `account_id`를 갖고 유니크는 `(account_id, ticker)`·
@@ -268,6 +275,9 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `PAPER_MAX_POSITION_WEIGHT` / `PAPER_MAX_POSITIONS` | 한 종목 비중 상한(기본 0.30) · 최대 보유 종목 수(기본 8) |
 | `PAPER_MIN_ORDER_KRW` | 모의투자 최소 주문 금액(기본 10000원) |
 | `PAPER_CANDIDATES` | 시장별 매수 후보 수(기본 10종목) |
+| `PAPER_STATUS_TTL` | 모의투자 상태 스냅샷 캐시 유효 시간(초, 기본 25). `0`이면 매번 새로 계산 |
+| `PAPER_STATUS_STALE` | 상태 스냅샷이 만료된 뒤에도 옛 값을 먼저 내주는 한도(초, 기본 180). 그 안에는 백그라운드에서 새로 채운다 |
+| `PAPER_STATUS_CACHE` | 상태 스냅샷 캐시 스위치(기본 켜짐). `0`이면 캐시 없이 매번 계산 |
 | `PAPER_USDKRW` | 환율 조회가 모두 실패할 때 쓰는 고정 USD/KRW(기본 1350) |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | 체결 푸시(FCM) 서비스 계정 JSON 문자열 전체 또는 base64(선택). 없으면 푸시만 건너뜀 |
 | `FIREBASE_CREDENTIALS_PATH` | `FIREBASE_SERVICE_ACCOUNT_JSON` 대신 쓸 서비스 계정 JSON 파일 경로(선택) |
