@@ -392,6 +392,28 @@ class StatusEndpointTests(StatusCase):
         self.assertEqual(us["comparison"], kr["comparison"])
         self.assertEqual(kr["market"], "KR")
 
+    def test_prewarm_fills_cache_before_first_request(self):
+        with patch.object(paper_trading, "default_prices", self.prices({})), \
+             patch.object(paper_trading, "get_usd_krw", self.fx()):
+            paper_trading.warm_status_cache(delay=0)
+            deadline = time.time() + 2.0
+            body = None
+            while time.time() < deadline:
+                body = paper_trading.status(db_path=self.db_path, market="KR")
+                if body["cache"]["hit"]:
+                    break
+                time.sleep(0.02)
+        self.assertIsNotNone(body)
+        self.assertTrue(body["cache"]["hit"], "예열된 스냅샷을 바로 쓴다")
+
+    def test_prewarm_switch_off(self):
+        with patch.dict(os.environ, {"PAPER_STATUS_PREWARM": "0"}), \
+             patch.object(paper_trading, "default_prices", self.prices({})), \
+             patch.object(paper_trading, "get_usd_krw", self.fx()):
+            paper_trading.warm_status_cache(delay=0)
+            time.sleep(0.2)
+        self.assertIsNone(paper_trading._cached_snapshot(self.db_path))
+
     def test_status_after_configure_shows_new_value(self):
         with patch.object(paper_trading, "get_usd_krw", self.fx()):
             self.client.get("/api/paper/status?market=KR")

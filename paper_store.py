@@ -1123,6 +1123,36 @@ def init_store(db_path: str | None = None, account_id: Any = None) -> dict:
     return get_account(account_id or ACCOUNT_US, db_path)
 
 
+def _recent_per_account(conn, backend: str, table: str, order_column: str, limit: int,
+                        normalize=None) -> dict[int, list[dict]]:
+    """두 계좌의 최근 N행 — 윈도 함수 한 번으로 계좌별 LIMIT을 맞춘다.
+
+    계좌마다 따로 읽으면 원격 PostgreSQL 왕복이 두 배(0.5초×2)가 되므로 한 번에 읽는다.
+    반환은 `account_id` → 행 목록(최신이 앞). 윈도 함수가 없는 아주 오래된 SQLite에서는
+    계좌별 조회로 물러난다(결과는 같다).
+    """
+    sql = (f"SELECT * FROM (SELECT {table}.*, ROW_NUMBER() OVER"
+           f" (PARTITION BY account_id ORDER BY {order_column} DESC) AS rn"
+           f" FROM {table}) AS t WHERE rn <= ? ORDER BY account_id, rn")
+    try:
+        rows = _rows(conn.execute(_sql(sql, backend), (limit,)))
+    except Exception as exc:  # pragma: no cover - 표준 sqlite3는 윈도 함수를 지원
+        logger.warning("%s 최근 행 조회 실패 → 계좌별 조회로 대체: %s: %s",
+                       table, type(exc).__name__, str(exc)[:120])
+        rows = []
+        for aid in ACCOUNTS:
+            rows.extend(_rows(conn.execute(_sql(
+                f"SELECT * FROM {table} WHERE account_id = ?"
+                f" ORDER BY {order_column} DESC LIMIT ?", backend), (aid, limit))))
+    out: dict[int, list[dict]] = {aid: [] for aid in ACCOUNTS}
+    for row in rows:
+        data = dict(row)
+        data.pop("rn", None)  # 윈도 함수가 붙인 순번은 응답에 넣지 않는다
+        aid = normalize_account_id(data.get("account_id"))
+        out.setdefault(aid, []).append(normalize(data) if normalize else data)
+    return out
+
+
 def snapshot(limit_trades: int = 40, limit_equity: int = 180,
              db_path: str | None = None) -> dict:
     """두 계좌의 화면 데이터를 **DB 연결 1회**로 모아 온다(`/api/paper/status`용).
@@ -1145,15 +1175,15 @@ def snapshot(limit_trades: int = 40, limit_equity: int = 180,
                "auto_enabled", "last_run_date", "last_run_us_date", "last_run_kr_date",
                "created_at", "updated_at")
     with _connection(db_path, write=True) as (conn, backend):
-        # 1) 두 계좌 행을 보장한다(이미 있으면 그대로 — 기존 get_account와 같은 결과).
-        for aid in ACCOUNTS:
-            default = _default_account(aid)
-            conn.execute(
-                _sql(f"INSERT INTO {TABLE_ACCOUNT} ({', '.join(columns)})"
-                     f" VALUES ({', '.join('?' for _ in columns)})"
-                     " ON CONFLICT (id) DO NOTHING", backend),
-                tuple(default[column] for column in columns),
-            )
+        # 1) 두 계좌 행을 보장한다 — 한 문장으로 넣어 왕복을 한 번만 쓴다.
+        defaults = [_default_account(aid) for aid in ACCOUNTS]
+        row_sql = "(" + ", ".join("?" for _ in columns) + ")"
+        conn.execute(
+            _sql(f"INSERT INTO {TABLE_ACCOUNT} ({', '.join(columns)})"
+                 f" VALUES {', '.join(row_sql for _ in defaults)}"
+                 " ON CONFLICT (id) DO NOTHING", backend),
+            tuple(default[column] for default in defaults for column in columns),
+        )
         accounts_raw = {int(row["id"]): row for row in
                         _rows(conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT}", backend)))}
 
@@ -1172,36 +1202,35 @@ def snapshot(limit_trades: int = 40, limit_equity: int = 180,
             aid = normalize_account_id(row.get("account_id"))
             realized[aid] = round(float(row.get("total") or 0.0), 2)
 
-        # 4) 최근 체결과 수익률 스냅샷 — 계좌별 LIMIT이라 계좌마다 한 번씩.
-        trades: dict[int, list[dict]] = {}
-        equity: dict[int, list[dict]] = {}
+        # 4) 최근 체결·수익률 스냅샷 — 계좌별 LIMIT을 윈도 함수 한 번으로 맞춘다.
+        #    (계좌마다 따로 읽으면 원격 DB 왕복이 두 배가 된다)
+        trades = _recent_per_account(conn, backend, TABLE_TRADES, "id", trades_n,
+                                     _normalize_trade)
+        equity = _recent_per_account(conn, backend, TABLE_EQUITY, "date", equity_n,
+                                     _normalize_equity_row)
         for aid in ACCOUNTS:
-            trades[aid] = [_normalize_trade(row) for row in _rows(conn.execute(_sql(
-                f"SELECT * FROM {TABLE_TRADES} WHERE account_id = ?"
-                " ORDER BY id DESC LIMIT ?", backend), (aid, trades_n)))]
-            rows = _rows(conn.execute(_sql(
+            equity.setdefault(aid, []).reverse()  # 오래된 날짜부터(차트 x축)
+            trades.setdefault(aid, [])
+        for aid in ACCOUNTS:
+            if equity[aid]:
+                continue
+            # 스냅샷이 하나도 없는 계좌는 시드 시점을 남긴다(기존 init_store 동작).
+            account = _normalize_account(accounts_raw.get(aid) or _default_account(aid))
+            conn.execute(
+                _sql(f"INSERT INTO {TABLE_EQUITY} (account_id, date, total_value_krw, cash_krw,"
+                     " stock_value_krw, return_pct, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                     " ON CONFLICT (account_id, date) DO UPDATE SET"
+                     " total_value_krw = excluded.total_value_krw, cash_krw = excluded.cash_krw,"
+                     " stock_value_krw = excluded.stock_value_krw, return_pct = excluded.return_pct,"
+                     " recorded_at = excluded.recorded_at", backend),
+                (aid, kst_today_str(), account["cash_krw"], account["cash_krw"], 0.0, 0.0,
+                 _now()),
+            )
+            seeded = _rows(conn.execute(_sql(
                 f"SELECT * FROM {TABLE_EQUITY} WHERE account_id = ?"
                 " ORDER BY date DESC LIMIT ?", backend), (aid, equity_n)))
-            rows.reverse()  # 오래된 날짜부터(차트 x축)
-            equity[aid] = [_normalize_equity_row(row) for row in rows]
-            if not equity[aid]:
-                # 스냅샷이 하나도 없는 계좌는 시드 시점을 남긴다(기존 init_store 동작).
-                account = _normalize_account(accounts_raw.get(aid) or _default_account(aid))
-                conn.execute(
-                    _sql(f"INSERT INTO {TABLE_EQUITY} (account_id, date, total_value_krw, cash_krw,"
-                         " stock_value_krw, return_pct, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-                         " ON CONFLICT (account_id, date) DO UPDATE SET"
-                         " total_value_krw = excluded.total_value_krw, cash_krw = excluded.cash_krw,"
-                         " stock_value_krw = excluded.stock_value_krw, return_pct = excluded.return_pct,"
-                         " recorded_at = excluded.recorded_at", backend),
-                    (aid, kst_today_str(), account["cash_krw"], account["cash_krw"], 0.0, 0.0,
-                     _now()),
-                )
-                seeded = _rows(conn.execute(_sql(
-                    f"SELECT * FROM {TABLE_EQUITY} WHERE account_id = ?"
-                    " ORDER BY date DESC LIMIT ?", backend), (aid, equity_n)))
-                seeded.reverse()
-                equity[aid] = [_normalize_equity_row(row) for row in seeded]
+            seeded.reverse()
+            equity[aid] = [_normalize_equity_row(row) for row in seeded]
 
     return {
         "accounts": {aid: _normalize_account(accounts_raw.get(aid) or _default_account(aid))

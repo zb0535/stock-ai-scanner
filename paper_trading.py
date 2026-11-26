@@ -118,6 +118,7 @@ AUTO_START_GRACE_SEC = 120
 # 상태 스냅샷 캐시(탭 전환·새로고침) — 계좌 두 개를 한 번에 평가한 결과를 잠시 재사용한다.
 STATUS_TTL = float(os.environ.get("PAPER_STATUS_TTL", "25"))
 STATUS_STALE_SEC = float(os.environ.get("PAPER_STATUS_STALE", "180"))
+STATUS_WARM_DELAY = float(os.environ.get("PAPER_STATUS_WARM_DELAY", "20"))
 _STATUS_CACHE: dict[str, dict] = {}       # 키 -> {"ts": float, "snapshot": dict}
 _STATUS_LOCK = threading.Lock()
 _STATUS_BUILD_LOCK = threading.Lock()
@@ -1160,6 +1161,32 @@ def _snapshot(db_path: str | None = None, price_fn=None, fx_fn=None, limit_trade
             # 주입된 대체 경로 결과는 캐시에 남기지 않는다
             _store_snapshot(db_path, snapshot)
         return snapshot, False, 0.0
+
+
+def warm_status_cache(delay: float | None = None) -> None:
+    """기동 직후 상태 스냅샷을 미리 만들어 둔다 — 서버가 방금 떠도 첫 탭이 바로 뜼다.
+
+    데모 스레드라 실패해도 서버는 계속 돈다. `PAPER_STATUS_PREWARM=0`이면 끔.
+    """
+    if (os.environ.get("PAPER_STATUS_PREWARM") or "1").strip() in ("0", "false", "False"):
+        return
+    if not _status_cache_enabled():
+        return
+    wait = STATUS_WARM_DELAY if delay is None else max(0.0, float(delay))
+
+    def _work() -> None:
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            with _STATUS_BUILD_LOCK:
+                if _cached_snapshot(None) is None:
+                    _store_snapshot(None, _build_snapshot())
+                logger.info("모의투자 상태 스냅샷 예열 완료")
+        except Exception as exc:  # 예열 실패는 첫 요청이 다시 시도한다
+            logger.warning("모의투자 상태 예열 실패: %s: %s",
+                           type(exc).__name__, str(exc)[:160])
+
+    threading.Thread(target=_work, name="paper-status-warm", daemon=True).start()
 
 
 def status(db_path: str | None = None, price_fn=None, fx_fn=None,
