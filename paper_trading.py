@@ -1,13 +1,19 @@
-"""AI 모의투자(페이퍼 트레이딩) 실행 엔진 — 한국·미국 통합 원화 계좌.
+"""AI 모의투자(페이퍼 트레이딩) 실행 엔진 — 미국(US)·한국(KR) 두 계좌.
+
+계좌
+----
+- **시장별로 완전히 분리된 두 계좌**: 미국 계좌(id=1)와 한국 계좌(id=2)가 각각 시드머니·
+  현금·보유 종목·체결·일별 수익률을 따로 가진다. 한 번의 실행(`run(market="US"|"KR")`)은
+  **그 시장 계좌에만** 매매하고 기록하므로 두 계좌의 수익률을 공정하게 비교할 수 있다.
 
 무엇을 하나
 -----------
-1. **매도 판단**: 보유 포지션의 현재가(미국은 시간외 포함 실시간, 한국은 네이버)를 받아
+1. **매도 판단**: 그 계좌의 보유 포지션 현재가(미국은 시간외 포함 실시간, 한국은 네이버)를 받아
    손절(-8%)·익절(+25%) 규칙과 AI 판단으로 전량/부분 매도해 현금을 만든다.
-2. **매수 판단**: 대상 시장의 스크리너 상위 후보(S&P 500 · 코스피 200 + 정량 점수 + Gemini)를
+2. **매수 판단**: 그 시장의 스크리너 상위 후보(S&P 500 · 코스피 200 + 정량 점수 + Gemini)를
    보고 **남은 현금 한도 안에서만** 종목·금액을 정해 현재가로 체결한다. Gemini가 죽거나
    429면 정량 점수 상위 종목을 균등 배분하는 폴백으로 내려간다(AI 없이도 매매는 돈다).
-3. **기록**: 체결·포지션·일별 총자산 스냅샷을 `paper_store`에 남긴다.
+3. **기록**: 체결·포지션·일별 총자산 스냅샷을 `paper_store`에 남긴다(계좌별).
 
 통화·수량 규칙
 --------------
@@ -29,10 +35,10 @@
 
 자동 실행
 --------
-`auto_due_markets()`가 KST 시각과 `last_run_*_date`를 보고 오늘 아직 안 돈 시장을 알려준다.
-- 한국: 15:40 이후(한국 정규장 마감 15:30 + 여유)
-- 미국: 06:20 이후(미국 정규장 마감 16:00 ET = KST 05:00~06:00 + 여유)
-`start_auto()`가 5분 간격으로 이 함수를 확인해 하루 한 번씩 실행한다(`PAPER_AUTO=0`으로 끔).
+`auto_due_markets()`가 KST 시각과 계좌별 `last_run_*_date`를 보고 지금 돌릴 시장을 알려준다.
+- 한국 계좌: 15:40 이후(한국 정규장 마감 15:30 + 여유) — 한국 종목만
+- 미국 계좌: 06:20 이후(미국 정규장 마감 16:00 ET = KST 05:00~06:00 + 여유) — 미국 종목만
+`start_auto()`가 5분 간격으로 이 함수를 확인해 시장별로 하루 한 번씩 실행한다(`PAPER_AUTO=0`으로 끔).
 수동 `POST /api/paper/run`은 `force`를 주면 같은 날에도 다시 돈다.
 """
 
@@ -101,6 +107,10 @@ AI_MAX_BUYS = 3
 # 자동 실행 시각(KST, 시:분). 정규장 마감 직후 + 여유.
 KR_RUN_AT = (15, 40)
 US_RUN_AT = (6, 20)
+RUN_AT = {"KR": KR_RUN_AT, "US": US_RUN_AT}
+ACCOUNT_NAMES = {"US": "미국", "KR": "한국"}
+ACCOUNT_FLAGS = {"US": "🇺🇸", "KR": "🇰🇷"}
+ACCOUNT_ORDER = ("KR", "US")   # 같은 시각에 둘 다 밀려 있으면 한국을 먼저 처리한다
 AUTO_INTERVAL_SEC = int(os.environ.get("PAPER_AUTO_INTERVAL", "300"))
 AUTO_START_GRACE_SEC = 120
 
@@ -136,6 +146,38 @@ _AUTO_FAILURES: dict[tuple[str, str], int] = {}
 def market_of(ticker) -> str:
     """티커 → "KR"(`.KS`/`.KQ`) 또는 "US"."""
     return "KR" if naver_finance.is_korean_ticker(ticker) else "US"
+
+
+def account_scope(value=None) -> str:
+    """`"US"`/`"KR"`/`1`/`2` → 계좌의 시장 코드. 빈 값·`"ALL"`은 미국(기본 계좌).
+
+    모르는 값은 `ValueError("market_invalid")` — 오타가 엉뚱한 계좌를 건드리지 않게 한다.
+    """
+    if value is None:
+        return "US"
+    if isinstance(value, bool):
+        raise ValueError("market_invalid")
+    if isinstance(value, int):
+        return paper_store.account_market(value)
+    token = str(value).strip().upper()
+    if not token:
+        return "US"
+    if token in ("US", "USA", "ALL"):     # ALL은 더 이상 없다(예전 클라이언트 호환 = 미국)
+        return "US"
+    if token in ("KR", "KOR"):
+        return "KR"
+    raise ValueError("market_invalid")
+
+
+def account_id_of(value=None) -> int:
+    """`"US"`/`"KR"`/`1`/`2` → 계좌 id(1=미국, 2=한국)."""
+    return paper_store.MARKET_ACCOUNTS[account_scope(value)]
+
+
+def account_label(value=None) -> str:
+    """화면·프롬프트·푸시용 이름 — `"🇺🇸 미국"` / `"🇰🇷 한국"`."""
+    scope = account_scope(value)
+    return f"{ACCOUNT_FLAGS[scope]} {ACCOUNT_NAMES[scope]}"
 
 
 def normalize_markets(value) -> list[str]:
@@ -321,7 +363,8 @@ def compact_candidate(row: dict) -> dict:
 
 def build_prompt(account: dict, markets: list[str], cash_krw: float, total_value_krw: float,
                  positions: list[dict], candidates: dict[str, list[dict]], fx: dict) -> str:
-    """매매 판단 프롬프트 — 지금 있는 돈과 후보만 주고 JSON 하나만 받는다."""
+    """매매 판단 프롬프트 — 그 계좌에 있는 돈과 그 시장 후보만 주고 JSON 하나만 받는다."""
+    scope = account_scope(account.get("market_scope") or (markets[0] if markets else None))
     held = [
         {
             "ticker": item["ticker"], "name": item.get("name"), "market": item.get("market"),
@@ -338,7 +381,8 @@ def build_prompt(account: dict, markets: list[str], cash_krw: float, total_value
         for item in positions
     ]
     lines = [
-        "너는 원화 통합 계좌로 한국·미국 주식을 굴리는 모의투자 운용 AI다.",
+        f"너는 {ACCOUNT_FLAGS[scope]} {ACCOUNT_NAMES[scope]} 계좌(원화)만 운용하는 모의투자 AI다.",
+        f"이 계좌는 {ACCOUNT_NAMES[scope]} 주식만 매매한다(다른 시장 종목은 사지도 팔지도 마라).",
         "아래 '후보'는 서버가 스크리너(정량 점수 quant_score)로 추린 종목이고, '보유'는 지금 계좌다.",
         "규칙:",
         "- 매수는 **남은 현금 한도 안에서만** 한다. 원화 금액(amount_krw)으로만 말하라.",
@@ -355,8 +399,8 @@ def build_prompt(account: dict, markets: list[str], cash_krw: float, total_value
         "- 수익률이 나쁘거나 근거가 약해지면 보유 종목을 팔아 현금을 만들어도 된다.",
         "- 제공된 수치에 없는 가격·지표를 지어내지 마라.",
         "",
-        f"계좌: 시드 {account['initial_cash_krw']:,.0f}원 · 남은 현금 {cash_krw:,.0f}원 · "
-        f"총자산 {total_value_krw:,.0f}원 · 전략 {account.get('strategy')}",
+        f"계좌: {ACCOUNT_FLAGS[scope]} {ACCOUNT_NAMES[scope]} · 시드 {account['initial_cash_krw']:,.0f}원 · "
+        f"남은 현금 {cash_krw:,.0f}원 · 총자산 {total_value_krw:,.0f}원 · 전략 {account.get('strategy')}",
         f"환율: 1 USD = {fx['rate']:,.2f} KRW ({fx.get('source')})",
         f"대상 시장: {', '.join(markets)}",
         "",
@@ -442,7 +486,8 @@ def _quant_plan(candidates: list[dict], cash_krw: float, held: set[str],
 
 
 def _execute_sell(position: dict, price: float, fx_rate: float, fraction: float, reason: str,
-                  run_id: str, source: str, db_path: str | None) -> dict:
+                  run_id: str, source: str, db_path: str | None,
+                  account_id: int = paper_store.ACCOUNT_US) -> dict:
     """포지션 일부/전량 매도 체결 — 수수료·증권거래세를 뺀 **순수취액**이 현금으로 들어온다.
 
     - 총 매도대금 `gross_krw` = 주가 × 수량 × 현재환율
@@ -490,12 +535,13 @@ def _execute_sell(position: dict, price: float, fx_rate: float, fraction: float,
             "ai_source": source,
         },
         db_path,
+        account_id,
     )
 
 
 def _execute_buy(symbol: str, market: str, name: str, currency: str, price: float,
                  amount_krw: float, fx_rate: float, reason: str, run_id: str, source: str,
-                 db_path: str | None) -> dict | None:
+                 db_path: str | None, account_id: int = paper_store.ACCOUNT_US) -> dict | None:
     """매수 체결 — 현금 한도·최소 주문·수량 단위를 지키고, 불가능하면 None.
 
     **수수료까지 예산 안에서 계산한다**: `amount_krw`는 이 종목에 쓸 수 있는 총액(수수료 포함)이고,
@@ -504,7 +550,7 @@ def _execute_buy(symbol: str, market: str, name: str, currency: str, price: floa
 
     포지션 추가·현금 차감·체결 기록은 `paper_store.apply_buy`가 한 트랜잭션으로 처리한다.
     """
-    account = paper_store.get_account(db_path)
+    account = paper_store.get_account(account_id, db_path)
     cash = float(account["cash_krw"])
     buy_fee_rate, _ = fee_rates(market)
     budget = min(float(amount_krw), cash)
@@ -555,6 +601,7 @@ def _execute_buy(symbol: str, market: str, name: str, currency: str, price: floa
             "ai_source": source,
         },
         db_path,
+        account_id,
     )
 
 
@@ -643,36 +690,37 @@ def _position_views(positions: list[dict], price_fn, fx_rate: float) -> dict:
 # --- 실행 -------------------------------------------------------------------
 
 
-def run(markets=None, force: bool = False, trigger: str = "manual", db_path: str | None = None,
+def run(market=None, force: bool = False, trigger: str = "manual", db_path: str | None = None,
         ai_call=None, price_fn=None, candidate_fn=None, fx_fn=None,
         now: datetime | None = None, push_fn=None) -> dict:
-    """AI 모의투자 1회 실행(매도 → 매수 → 스냅샷). 동시에 두 번 돌지 않는다.
+    """지정한 시장 계좌에서 AI 모의투자 1회 실행(매도 → 매수 → 스냅샷). 동시에 두 번 돌지 않는다.
 
+    `market`: "US"(미국 계좌) 또는 "KR"(한국 계좌). 비우면 미국 계좌.
     이미 다른 실행이 돌고 있으면 기다리지 않고 `skipped: "already_running"`을 돌려준다 —
     두 실행이 같은 현금을 보고 각자 매수하면 시드머니를 넘겨 살 수 있기 때문이다.
     """
+    scope = account_scope(market)
     if not _RUN_LOCK.acquire(blocking=False):
         return {
-            "ok": True, "skipped": "already_running",
-            "markets": normalize_markets(markets),
-            "message": "다른 AI 매매가 실행 중입니다. 끝나면 결과가 계좌에 반영됩니다.",
+            "ok": True, "skipped": "already_running", "market": scope, "markets": [scope],
+            "message": f"{account_label(scope)} 계좌의 AI 매매가 실행 중입니다. 끝나면 결과가 계좌에 반영됩니다.",
             "ran_at": paper_store._now(),
         }
     try:
-        return _run_locked(markets=markets, force=force, trigger=trigger, db_path=db_path,
+        return _run_locked(market=scope, force=force, trigger=trigger, db_path=db_path,
                            ai_call=ai_call, price_fn=price_fn, candidate_fn=candidate_fn,
                            fx_fn=fx_fn, now=now, push_fn=push_fn)
     finally:
         _RUN_LOCK.release()
 
 
-def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
+def _run_locked(market=None, force: bool = False, trigger: str = "manual",
                 db_path: str | None = None, ai_call=None, price_fn=None, candidate_fn=None,
                 fx_fn=None, now: datetime | None = None, push_fn=None) -> dict:
-    """실제 실행 본체(`run`이 락을 잡고 부른다).
+    """실제 실행 본체(`run`이 락을 잡고 부른다) — 한 시장 계좌만 건드린다.
 
-    `markets`: "ALL"/"US"/"KR" 또는 목록. 비우면 계좌 설정을 따른다.
-    `force`: False면 오늘 이미 돈 시장은 건너뛴다(자동 실행 중복 방지).
+    `market`: "US"/"KR". 그 계좌의 현금·보유·설정만 보고, 그 계좌에만 기록한다.
+    `force`: False면 오늘 이미 돈 계좌는 건너뛴다(자동 실행 중복 방지).
     `ai_call(prompt) -> str|dict|None`, `price_fn(tickers) -> (prices, sources)`,
     `candidate_fn(market, criteria) -> list[dict]`, `fx_fn() -> {"rate","source"}`,
     `push_fn(sells, buys, db_path) -> dict`는 테스트·대체 경로용 주입점이다.
@@ -681,22 +729,18 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
     candidate_fn = candidate_fn or default_candidates
     fx_fn = fx_fn or get_usd_krw
 
-    account = paper_store.init_store(db_path)
-    requested = normalize_markets(markets if markets is not None else account["markets"])
-    allowed = normalize_markets(account["markets"])
-    targets = [market for market in requested if market in allowed] or allowed
+    scope = account_scope(market)
+    account_id = account_id_of(scope)
+    account = paper_store.init_store(db_path, account_id)
+    targets = [scope]
 
     today = paper_store.kst_today_str()
-    if not force:
-        pending = [market for market in targets
-                   if (account.get(f"last_run_{market.lower()}_date") or "") != today]
-        if not pending:
-            return {
-                "ok": True, "skipped": "already_ran_today", "markets": targets,
-                "message": "오늘은 이미 AI 매매가 실행됐습니다(시장별 하루 1회).",
-                "ran_at": paper_store._now(),
-            }
-        targets = pending
+    if not force and (account.get(f"last_run_{scope.lower()}_date") or "") == today:
+        return {
+            "ok": True, "skipped": "already_ran_today", "market": scope, "markets": targets,
+            "message": f"오늘은 {account_label(scope)} 계좌의 AI 매매가 이미 실행됐습니다(계좌별 하루 1회).",
+            "ran_at": paper_store._now(),
+        }
 
     run_id = uuid.uuid4().hex[:10]
     fx = fx_fn() or {"rate": DEFAULT_USDKRW, "source": "fixed_fallback"}
@@ -704,7 +748,7 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
     strategy = account.get("strategy") or paper_store.DEFAULT_STRATEGY
     criteria = criteria_for(strategy)
 
-    positions = paper_store.list_positions(db_path)
+    positions = paper_store.list_positions(db_path, account_id)
     views = _position_views(positions, price_fn, fx_rate)
     view_by_ticker = {row["ticker"]: row for row in views["positions"]}
     cash = float(account["cash_krw"])
@@ -715,7 +759,7 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
     skipped: list[dict] = []
     notes: list[str] = []
 
-    # --- 1) 후보 수집(시장별) ---
+    # --- 1) 후보 수집(그 계좌의 시장만) ---
     candidates: dict[str, list[dict]] = {}
     for market in targets:
         try:
@@ -788,14 +832,14 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
         fraction = 1.0 if fraction is None else max(0.05, min(1.0, fraction))
         reason = str(item.get("reason") or "AI 판단 매도")[:300]
         trade = _execute_sell(position, price, fx_rate, fraction, reason, run_id,
-                              item.get("source") or ai_source, db_path)
+                              item.get("source") or ai_source, db_path, account_id)
         sells.append(trade)
-        cash = float(paper_store.get_account(db_path)["cash_krw"])
+        cash = float(paper_store.get_account(account_id, db_path)["cash_krw"])
 
     # --- 5) 매수 판단 ---
     buy_plan: list[dict] = []
     if decision and (decision.get("buys") or []):
-        held_after = {p["ticker"] for p in paper_store.list_positions(db_path)}
+        held_after = {p["ticker"] for p in paper_store.list_positions(db_path, account_id)}
         for item in decision["buys"]:
             if not isinstance(item, dict):
                 continue
@@ -819,7 +863,7 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
                              "row": row, "source": ai_source})
     else:
         combined = [row for market in targets for row in candidates.get(market) or []]
-        held_now = {p["ticker"] for p in paper_store.list_positions(db_path)}
+        held_now = {p["ticker"] for p in paper_store.list_positions(db_path, account_id)}
         for item in _quant_plan(combined, cash, held_now, total_value):
             pool = {row["ticker"]: row for market in targets for row in candidates.get(market) or []}
             row = pool.get(item["ticker"])
@@ -830,11 +874,11 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
     for item in buy_plan:
         row = item["row"]
         symbol = item["ticker"]
-        positions_now = paper_store.list_positions(db_path)
+        positions_now = paper_store.list_positions(db_path, account_id)
         if len(positions_now) >= MAX_POSITIONS:
             skipped.append({"ticker": symbol, "reason": f"최대 보유 종목 수({MAX_POSITIONS}) 도달"})
             continue
-        account_now = paper_store.get_account(db_path)
+        account_now = paper_store.get_account(account_id, db_path)
         cash_now = float(account_now["cash_krw"])
         if cash_now < MIN_ORDER_KRW:
             skipped.append({"ticker": symbol, "reason": "남은 현금 부족"})
@@ -853,7 +897,7 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
             continue
         trade = _execute_buy(symbol, market_of(symbol), str(row.get("name") or ""), currency,
                              price, amount, fx_rate, item.get("reason") or "", run_id,
-                             item.get("source") or ai_source, db_path)
+                             item.get("source") or ai_source, db_path, account_id)
         if trade:
             buys.append(trade)
         else:
@@ -870,23 +914,26 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
             logger.warning("체결 푸시 생략(%s: %s)", type(exc).__name__, str(exc)[:200])
             push = {"sent": 0, "failed": 0, "error": "push_failed"}
 
-    # --- 7) 스냅샷·실행 기록 ---
-    final_positions = paper_store.list_positions(db_path)
+    # --- 7) 스냅샷·실행 기록(그 계좌만) ---
+    final_positions = paper_store.list_positions(db_path, account_id)
     final_views = _position_views(final_positions, price_fn, fx_rate)
-    final_account = paper_store.get_account(db_path)
+    final_account = paper_store.get_account(account_id, db_path)
     summary = _summary(final_account, float(final_account["cash_krw"]),
                        final_views["stock_value_krw"])
     paper_store.record_equity(today, summary["total_value_krw"], float(final_account["cash_krw"]),
-                              final_views["stock_value_krw"], summary["total_return_pct"], db_path)
+                              final_views["stock_value_krw"], summary["total_return_pct"],
+                              db_path, account_id)
     fields = {"last_run_date": today}
     for market in targets:
         fields[f"last_run_{market.lower()}_date"] = today
-    paper_store.update_account(fields, db_path)
+    paper_store.update_account(fields, db_path, account_id)
 
     result = {
         "ok": True,
         "run_id": run_id,
         "trigger": trigger,
+        "market": scope,
+        "account": {"id": account_id, "market": scope, "label": account_label(scope)},
         "markets": targets,
         "strategy": strategy,
         "ai_source": ai_source,
@@ -901,8 +948,8 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
         "push": push,
         "ran_at": paper_store._now(),
     }
-    logger.info("모의투자 실행 %s(%s): 매도 %d · 매수 %d · 총자산 ₩%.0f(%s%%) · AI %s",
-                run_id, ",".join(targets), len(sells), len(buys), summary["total_value_krw"],
+    logger.info("모의투자 실행 %s(%s 계좌): 매도 %d · 매수 %d · 총자산 ₩%.0f(%s%%) · AI %s",
+                run_id, scope, len(sells), len(buys), summary["total_value_krw"],
                 summary["total_return_pct"], ai_source)
     return result
 
@@ -911,45 +958,91 @@ def _run_locked(markets=None, force: bool = False, trigger: str = "manual",
 
 
 def status(db_path: str | None = None, price_fn=None, fx_fn=None,
-           limit_trades: int = 40, limit_equity: int = 180) -> dict:
-    """계좌 요약·보유 포지션(평가손익)·체결 내역·수익률 추이."""
-    account = paper_store.init_store(db_path)
+           limit_trades: int = 40, limit_equity: int = 180, market: str | None = None) -> dict:
+    """한 계좌의 상세(보유·체결·수익률) + **두 계좌를 나란히 비교하는 요약**.
+
+    반환: `market`이 지정한 계좌(기본 미국)의 `account`·`positions`·`trades`·`equity_history`와
+    함께, `accounts`(US·KR 각각의 총자산·수익률·현금·보유 수·마지막 실행일)와 앱이
+    순서대로 그리기 쉬운 `comparison` 목록을 담는다.
+    """
+    scope = account_scope(market)
+    account_id = account_id_of(scope)
+    paper_store.init_store(db_path)
     fx = (fx_fn or get_usd_krw)()
     fx_rate = float(fx["rate"])
-    positions = paper_store.list_positions(db_path)
-    views = _position_views(positions, price_fn or default_prices, fx_rate)
-    summary = _summary(account, account["cash_krw"], views["stock_value_krw"])
-    trades = paper_store.recent_trades(limit_trades, db_path)
-    realized = sum(float(trade.get("realized_pnl_krw") or 0.0) for trade in trades
-                   if trade.get("side") == "SELL")
+
+    accounts = {aid: paper_store.get_account(aid, db_path) for aid in paper_store.ACCOUNTS}
+    raw_positions = {aid: paper_store.list_positions(db_path, aid) for aid in paper_store.ACCOUNTS}
+    # 두 계좌의 종목을 한 번에 평가한다(시세 호출을 두 배로 늘리지 않는다).
+    tickers: list[str] = []
+    for aid in paper_store.ACCOUNTS:
+        for row in raw_positions[aid]:
+            if row["ticker"] not in tickers:
+                tickers.append(row["ticker"])
+    prices: dict = {}
+    sources: dict = {}
+    if tickers:
+        try:
+            prices, sources = (price_fn or default_prices)(tickers) or ({}, {})
+        except Exception as exc:  # 시세 장애 → 원가 평가로 계속
+            logger.warning("모의투자 평가 시세 실패: %s: %s", type(exc).__name__, str(exc)[:160])
+    views = {aid: _valuation(raw_positions[aid], prices or {}, sources or {}, fx_rate)
+             for aid in paper_store.ACCOUNTS}
     today = paper_store.kst_today_str()
+
+    rows: dict[str, dict] = {}
+    for aid in paper_store.ACCOUNTS:
+        acct = accounts[aid]
+        mkt = paper_store.account_market(aid)
+        summary = _summary(acct, acct["cash_krw"], views[aid]["stock_value_krw"])
+        rows[mkt] = {
+            **summary,
+            "account_id": aid,
+            "market": mkt,
+            "label": account_label(mkt),
+            "positions_count": len(raw_positions[aid]),
+            "realized_pnl_krw": paper_store.realized_pnl(db_path, aid),
+            "strategy": acct["strategy"],
+            "strategy_label": paper_store.STRATEGY_LABELS.get(acct["strategy"], acct["strategy"]),
+            "auto_enabled": acct["auto_enabled"],
+            "last_run_date": acct.get(f"last_run_{mkt.lower()}_date"),
+        }
+
+    account = accounts[account_id]
+    summary = _summary(account, account["cash_krw"], views[account_id]["stock_value_krw"])
+    trades = paper_store.recent_trades(limit_trades, db_path, account_id)
     schedule = [
-        {"market": "KR", "at": f"{KR_RUN_AT[0]:02d}:{KR_RUN_AT[1]:02d}", "label": "한국 장 마감 후",
-         "enabled": account["markets"] in ("ALL", "KR"),
-         "done_today": (account.get("last_run_kr_date") or "") == today},
-        {"market": "US", "at": f"{US_RUN_AT[0]:02d}:{US_RUN_AT[1]:02d}", "label": "미국 장 마감 후",
-         "enabled": account["markets"] in ("ALL", "US"),
-         "done_today": (account.get("last_run_us_date") or "") == today},
+        {"market": mkt, "account_id": aid, "label": f"{ACCOUNT_NAMES[mkt]} 장 마감 후",
+         "at": f"{RUN_AT[mkt][0]:02d}:{RUN_AT[mkt][1]:02d}",
+         "enabled": accounts[aid]["auto_enabled"],
+         "done_today": (accounts[aid].get(f"last_run_{mkt.lower()}_date") or "") == today}
+        for mkt, aid in (("KR", paper_store.ACCOUNT_KR), ("US", paper_store.ACCOUNT_US))
     ]
     return {
+        "market": scope,
         "account": {
             **summary,
-            "markets": account["markets"],
+            "id": account_id,
+            "market_scope": scope,
+            "markets": scope,
+            "label": account_label(scope),
             "strategy": account["strategy"],
             "strategy_label": paper_store.STRATEGY_LABELS.get(account["strategy"], account["strategy"]),
             "auto_enabled": account["auto_enabled"],
             "last_run_date": account.get("last_run_date"),
             "last_run_us_date": account.get("last_run_us_date"),
             "last_run_kr_date": account.get("last_run_kr_date"),
-            "realized_pnl_krw": round(realized, 2),
+            "realized_pnl_krw": rows[scope]["realized_pnl_krw"],
             "fx_rate": round(fx_rate, 2),
             "fx_source": fx.get("source"),
             "created_at": account.get("created_at"),
             "updated_at": account.get("updated_at"),
         },
-        "positions": views["positions"],
+        "positions": views[account_id]["positions"],
         "trades": trades,
-        "equity_history": paper_store.equity_history(limit_equity, db_path),
+        "equity_history": paper_store.equity_history(limit_equity, db_path, account_id),
+        "accounts": rows,
+        "comparison": [rows["US"], rows["KR"]],
         "auto_schedule": schedule,
         "next_auto": next_auto_info(account),
         "fee_policy": fee_policy(),
@@ -959,50 +1052,51 @@ def status(db_path: str | None = None, price_fn=None, fx_fn=None,
 
 
 def next_auto_info(account: dict, now: datetime | None = None) -> dict:
-    """다음 자동 실행 예정(오늘 남은 것 또는 내일 첫 것) — 화면 안내용."""
+    """계좌 하나의 다음 자동 실행 예정(오늘 남은 것 또는 내일 것) — 화면 안내용."""
     if not account.get("auto_enabled"):
         return {"enabled": False, "label": "자동 실행 꺼짐"}
+    scope = account_scope(account.get("market_scope") or account.get("markets") or account.get("id"))
+    label = ACCOUNT_NAMES[scope]
     current = now or datetime.now(KST)
     if current.tzinfo is None:
         current = current.replace(tzinfo=KST)
+    current = current.astimezone(KST)
+    hour, minute = RUN_AT[scope]
+    today = current.date().isoformat()
     # 지금 시각이 이미 지난 실행 시각이고 오늘 아직 안 돌았으면, 다음 일정이 아니라 '곧 실행'이다
     # (서버가 그 시각에 꺼져 있었다가 켜지면 자동 루프가 따라잡아 실행한다).
-    due_now = auto_due_markets(account, current)
-    if due_now:
-        label = "한국" if due_now[0] == "KR" else "미국"
-        return {"enabled": True, "market": due_now[0],
+    if (current.hour * 60 + current.minute) >= hour * 60 + minute and \
+            (account.get(f"last_run_{scope.lower()}_date") or "") != today and \
+            _AUTO_FAILURES.get((scope, today), 0) < 3:
+        return {"enabled": True, "market": scope,
                 "at": current.isoformat(timespec="minutes"),
-                "label": f"{label} 시장 · 곧 자동 실행(오늘 몫 따라잡기)"}
-    markets = normalize_markets(account.get("markets"))
-    options = []
-    for market, (hour, minute) in (("KR", KR_RUN_AT), ("US", US_RUN_AT)):
-        if market not in markets:
-            continue
-        target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        done = (account.get(f"last_run_{market.lower()}_date") or "") == target.date().isoformat()
-        if target <= current or done:
-            target += timedelta(days=1)
-        options.append((target, market))
-    if not options:
-        return {"enabled": True, "market": None, "at": None, "label": "-"}
-    target, market = min(options)
-    return {"enabled": True, "market": market,
+                "label": f"{label} 계좌 · 곧 자동 실행(오늘 몫 따라잡기)"}
+    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    done = (account.get(f"last_run_{scope.lower()}_date") or "") == target.date().isoformat()
+    if target <= current or done:
+        target += timedelta(days=1)
+    return {"enabled": True, "market": scope,
             "at": target.isoformat(timespec="minutes"),
-            "label": f"{'한국' if market == 'KR' else '미국'} 시장 · {target.strftime('%m/%d %H:%M')} KST"}
+            "label": f"{label} 계좌 · {target.strftime('%m/%d %H:%M')} KST"}
 
 
 # --- 설정 -------------------------------------------------------------------
 
 
-def configure(initial_cash_krw=None, markets=None, strategy=None, auto_enabled=None,
-              reset: bool = False, db_path: str | None = None) -> dict:
-    """시드머니·시장·전략·자동 실행 설정. `reset=True`면 포지션·체결·스냅샷을 지우고 다시 시작.
+def configure(account: str | None = None, initial_cash_krw=None, markets=None, strategy=None,
+              auto_enabled=None, reset: bool = False, db_path: str | None = None) -> dict:
+    """한 계좌(미국/한국)의 시드머니·전략·자동 실행 설정. `reset=True`면 그 계좌만 초기화한다.
 
-    검증: 시드머니 10만~10억 원, 시장 ALL/US/KR, 전략 4종.
+    검증: 시드머니 10만~10억 원, 전략 4종.
     `reset=False`에서 시드머니를 줄이면 현금에서 차감한다. 보유 종목에 이미 들어간 돈은
     건드리지 않으므로, 현금보다 큰 폭으로 줄이면 400(`cash_below_zero`)으로 거절한다.
+
+    `market`: 설정할 계좌(`US`/`KR`). `markets`는 예전 클라이언트가 보내는 값을 받아만 두고
+    무시한다 — 계좌의 시장은 계좌가 정한다(미국 계좌는 미국 종목만 산다).
     """
-    account = paper_store.init_store(db_path)
+    scope = account_scope(account)
+    account_id = account_id_of(scope)
+    current = paper_store.init_store(db_path, account_id)
 
     seed = None
     if initial_cash_krw is not None:
@@ -1012,12 +1106,6 @@ def configure(initial_cash_krw=None, markets=None, strategy=None, auto_enabled=N
         if seed < paper_store.MIN_INITIAL_CASH_KRW or seed > paper_store.MAX_INITIAL_CASH_KRW:
             raise ValueError("initial_cash_krw_out_of_range")
 
-    market_value = None
-    if markets is not None:
-        market_value = str(markets).strip().upper()
-        if market_value not in paper_store.MARKETS:
-            raise ValueError("markets_invalid")
-
     strategy_value = None
     if strategy is not None:
         strategy_value = str(strategy).strip().lower()
@@ -1025,43 +1113,40 @@ def configure(initial_cash_krw=None, markets=None, strategy=None, auto_enabled=N
             raise ValueError("strategy_invalid")
 
     if reset:
-        updated = paper_store.reset(db_path, initial_cash_krw=seed)
+        updated = paper_store.reset(db_path, initial_cash_krw=seed, account_id=account_id)
         patch: dict = {}
-        if market_value:
-            patch["markets"] = market_value
         if strategy_value:
             patch["strategy"] = strategy_value
         if auto_enabled is not None:
             patch["auto_enabled"] = 1 if auto_enabled else 0
         if patch:
-            updated = paper_store.update_account(patch, db_path)
-        return {"ok": True, "reset": True, "account": updated}
+            updated = paper_store.update_account(patch, db_path, account_id)
+        return {"ok": True, "reset": True, "market": scope, "account": updated}
 
     patch = {}
-    if seed is not None and abs(seed - account["initial_cash_krw"]) > 0.5:
-        delta = seed - account["initial_cash_krw"]
-        new_cash = float(account["cash_krw"]) + delta
+    if seed is not None and abs(seed - current["initial_cash_krw"]) > 0.5:
+        delta = seed - current["initial_cash_krw"]
+        new_cash = float(current["cash_krw"]) + delta
         if new_cash < 0:
             raise ValueError("cash_below_zero")
         patch["initial_cash_krw"] = seed
         patch["cash_krw"] = round(new_cash, 2)
-    if market_value:
-        patch["markets"] = market_value
     if strategy_value:
         patch["strategy"] = strategy_value
     if auto_enabled is not None:
         patch["auto_enabled"] = 1 if auto_enabled else 0
-    updated = paper_store.update_account(patch, db_path) if patch else account
-    return {"ok": True, "reset": False, "account": updated}
+    updated = paper_store.update_account(patch, db_path, account_id) if patch else current
+    return {"ok": True, "reset": False, "market": scope, "account": updated}
 
 
 # --- 자동 실행 ---------------------------------------------------------------
 
 
-def auto_due_markets(account: dict, now: datetime | None = None) -> list[str]:
-    """지금 자동 실행해야 할 시장 목록(설정·시각·오늘 실행 여부 기준)."""
-    if not account.get("auto_enabled"):
-        return []
+def auto_due_markets(now: datetime | None = None) -> list[str]:
+    """지금 자동 실행해야 할 시장 계좌 목록(계좌별 설정·시각·오늘 실행 여부).
+
+    계좌별로 따로 본다: 미국 계좌가 오늘 돌았어도 한국 계좌가 아직이면 `KR`은 여기에 들어온다.
+    """
     current = now or datetime.now(KST)
     if current.tzinfo is None:
         current = current.replace(tzinfo=KST)
@@ -1069,33 +1154,35 @@ def auto_due_markets(account: dict, now: datetime | None = None) -> list[str]:
     today = current.date().isoformat()
     minutes = current.hour * 60 + current.minute
     due: list[str] = []
-    markets = normalize_markets(account.get("markets"))
-    for market, (hour, minute) in (("KR", KR_RUN_AT), ("US", US_RUN_AT)):
-        if market not in markets:
-            continue
+    for market in ACCOUNT_ORDER:
+        hour, minute = RUN_AT[market]
         if minutes < hour * 60 + minute:
             continue
-        if (account.get(f"last_run_{market.lower()}_date") or "") == today:
-            continue
         if _AUTO_FAILURES.get((market, today), 0) >= 3:
+            continue
+        try:
+            account = paper_store.get_account(account_id_of(market))
+        except Exception as exc:  # 저장소 장애 — 루프는 계속 돈다
+            logger.warning("모의투자 자동 실행 판단 실패(%s): %s", market, type(exc).__name__)
+            continue
+        if not account.get("auto_enabled"):
+            continue
+        if (account.get(f"last_run_{market.lower()}_date") or "") == today:
             continue
         due.append(market)
     return due
 
 
 def _auto_tick(ai_call=None) -> dict | None:
-    account = paper_store.get_account()
-    if not account.get("auto_enabled"):
-        AUTO_STATE["last_check"] = paper_store._now()
-        return None
-    due = auto_due_markets(account)
+    due = auto_due_markets()
     AUTO_STATE["last_check"] = paper_store._now()
     if not due:
         return None
     market = due[0]
     try:
-        result = run(markets=[market], force=False, trigger="auto", ai_call=ai_call)
-        AUTO_STATE["last_run"] = {"market": market, "at": paper_store._now(),
+        result = run(market=market, force=False, trigger="auto", ai_call=ai_call)
+        AUTO_STATE["last_run"] = {"market": market, "label": account_label(market),
+                                  "at": paper_store._now(),
                                   "summary": result.get("summary"),
                                   "buys": len(result.get("buys") or []),
                                   "sells": len(result.get("sells") or [])}

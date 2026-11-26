@@ -228,12 +228,28 @@ def _sell_body(trade: dict) -> str:
     return f"순손익 {_won_signed(realized)}{pct_text}"
 
 
+def _account_badge(markets: list[str]) -> str:
+    """체결 시장 → 계좌 구분 표식(`[미국]` / `[한국]` / `[미국+한국]`)."""
+    labels = {"US": "미국", "KR": "한국"}
+    order = [market for market in ("US", "KR") if market in markets]
+    if not order:
+        return ""
+    return "[" + "+".join(labels[market] for market in order) + "]"
+
+
 def build_fill_message(sells: list[dict] | None, buys: list[dict] | None) -> dict:
-    """체결 목록 → FCM 알림 제목·본문·data payload. 체결이 없으면 빈 dict."""
+    """체결 목록 → FCM 알림 제목·본문·data payload. 체결이 없으면 빈 dict.
+
+    두 계좌(미국/한국)를 나란히 굴리므로, 알림만 봐도 **어느 계좌의 체결인지** 알 수 있게
+    제목에 `[미국]`/`[한국]`, 본문 앞에 `미국 계좌 · `를 붙인다.
+    """
     trades = list(sells or []) + list(buys or [])
     if not trades:
         return {}
     markets = sorted({str(t.get("market") or "").upper() for t in trades if t.get("market")})
+    badge = _account_badge(markets)
+    head = f"🤖 {badge} " if badge else "🤖 "
+    account_text = (badge.strip("[]") + " 계좌 · ") if badge else ""
     data = {
         "screen": "paper",
         "market": ",".join(markets) or "ALL",
@@ -244,12 +260,14 @@ def build_fill_message(sells: list[dict] | None, buys: list[dict] | None) -> dic
         trade = trades[0]
         name = _display_name(trade)
         if str(trade.get("side") or "").upper() == "SELL":
-            return {"title": f"🤖 AI 매도 체결 · {name}", "body": _sell_body(trade), "data": data}
+            return {"title": f"{head}AI 매도 체결 · {name}",
+                    "body": account_text + _sell_body(trade), "data": data}
         body = f"{_shares(trade.get('shares'))}주 · {_won(trade.get('amount_krw'))}"
         fee = float(trade.get("fee_krw") or 0.0)
         if fee > 0:
             body += f" (수수료 {_won(fee)})"
-        return {"title": f"🤖 AI 매수 체결 · {name}", "body": body, "data": data}
+        return {"title": f"{head}AI 매수 체결 · {name}",
+                "body": account_text + body, "data": data}
 
     buy_rows = [t for t in trades if str(t.get("side") or "").upper() == "BUY"]
     sell_rows = [t for t in trades if str(t.get("side") or "").upper() == "SELL"]
@@ -261,7 +279,8 @@ def build_fill_message(sells: list[dict] | None, buys: list[dict] | None) -> dic
         detail = (f"매수 {_won(sum(_settle_krw(t) for t in buy_rows))} · "
                   f"매도 {_won(sum(_settle_krw(t) for t in sell_rows))}")
     body = f"{_display_name(trades[0])} 외 {len(trades) - 1}건 {detail}"
-    return {"title": f"🤖 AI 모의투자 {len(trades)}건 체결", "body": body, "data": data}
+    return {"title": f"{head}AI 모의투자 {len(trades)}건 체결",
+            "body": account_text + body, "data": data}
 
 
 # --- 발송 ---------------------------------------------------------------------

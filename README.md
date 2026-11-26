@@ -112,8 +112,10 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     위 `DATABASE_URL`(Neon 등 무료 PostgreSQL)을 넣으면 재배포에도 이력이 남는다.
     굳이 파일로 유지하려면 Render Persistent Disk를 붙이고 `HISTORY_DB_PATH=/var/data/recommendations.db`처럼 지정한다.
 - **🤖 AI 모의투자(페이퍼 트레이딩)**(`paper_store.py` · `paper_trading.py`): 스크리너 결과로 AI가
-  **원화 통합 계좌**에서 한국·미국 주식을 가상으로 사고팔아 수익률을 추적한다. 실제 주문은 나가지 않는다.
-  - 계좌: 시드머니 **기본 10,000,000원**(10만~10억, 언제든 설정/리셋). 현금·총자산·수익률은 모두 `₩`,
+  **미국·한국 두 계좌**에서 주식을 가상으로 사고팔아 수익률을 서로 비교한다. 실제 주문은 나가지 않는다.
+  - 계좌: **미국(US, id=1)·한국(KR, id=2)** 두 계좌가 **서로 완전히 분리**되어 있고, 각각 시드머니
+    **기본 1,000,000원**(10만~10억, 계좌별 설정/리셋)을 가진다. 현금·보유 종목·체결·일별 수익률이
+    `account_id`로 갈라져 한쪽 매매가 다른 쪽 숫자를 건드리지 않는다. 계좌 안의 금액은 모두 `₩`,
     미국 종목은 달러로 체결하고 **체결 시점의 USD/KRW 환율**을 포지션에 저장해 원화 원가를 고정한다.
     평가는 현재 환율로 다시 계산하므로 **환차손익도 수익률에 들어간다**. 환율은 네이버 금융(하나은행 고시)
     → Yahoo `KRW=X` → 고정 1,350원 순으로 폴백하고, 응답의 `fx_source`에 어느 경로였는지 남긴다.
@@ -124,39 +126,46 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     수량을 정하고(예산이 수수료 포함이라 현금이 음수가 되지 않는다) 포지션 원가에 매수수수료를 넣는다.
     매도는 총대금에서 수수료·세금을 뺀 **순수취액만** 현금으로 들어와, `순수취액 - 원가`가 실현손익이 된다.
     응답에는 `fee_policy`와 각 체결의 `fee_krw`·`settle_krw`(매수 지출/매도 입금)가 실린다.
-  - 투자 시장: `ALL`(한국+미국, 기본) / `US` / `KR`. 전략: `balanced`(기본)·`momentum`·`value`·`oversold`.
+  - 시장: 계좌가 시장을 정한다(미국 계좌는 미국 종목만, 한국 계좌는 한국 종목만). 전략은 계좌별로
+    `balanced`(기본)·`momentum`·`value`·`oversold` 중 고른다.
   - 매도: 손절 **-8%** · 익절 **+25%** 규칙과 Gemini 판단(전량/부분 `fraction`)으로 현금을 만든다.
     판정 기준은 주가 등락률이 아니라 **지금 전량 매도할 때의 순수익률**(`net_pnl_pct`)이다 — 매수 수수료가
     든 원가, 매도 수수료·증권거래세, 미국 종목의 **매수 환율 대비 현재 환율(환차)**까지 반영한다
     (보유 행의 `net_pnl_krw`·`net_pnl_pct`·`sell_fee_krw`·`fx_change_pct`). Gemini 프롬프트에도 같은 값과
-    시장별 비용률을 넣어 수수료·환차를 고려한 매도/보유 판단을 받는다.
-  - 매수: 대상 시장의 스크리너 상위 후보(S&P 500 · 코스피 200, 정량 점수·`signals`·재무·뉴스)를 Gemini에
+    시장별 비용률, 이 계좌의 시장만 매매하라는 규칙을 넣는다.
+  - 매수: 그 계좌의 시장 스크리너 상위 후보(S&P 500 · 코스피 200, 정량 점수·`signals`·재무·뉴스)를 Gemini에
     넘겨 종목·원화 금액을 받는다. **남은 현금을 넘겨 살 수 없고**(요청 금액을 현금으로 자르고 체결 후
     잔고를 다시 검증), 한 종목은 총자산의 **30%**, 최대 **8종목**, 최소 주문 **1만 원**이다.
     Gemini가 죽거나 429·해석 실패면 **정량 점수 상위 3종목 균등 배분 폴백**으로 매매를 계속한다.
-  - 자동 실행: 서버 백그라운드 루프가 **한국 장 마감 후 15:40 KST**·**미국 장 마감 후 06:20 KST**에
-    시장별 **하루 1회**(`last_run_kr_date`·`last_run_us_date`) 실행한다. 서버가 그 시각에 꺼져 있었다면
-    다시 켜진 뒤 1회 따라잡고, `PAPER_AUTO=0`으로 끌 수 있으며, `force` 없이 같은 날 다시 부르면
-    `skipped: "already_ran_today"`로 건너뛴다.
-  - API: `GET /api/paper/status`(계좌 요약·보유 포지션 평가손익·체결 내역·일별 수익률 추이·자동 실행 일정·
-    `fee_policy`),
-    `POST /api/paper/configure`(`initial_cash_krw`·`markets`·`strategy`·`auto_enabled`·`reset`),
-    `POST /api/paper/run`(`force`·`markets`, 실행 결과 + 갱신된 status). 실행은 한 번에 하나만
+  - 자동 실행: 서버 백그라운드 루프가 **한국 계좌를 15:40 KST**(한국 장 마감 후)·**미국 계좌를 06:20 KST**
+    (미국 장 마감 후)에 **계좌별 하루 1회**(`last_run_kr_date`·`last_run_us_date`) 실행한다. 서버가 그 시각에
+    꺼져 있었다면 다시 켜진 뒤 1회 따라잡고, `PAPER_AUTO=0`으로 끌 수 있으며, `force` 없이 같은 날 다시
+    부르면 `skipped: "already_ran_today"`로 건너뛴다. 자동 실행은 `auto_enabled`가 켜진 계좌만 돈다.
+  - API: `GET /api/paper/status?market=US|KR`(그 계좌의 요약·보유 포지션 평가손익·체결 내역·일별 수익률
+    추이·자동 실행 일정·`fee_policy` + **두 계좌 비교 요약** `accounts`/`comparison`: 총자산·현금·주식평가액·
+    누적손익·수익률%·보유종목수·마지막 실행일),
+    `POST /api/paper/configure`(`market`·`initial_cash_krw`·`strategy`·`auto_enabled`·`reset` — 그 계좌에만 적용),
+    `POST /api/paper/run`(`market`·`force`, 그 계좌만 매매, 실행 결과 + 갱신된 status). 실행은 한 번에 하나만
     돌고(`_RUN_LOCK`), 자동 실행과 수동 실행이 겹치면 두 번째는 `skipped: "already_running"`을 받는다.
     현금은 `cash_krw + ?`로 원자 증감해 잔고보다 많이 차감하려 하면 체결 전체가 취소된다
     (포지션·체결이 반쪽만 남지 않는다).
   - 저장: 기존 `recommendations`(성적표) 테이블은 그대로 두고 `paper_account`·`paper_positions`·
     `paper_trades`·`paper_equity_history` 네 테이블을 새로 만든다(`DATABASE_URL`이 있으면 PostgreSQL,
-    없으면 같은 SQLite 파일). `paper_trades.fee_krw`는 기존 DB에 `ALTER TABLE ... ADD COLUMN`(SQLite는
-    `PRAGMA table_info` 확인 후)으로만 더해, 돌고 있는 계좌·체결을 지우지 않는다(예전 체결은 0).
-  - 웹 UI 상단에 **🤖 AI 모의투자** 탭: 총 자산·총 수익률·시드머니 카드, 시드머니/시장/전략/자동 실행 설정과
-    계좌 초기화, `▶ 지금 AI 매매 1회 실행`, 보유 종목 표(수량·평단가·현재가·평가손익·**매도 시 순손익**·AI 사유),
+    없으면 같은 SQLite 파일). 세 테이블 모두 `account_id`를 갖고 유니크는 `(account_id, ticker)`·
+    `(account_id, date)`다. 예전 단일 계좌 DB는 기동 시 `account_id`·`market_scope` 컬럼을 더하고
+    유니크를 계좌별로 바꾸며, 이미 쌓인 계좌·체결·스냅샷을 **미국 계좌(1)**로 옮긴다(지우지 않는다).
+    `paper_trades.fee_krw`도 같은 방식으로 더해 예전 체결은 0으로 읽힌다.
+  - 웹 UI 상단에 **🤖 AI 모의투자** 탭: 맨 위 **🇺🇸 미국 vs 🇰🇷 한국 비교 카드**(총자산·수익률·손익·현금)와
+    계좌 전환 탭, 그 아래 총 자산·총 수익률·시드머니 카드, 시드머니/전략/자동 실행 설정과 계좌 초기화,
+    `▶ 지금 AI 매매 1회 실행`, 보유 종목 표(수량·평단가·현재가·평가손익·**매도 시 순손익**·AI 사유),
     최근 매매 내역(**수수료·세금** 열), 적용 중인 수수료·세금 기준 안내, 수익률 추이 차트(Recharts).
   - **체결 푸시 알림(FCM)**(`fcm.py`): 매수·매도가 체결되면 **DB 커밋 직후** 등록된 안드로이드 기기로
-    알림이 간다(1초 컷). 단건은 `🤖 AI 매수 체결 · 현대글로비스` / `1주 · ₩201,470 (수수료 ₩30)`,
-    매도는 `순손익 +₩12,300 (+4.2%)`(수수료·세금·환차 반영 순손익), 다건은
-    `🤖 AI 모의투자 3건 체결` / `현대글로비스 외 2건 매수 · 총 ₩681,572`. `data`에
-    `{"screen":"paper","market":"KR"}`을 넣어 알림을 탭하면 앱이 🤖 AI 모의투자 화면으로 열린다.
+    알림이 간다(1초 컷). 알림만 봐도 어느 계좌인지 알 수 있게 제목에 `[미국]`/`[한국]`, 본문 앞에
+    `미국 계좌 · `를 붙인다. 단건은 `🤖 [한국] AI 매수 체결 · 현대글로비스` /
+    `한국 계좌 · 1주 · ₩201,470 (수수료 ₩30)`, 매도는 `순손익 +₩12,300 (+4.2%)`(수수료·세금·환차 반영
+    순손익), 다건은 `🤖 [미국] AI 모의투자 3건 체결` / `미국 계좌 · 엔비디아 외 2건 매수 · 총 ₩…`.
+    `data`에 `{"screen":"paper","market":"KR"}`을 넣어 알림을 탭하면 앱이 🤖 AI 모의투자 화면의
+    그 계좌로 열린다.
     - 키는 **환경변수 `FIREBASE_SERVICE_ACCOUNT_JSON`**(JSON 문자열 전체 또는 base64) 또는
       `FIREBASE_CREDENTIALS_PATH`(파일 경로)로만 넣는다. 서비스 계정 JSON은 `.gitignore`의
       `*firebase-adminsdk*.json`·`*service-account*.json`으로 커밋을 막아 두었다.
@@ -236,7 +245,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자(수수료·세금·환차 포함)·FCM 체결 푸시 검증, 560개)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자(두 계좌 분리·수수료·세금·환차·마이그레이션)·FCM 체결 푸시 검증, 585개)
 
 ## 환경변수
 | 이름 | 설명 |

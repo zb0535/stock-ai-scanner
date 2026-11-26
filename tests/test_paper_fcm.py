@@ -116,33 +116,40 @@ class FcmStoreCase(unittest.TestCase):
 
     def test_single_buy_message(self):
         message = fcm.build_fill_message([], [buy_trade()])
-        self.assertEqual(message["title"], "🤖 AI 매수 체결 · 현대글로비스")
-        self.assertEqual(message["body"], "1주 · ₩201,470 (수수료 ₩30)")
+        self.assertEqual(message["title"], "🤖 [한국] AI 매수 체결 · 현대글로비스")
+        self.assertEqual(message["body"], "한국 계좌 · 1주 · ₩201,470 (수수료 ₩30)")
         self.assertEqual(message["data"]["screen"], "paper")
         self.assertEqual(message["data"]["market"], "KR")
 
+    def test_us_fill_message_is_marked_as_the_us_account(self):
+        message = fcm.build_fill_message([], [buy_trade("AAPL", "애플", 3.6338, 998_502.0, 1_498.0,
+                                                        market="US")])
+        self.assertEqual(message["title"], "🤖 [미국] AI 매수 체결 · 애플")
+        self.assertTrue(message["body"].startswith("미국 계좌 · "))
+        self.assertEqual(message["data"]["market"], "US")
+
     def test_single_sell_message_shows_net_pnl_with_percent(self):
         message = fcm.build_fill_message([sell_trade()], [])
-        self.assertEqual(message["title"], "🤖 AI 매도 체결 · 오리온")
+        self.assertEqual(message["title"], "🤖 [한국] AI 매도 체결 · 오리온")
         # 순수취 304,405 - 순손익 12,300 = 원가 292,105 → +4.2%
-        self.assertEqual(message["body"], "순손익 +₩12,300 (+4.2%)")
+        self.assertEqual(message["body"], "한국 계좌 · 순손익 +₩12,300 (+4.2%)")
 
     def test_single_sell_message_without_realized_pnl(self):
         trade = sell_trade(realized=None)
         message = fcm.build_fill_message([trade], [])
-        self.assertEqual(message["body"], "3주 · 순수취 ₩304,405")
+        self.assertEqual(message["body"], "한국 계좌 · 3주 · 순수취 ₩304,405")
 
     def test_multiple_buys_message(self):
         rows = [buy_trade(), buy_trade("005930.KS", "삼성전자", 2.0, 400_000.0, 60.0),
                 buy_trade("000660.KS", "SK하이닉스", 1.0, 80_000.0, 12.0)]
         message = fcm.build_fill_message([], rows)
-        self.assertEqual(message["title"], "🤖 AI 모의투자 3건 체결")
-        self.assertEqual(message["body"], "현대글로비스 외 2건 매수 · 총 ₩681,572")
+        self.assertEqual(message["title"], "🤖 [한국] AI 모의투자 3건 체결")
+        self.assertEqual(message["body"], "한국 계좌 · 현대글로비스 외 2건 매수 · 총 ₩681,572")
         self.assertEqual(message["data"]["count"], "3")
 
     def test_mixed_message_separates_buy_and_sell_totals(self):
         message = fcm.build_fill_message([sell_trade(fee=0.0)], [buy_trade(fee=0.0)])
-        self.assertEqual(message["title"], "🤖 AI 모의투자 2건 체결")
+        self.assertEqual(message["title"], "🤖 [한국] AI 모의투자 2건 체결")
         self.assertIn("매수 ₩201,470", message["body"])
         self.assertIn("매도 ₩305,000", message["body"])
 
@@ -196,7 +203,7 @@ class FcmStoreCase(unittest.TestCase):
             return found, {sym: "test" for sym in found}
 
         return paper_trading.run(
-            markets="US", force=force, db_path=self.db_path,
+            market="US", force=force, db_path=self.db_path,
             ai_call=(lambda prompt: json.dumps(ai_payload)) if ai_payload else None,
             price_fn=price_fn,
             candidate_fn=lambda market, criteria, top_n=8: list(candidates),

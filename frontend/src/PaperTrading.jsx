@@ -13,9 +13,8 @@ import {
 const API_BASE = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/+$/, "");
 
 const MARKETS = [
-  { value: "ALL", label: "🇰🇷+🇺🇸 한국+미국" },
-  { value: "US", label: "🇺🇸 미국만" },
-  { value: "KR", label: "🇰🇷 한국만" },
+  { value: "US", label: "🇺🇸 미국 계좌" },
+  { value: "KR", label: "🇰🇷 한국 계좌" },
 ];
 
 const STRATEGIES = [
@@ -108,7 +107,7 @@ export default function PaperTradingView() {
   const [running, setRunning] = useState(false);
   const [saving, setSaving] = useState(false);
   const [seed, setSeed] = useState("");
-  const [markets, setMarkets] = useState("ALL");
+  const [market, setMarket] = useState("US");
   const [strategy, setStrategy] = useState("balanced");
   const [auto, setAuto] = useState(true);
   const [runResult, setRunResult] = useState(null);
@@ -116,16 +115,15 @@ export default function PaperTradingView() {
   const apply = useCallback((body) => {
     setData(body);
     setSeed(String(Math.round(body?.account?.initial_cash_krw ?? 0)));
-    setMarkets(body?.account?.markets ?? "ALL");
     setStrategy(body?.account?.strategy ?? "balanced");
     setAuto(Boolean(body?.account?.auto_enabled));
   }, []);
 
   const load = useCallback(
-    async (silent = false) => {
+    async (silent = false, scope = market) => {
       if (!silent) setLoading(true);
       try {
-        const res = await fetch(`${API_BASE}/api/paper/status`);
+        const res = await fetch(`${API_BASE}/api/paper/status?market=${scope}`);
         if (!res.ok) throw new Error(`계좌를 불러오지 못했습니다 (${res.status})`);
         apply(await res.json());
         setError("");
@@ -135,12 +133,14 @@ export default function PaperTradingView() {
         setLoading(false);
       }
     },
-    [apply]
+    [apply, market]
   );
 
   useEffect(() => {
-    load();
-  }, [load]);
+    load(false, market);
+    setRunResult(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [market]);
 
   const saveSettings = async (reset = false) => {
     const amount = Number(String(seed).replace(/[^0-9.]/g, ""));
@@ -148,7 +148,7 @@ export default function PaperTradingView() {
       setError("시드머니를 입력해 주세요.");
       return;
     }
-    if (reset && !window.confirm(`${won(amount)}으로 계좌를 초기화할까요? 보유 종목·체결 내역이 모두 지워집니다.`)) {
+    if (reset && !window.confirm(`${won(amount)}으로 ${market === "KR" ? "한국" : "미국"} 계좌를 초기화할까요? 보유 종목·체결 내역이 모두 지워집니다.`)) {
       return;
     }
     setSaving(true);
@@ -158,8 +158,8 @@ export default function PaperTradingView() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          market,
           initial_cash_krw: amount,
-          markets,
           strategy,
           auto_enabled: auto,
           reset,
@@ -192,7 +192,7 @@ export default function PaperTradingView() {
       const res = await fetch(`${API_BASE}/api/paper/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ force: true }),
+        body: JSON.stringify({ market, force: true }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(`AI 매매 실행 실패 (${res.status})`);
@@ -210,6 +210,7 @@ export default function PaperTradingView() {
   const trades = data?.trades || [];
   const schedule = data?.auto_schedule || [];
   const feePolicy = data?.fee_policy || null;
+  const comparison = data?.comparison || [];
 
   const chart = useMemo(
     () =>
@@ -227,15 +228,54 @@ export default function PaperTradingView() {
 
   return (
     <div className="paper">
+      {comparison.length > 0 && (
+        <section className="paper-compare">
+          {comparison.map((row) => (
+            <button
+              key={row.market}
+              type="button"
+              className={`paper-compare-card ${row.market === market ? "active" : ""}`}
+              onClick={() => setMarket(row.market)}
+            >
+              <span className="paper-compare-label">
+                {row.label || row.market} 계좌
+                {row.auto_enabled === false && <em className="sub">자동 꺼짐</em>}
+              </span>
+              <strong>{won(row.total_value_krw)}</strong>
+              <span className={`ret ${retClass(row.total_return_pct)}`}>
+                {pct(row.total_return_pct)}
+              </span>
+              <em className={`sub ${retClass(row.total_pnl_krw)}`}>
+                손익 {won(row.total_pnl_krw)}
+              </em>
+              <em className="sub">
+                현금 {won(row.cash_krw)} · 보유 {row.positions_count ?? 0}종목
+              </em>
+            </button>
+          ))}
+        </section>
+      )}
+
       <section className="panel paper-hero">
         <div className="score-head">
           <div>
-            <h2 className="score-title">🤖 AI 모의투자</h2>
+            <h2 className="score-title">🤖 AI 모의투자 · {market === "KR" ? "🇰🇷 한국" : "🇺🇸 미국"} 계좌</h2>
             <p className="score-sub">
-              원화 통합 계좌 · {account?.markets === "KR" ? "한국" : account?.markets === "US" ? "미국" : "한국+미국"} ·{" "}
-              {account?.strategy_label || "-"} · 1 USD = {won(account?.fx_rate)}{" "}
+              시드 {won(account?.initial_cash_krw)} · {account?.strategy_label || "-"} · 1 USD = {won(account?.fx_rate)}{" "}
               <span className="mini-tag">{account?.fx_source || "-"}</span>
             </p>
+            <div className="seg paper-account-seg">
+              {MARKETS.map((item) => (
+                <button
+                  key={item.value}
+                  type="button"
+                  className={market === item.value ? "active" : ""}
+                  onClick={() => setMarket(item.value)}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
           </div>
           <div className="paper-actions">
             <button type="button" className="refresh-btn" onClick={() => load()} disabled={loading}>
@@ -357,8 +397,11 @@ export default function PaperTradingView() {
       <section className="panel paper-settings">
         <div className="score-head">
           <div>
-            <h3 className="score-title">⚙️ 계좌 설정</h3>
-            <p className="score-sub">시드머니는 언제든 바꿀 수 있고, 초기화하면 새 시드로 다시 시작합니다.</p>
+            <h3 className="score-title">⚙️ 계좌 설정 · {market === "KR" ? "🇰🇷 한국" : "🇺🇸 미국"}</h3>
+            <p className="score-sub">
+              계좌마다 시장이 따로입니다(미국 계좌는 미국 종목만). 시드머니는 언제든 바꿀 수 있고,
+              초기화하면 이 계좌만 새 시드로 다시 시작합니다.
+            </p>
           </div>
         </div>
         <div className="paper-form">
@@ -371,21 +414,6 @@ export default function PaperTradingView() {
               placeholder="10000000"
             />
             <em>{won(seed)}</em>
-          </label>
-          <label>
-            투자 시장
-            <div className="seg">
-              {MARKETS.map((item) => (
-                <button
-                  key={item.value}
-                  type="button"
-                  className={markets === item.value ? "active" : ""}
-                  onClick={() => setMarkets(item.value)}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </div>
           </label>
           <label>
             AI 전략

@@ -100,7 +100,8 @@ async def lifespan(_app: FastAPI):
     sp500_scanner.start_prewarm()
     # 코스피 200은 60초 뒤 시작해 S&P 500(8초 뒤) 첫 스캔과 겹치지 않게 한다(메모리 피크 분리).
     kospi200_scanner.start_prewarm()
-    # AI 모의투자: 계좌 스키마를 확인하고, 매일 1회(한국 15:40·미국 06:20 KST) 자동 매매 루프를 건다.
+    # AI 모의투자: 두 계좌(미국·한국) 스키마를 확인하고, 계좌별로 매일 1회
+    # (한국 계좌 15:40 · 미국 계좌 06:20 KST) 자동 매매 루프를 건다.
     # DB가 잠시 죽어 있어도 서버는 뜨고, 자동 루프는 5분마다 다시 시도한다(PAPER_AUTO=0으로 끔).
     try:
         paper_store.init_store()
@@ -1122,15 +1123,17 @@ def _paper_ai_call(prompt: str) -> str | None:
 
 
 class PaperConfigureRequest(BaseModel):
-    """`POST /api/paper/configure` — 시드머니·시장·전략·자동 실행 설정/리셋.
+    """`POST /api/paper/configure` — 한 계좌의 시드머니·전략·자동 실행 설정/리셋.
 
+    - `market`: "US"(미국 계좌) | "KR"(한국 계좌). 비우면 미국 계좌.
     - `initial_cash_krw`: 원화 시드머니(10만~10억). `reset` 없이 바꾸면 현금에서 차감/추가된다.
-    - `markets`: "ALL"(한국+미국) | "US" | "KR".
     - `strategy`: momentum | value | oversold | balanced.
-    - `auto_enabled`: 매일 1회 자동 매매(한국 15:40 · 미국 06:20 KST).
-    - `reset`: true면 보유·체결·스냅샷을 지우고 새 시드머니로 다시 시작.
+    - `auto_enabled`: 매일 1회 자동 매매(한국 계좌 15:40 · 미국 계좌 06:20 KST).
+    - `reset`: true면 그 계좌의 보유·체결·스냅샷을 지우고 새 시드머니로 다시 시작.
+    - `markets`: 예전 클라이언트가 보내는 값 — 받아만 두고 무시한다(계좌는 시장이 고정).
     """
 
+    market: str | None = None
     initial_cash_krw: float | None = None
     markets: str | None = None
     strategy: str | None = None
@@ -1139,21 +1142,25 @@ class PaperConfigureRequest(BaseModel):
 
 
 class PaperRunRequest(BaseModel):
-    """`POST /api/paper/run` — AI 매매 1회 실행.
+    """`POST /api/paper/run` — 한 계좌에서 AI 매매 1회 실행.
 
-    `force=false`(기본)면 오늘 이미 돈 시장은 건너뛴다. 사용자가 버튼으로 직접 돌릴 때는
-    클라이언트가 `force=true`를 보낸다. `markets`를 주면 그 시장만 판단한다.
+    `market`: "US"(미국 계좌) | "KR"(한국 계좌) — 생략하면 미국 계좌.
+    `force=false`(기본)면 오늘 이미 돈 계좌는 건너뛴다. 사용자가 버튼으로 직접 돌릴 때는
+    클라이언트가 `force=true`를 보낸다.
     """
 
+    market: str | None = None
     force: bool = False
     markets: str | None = None
 
 
 @app.get("/api/paper/status")
-def paper_status(trades: int = 40, history: int = 180):
-    """AI 모의투자 계좌 요약·보유 포지션(평가손익)·체결 내역·수익률 추이."""
+def paper_status(trades: int = 40, history: int = 180, market: str = "US"):
+    """한 계좌의 요약·보유·체결·수익률 + 미국·한국 두 계좌 비교 요약(`accounts`)."""
     try:
-        return paper_trading.status(limit_trades=trades, limit_equity=history)
+        return paper_trading.status(limit_trades=trades, limit_equity=history, market=market)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         logger.exception("모의투자 상태 조회 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_storage_unavailable")
@@ -1161,9 +1168,11 @@ def paper_status(trades: int = 40, history: int = 180):
 
 @app.post("/api/paper/configure")
 def paper_configure(req: PaperConfigureRequest):
-    """시드머니 설정·계좌 리셋·시장/전략/자동 실행 설정."""
+    """시드머니 설정·계좌 리셋·전략·자동 실행 설정(지정한 시장 계좌만)."""
+    market = req.market or req.markets or "US"
     try:
         result = paper_trading.configure(
+            account=market,
             initial_cash_krw=req.initial_cash_krw,
             markets=req.markets,
             strategy=req.strategy,
@@ -1175,24 +1184,27 @@ def paper_configure(req: PaperConfigureRequest):
     except Exception as exc:
         logger.exception("모의투자 설정 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_storage_unavailable")
-    return {"ok": True, **result, "status": paper_trading.status()}
+    return {"ok": True, **result, "status": paper_trading.status(market=market)}
 
 
 @app.post("/api/paper/run")
 def paper_run(req: PaperRunRequest | None = None):
-    """AI 일일 매매 1회 실행 — 매도(손절·익절·AI) → 매수(현금 한도) → 스냅샷.
+    """AI 일일 매매 1회 실행(한 계좌) — 매도(손절·익절·AI) → 매수(현금 한도) → 스냅샷.
 
     응답에는 실행 결과(`result`: 매수/매도 체결·건너뛴 이유·요약·`push` 발송 결과)와 갱신된
     `status`가 함께 온다. 체결이 있으면 등록된 기기로 FCM 푸시가 바로 나간다.
     """
     payload = req or PaperRunRequest()
+    market = payload.market or payload.markets or "US"
     try:
-        result = paper_trading.run(markets=payload.markets, force=payload.force,
+        result = paper_trading.run(market=market, force=payload.force,
                                    trigger="manual", ai_call=_paper_ai_call)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         logger.exception("모의투자 실행 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_run_failed")
-    return {"ok": True, "result": result, "status": paper_trading.status()}
+    return {"ok": True, "result": result, "status": paper_trading.status(market=market)}
 
 
 # --- 체결 푸시 알림(FCM) ------------------------------------------------------

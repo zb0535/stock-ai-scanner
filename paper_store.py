@@ -1,10 +1,14 @@
 """AI 모의투자(페이퍼 트레이딩) — 계좌·보유 포지션·체결·수익률 스냅샷 저장소.
 
 설계 원칙
-- **통화는 원화(KRW) 하나로 통일한다**: 미국·한국 종목을 한 계좌에서 굴리므로, 시드머니·
-  현금·총 자산·수익률은 모두 `₩`다. 미국 종목의 `avg_price`·`price`는 달러로 남기고
-  (`currency="USD"`), 매수 시점의 USD/KRW 환율(`fx_rate`)을 포지션에 함께 저장해 원화 원가
-  (`cost_krw`)를 고정한다. 평가는 **현재 환율**로 다시 계산한다 — 환율 변동도 수익률에 들어간다.
+- **시장별로 완전히 분리된 두 계좌**: 미국(US) 계좌(`id=1`, `market_scope='US'`)와
+  한국(KR) 계좌(`id=2`, `market_scope='KR'`). 현금·보유 종목·체결 내역·일별 수익률이
+  `account_id`로 갈라져 **한쪽 매매가 다른 쪽 숫자를 절대 건드리지 않는다**. 두 계좌의
+  수익률을 나란히 비교하는 것이 이 구조의 목적이다.
+- **통화는 원화(KRW) 하나로 통일한다**: 각 계좌의 시드머니·현금·총 자산·수익률은 모두 `₩`다.
+  미국 종목의 `avg_price`·`price`는 달러로 남기고(`currency="USD"`), 매수 시점의 USD/KRW
+  환율(`fx_rate`)을 포지션에 함께 저장해 원화 원가(`cost_krw`)를 고정한다. 평가는 **현재
+  환율**로 다시 계산한다 — 환율 변동도 수익률에 들어간다.
 - **기존 성적표와 분리**: `history_store`의 `recommendations` 테이블은 그대로 두고,
   `paper_*` 테이블 네 개를 새로 만든다(`performance` 화면은 건드리지 않는다).
 - **저장 백엔드는 성적표와 같은 규칙**: `DATABASE_URL`(PostgreSQL/Neon)이 있으면 그쪽에,
@@ -12,6 +16,9 @@
   유틸은 `history_store`를 그대로 재사용해 두 저장소가 같은 DB 파일·같은 SSL 규칙을 쓴다.
 - **현금은 절대 음수가 되지 않는다**: 매수 금액은 호출부(`paper_trading`)가 잔여 현금으로
   검증해 넘기지만, 저장 단계에서도 음수 현금을 막는다(`_guard_cash`).
+- **기존 DB는 그대로 살린다**: 예전 단일 계좌 테이블에는 `account_id`가 없다. 기동 시
+  `account_id`·`market_scope` 컬럼을 더하고, 이미 쌓인 계좌·체결·스냅샷은 **미국 계좌(1)**로
+  옮긴다(지우지 않는다). 유니크 제약도 `(account_id, ticker)`·`(account_id, date)`로 바꾼다.
 - 금액은 float(원, 소수점 반올림)로 저장한다. 화면 표시는 정수 원 단위로 반올림한다.
 """
 
@@ -34,15 +41,23 @@ TABLE_TRADES = "paper_trades"
 TABLE_EQUITY = "paper_equity_history"
 TABLE_FCM_TOKENS = "paper_fcm_tokens"
 
-ACCOUNT_ID = 1
+# 시장별 계좌 — id가 곧 계좌이고, market_scope가 그 계좌의 시장이다.
+ACCOUNT_US = 1
+ACCOUNT_KR = 2
+ACCOUNTS = (ACCOUNT_US, ACCOUNT_KR)
+ACCOUNT_MARKETS = {ACCOUNT_US: "US", ACCOUNT_KR: "KR"}
+MARKET_ACCOUNTS = {"US": ACCOUNT_US, "KR": ACCOUNT_KR}
+ACCOUNT_LABELS = {"US": "🇺🇸 미국", "KR": "🇰🇷 한국"}
+# 하위 호환: 계좌를 지정하지 않는 호출은 미국 계좌를 본다.
+ACCOUNT_ID = ACCOUNT_US
 
-# 기본 시드머니 — 원화 1,000만 원(한국·미국 통합 계좌).
-DEFAULT_INITIAL_CASH_KRW = 10_000_000.0
+# 기본 시드머니 — 계좌마다 원화 100만 원(미국·한국 각각 따로).
+DEFAULT_INITIAL_CASH_KRW = 1_000_000.0
 MIN_INITIAL_CASH_KRW = 100_000.0          # 10만 원
 MAX_INITIAL_CASH_KRW = 1_000_000_000.0    # 10억 원
 
 MARKETS = ("ALL", "US", "KR")
-DEFAULT_MARKETS = "ALL"
+DEFAULT_MARKETS = "US"
 
 STRATEGIES = ("momentum", "value", "oversold", "balanced")
 DEFAULT_STRATEGY = "balanced"
@@ -56,9 +71,10 @@ STRATEGY_LABELS = {
 _SQLITE_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_ACCOUNT} (
     id               INTEGER PRIMARY KEY,
+    market_scope     TEXT    NOT NULL DEFAULT 'US',
     initial_cash_krw REAL    NOT NULL,
     cash_krw         REAL    NOT NULL,
-    markets          TEXT    NOT NULL DEFAULT 'ALL',
+    markets          TEXT    NOT NULL DEFAULT 'US',
     strategy         TEXT    NOT NULL DEFAULT 'balanced',
     auto_enabled     INTEGER NOT NULL DEFAULT 1,
     last_run_date    TEXT,
@@ -70,7 +86,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_ACCOUNT} (
 
 CREATE TABLE IF NOT EXISTS {TABLE_POSITIONS} (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker     TEXT    NOT NULL UNIQUE,
+    account_id INTEGER NOT NULL DEFAULT 1,
+    ticker     TEXT    NOT NULL,
     market     TEXT    NOT NULL,
     name       TEXT    NOT NULL DEFAULT '',
     currency   TEXT    NOT NULL DEFAULT 'USD',
@@ -79,11 +96,13 @@ CREATE TABLE IF NOT EXISTS {TABLE_POSITIONS} (
     fx_rate    REAL    NOT NULL DEFAULT 1,
     cost_krw   REAL    NOT NULL,
     reason     TEXT    NOT NULL DEFAULT '',
-    opened_at  TEXT
+    opened_at  TEXT,
+    UNIQUE(account_id, ticker)
 );
 
 CREATE TABLE IF NOT EXISTS {TABLE_TRADES} (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id        INTEGER NOT NULL DEFAULT 1,
     run_id            TEXT,
     trade_date        TEXT    NOT NULL,
     traded_at         TEXT    NOT NULL,
@@ -104,12 +123,14 @@ CREATE TABLE IF NOT EXISTS {TABLE_TRADES} (
 
 CREATE TABLE IF NOT EXISTS {TABLE_EQUITY} (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    date            TEXT    NOT NULL UNIQUE,
+    account_id      INTEGER NOT NULL DEFAULT 1,
+    date            TEXT    NOT NULL,
     total_value_krw REAL    NOT NULL,
     cash_krw        REAL    NOT NULL,
     stock_value_krw REAL    NOT NULL,
     return_pct      REAL,
-    recorded_at     TEXT
+    recorded_at     TEXT,
+    UNIQUE(account_id, date)
 );
 
 CREATE TABLE IF NOT EXISTS {TABLE_FCM_TOKENS} (
@@ -123,9 +144,10 @@ CREATE TABLE IF NOT EXISTS {TABLE_FCM_TOKENS} (
 _PG_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_ACCOUNT} (
     id               INTEGER PRIMARY KEY,
+    market_scope     TEXT    NOT NULL DEFAULT 'US',
     initial_cash_krw DOUBLE PRECISION NOT NULL,
     cash_krw         DOUBLE PRECISION NOT NULL,
-    markets          TEXT    NOT NULL DEFAULT 'ALL',
+    markets          TEXT    NOT NULL DEFAULT 'US',
     strategy         TEXT    NOT NULL DEFAULT 'balanced',
     auto_enabled     INTEGER NOT NULL DEFAULT 1,
     last_run_date    TEXT,
@@ -137,7 +159,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_ACCOUNT} (
 
 CREATE TABLE IF NOT EXISTS {TABLE_POSITIONS} (
     id         SERIAL PRIMARY KEY,
-    ticker     TEXT    NOT NULL UNIQUE,
+    account_id INTEGER NOT NULL DEFAULT 1,
+    ticker     TEXT    NOT NULL,
     market     TEXT    NOT NULL,
     name       TEXT    NOT NULL DEFAULT '',
     currency   TEXT    NOT NULL DEFAULT 'USD',
@@ -146,11 +169,13 @@ CREATE TABLE IF NOT EXISTS {TABLE_POSITIONS} (
     fx_rate    DOUBLE PRECISION NOT NULL DEFAULT 1,
     cost_krw   DOUBLE PRECISION NOT NULL,
     reason     TEXT    NOT NULL DEFAULT '',
-    opened_at  TEXT
+    opened_at  TEXT,
+    UNIQUE(account_id, ticker)
 );
 
 CREATE TABLE IF NOT EXISTS {TABLE_TRADES} (
     id               SERIAL PRIMARY KEY,
+    account_id       INTEGER NOT NULL DEFAULT 1,
     run_id           TEXT,
     trade_date       TEXT    NOT NULL,
     traded_at        TEXT    NOT NULL,
@@ -171,12 +196,14 @@ CREATE TABLE IF NOT EXISTS {TABLE_TRADES} (
 
 CREATE TABLE IF NOT EXISTS {TABLE_EQUITY} (
     id              SERIAL PRIMARY KEY,
-    date            TEXT    NOT NULL UNIQUE,
+    account_id      INTEGER NOT NULL DEFAULT 1,
+    date            TEXT    NOT NULL,
     total_value_krw DOUBLE PRECISION NOT NULL,
     cash_krw        DOUBLE PRECISION NOT NULL,
     stock_value_krw DOUBLE PRECISION NOT NULL,
     return_pct      DOUBLE PRECISION,
-    recorded_at     TEXT
+    recorded_at     TEXT,
+    UNIQUE(account_id, date)
 );
 
 CREATE TABLE IF NOT EXISTS {TABLE_FCM_TOKENS} (
@@ -191,6 +218,37 @@ _PG_READY: set[str] = set()
 _PG_LOCK = threading.Lock()
 _SQLITE_READY: set[str] = set()
 _SQLITE_LOCK = threading.Lock()
+
+
+# --- 계좌 식별 ----------------------------------------------------------------
+
+
+def normalize_account_id(value: Any = None) -> int:
+    """`"US"`/`"KR"`/`1`/`2` → 계좌 id. 빈 값은 미국 계좌. 모르는 값은 `ValueError`."""
+    if value is None or value == "":
+        return ACCOUNT_US
+    if isinstance(value, bool):
+        raise ValueError("account_invalid")
+    if isinstance(value, int):
+        if value in ACCOUNT_MARKETS:
+            return value
+        raise ValueError("account_invalid")
+    token = str(value).strip().upper()
+    if token in ("", "US", "1", "USA"):
+        return ACCOUNT_US
+    if token in ("KR", "2", "KOR"):
+        return ACCOUNT_KR
+    raise ValueError("account_invalid")
+
+
+def account_market(account_id: Any = None) -> str:
+    """계좌 id → 시장 코드(`"US"`/`"KR"`)."""
+    return ACCOUNT_MARKETS[normalize_account_id(account_id)]
+
+
+def account_label(account_id: Any = None) -> str:
+    """화면·푸시용 이름 — `"🇺🇸 미국"` / `"🇰🇷 한국"`."""
+    return ACCOUNT_LABELS[account_market(account_id)]
 
 
 # --- 연결 ---------------------------------------------------------------------
@@ -217,31 +275,177 @@ def _ensure_pg_schema(conn, key: str) -> None:
         for statement in _split_statements(_PG_SCHEMA):
             conn.execute(statement)
         # 이미 돌고 있는 실서버 테이블에는 `CREATE TABLE IF NOT EXISTS`가 컬럼을 더하지 않는다.
-        # 기존 계좌·체결을 지우지 않고 수수료 컬럼만 덧붙인다(기본 0 = 예전 체결은 수수료 미기록).
+        # 기존 계좌·체결은 지우지 않고 컬럼만 덧붙인다(예전 행은 0 = 수수료 미기록, 계좌는 미국).
+        for table in (TABLE_POSITIONS, TABLE_TRADES, TABLE_EQUITY):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS account_id "
+                         "INTEGER NOT NULL DEFAULT 1")
         conn.execute(f"ALTER TABLE {TABLE_TRADES} ADD COLUMN IF NOT EXISTS fee_krw "
                      "DOUBLE PRECISION NOT NULL DEFAULT 0")
+        conn.execute(f"ALTER TABLE {TABLE_ACCOUNT} ADD COLUMN IF NOT EXISTS market_scope TEXT")
+        _pg_scope_accounts(conn)
+        # 예전 단일 계좌 시절의 전역 유니크(ticker / date)를 계좌별 유니크로 바꾼다.
+        _pg_drop_global_unique(conn, TABLE_POSITIONS, ("account_id", "ticker"))
+        _pg_drop_global_unique(conn, TABLE_EQUITY, ("account_id", "date"))
+        conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS paper_positions_account_ticker_key"
+                     f" ON {TABLE_POSITIONS} (account_id, ticker)")
+        conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS paper_equity_history_account_date_key"
+                     f" ON {TABLE_EQUITY} (account_id, date)")
         conn.commit()
         _PG_READY.add(key)
 
 
+def _pg_scope_accounts(conn) -> None:
+    """계좌 행의 market_scope를 id로 채운다(1=US, 2=KR). `markets`도 그 계좌의 시장으로 맞춘다."""
+    conn.execute(f"UPDATE {TABLE_ACCOUNT} SET market_scope = CASE WHEN id = 2 THEN 'KR' ELSE 'US' END"
+                 " WHERE market_scope IS NULL OR market_scope = ''")
+    conn.execute(f"UPDATE {TABLE_ACCOUNT} SET markets = market_scope"
+                 " WHERE markets IS NULL OR markets = '' OR markets = 'ALL' OR markets <> market_scope")
+
+
+def _pg_drop_global_unique(conn, table: str, keep: tuple[str, ...]) -> None:
+    """`keep` 컬럼 조합이 아닌 UNIQUE 제약을 지운다(계좌가 섞이지 않게)."""
+    try:
+        rows = conn.execute(
+            "SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint"
+            " WHERE conrelid = %s::regclass AND contype = 'u'", (table,)).fetchall() or []
+    except Exception as exc:  # 권한·구버전 — 기본 이름으로만 시도한다
+        logger.warning("유니크 제약 조회 실패(%s): %s", table, type(exc).__name__)
+        rows = []
+    for row in rows:
+        try:
+            data = dict(row)
+        except (TypeError, ValueError):
+            continue
+        name = data.get("conname")
+        definition = str(data.get("definition") or "")
+        if not name or all(column in definition for column in keep):
+            continue
+        conn.execute(f'ALTER TABLE {table} DROP CONSTRAINT IF EXISTS "{name}"')
+    # 기본 이름(구 스키마)도 확실히 지운다.
+    fallback = f"{table}_ticker_key" if table == TABLE_POSITIONS else f"{table}_date_key"
+    conn.execute(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {fallback}")
+
+
 def _ensure_sqlite_schema(conn, key: str) -> None:
-    """SQLite 스키마 + 기존 파일용 컬럼 마이그레이션(`PRAGMA table_info`로 확인 후 ADD COLUMN)."""
+    """SQLite 스키마 + 기존 파일용 컬럼/계좌 마이그레이션."""
     if key in _SQLITE_READY:
         return
     with _SQLITE_LOCK:
         if key in _SQLITE_READY:
             return
         conn.executescript(_SQLITE_SCHEMA)
-        columns = set()
-        for row in conn.execute(f"PRAGMA table_info({TABLE_TRADES})").fetchall() or []:
-            try:
-                columns.add(str(row[1]))
-            except (IndexError, KeyError, TypeError):
-                columns.add(str(dict(row).get("name")))
+        # 1) 수수료 컬럼(이미 있으면 그대로) — 계좌 테이블 재구성 전에 확인한다.
+        columns = _sqlite_columns(conn, TABLE_TRADES)
         if "fee_krw" not in columns:
             conn.execute(f"ALTER TABLE {TABLE_TRADES} ADD COLUMN fee_krw REAL NOT NULL DEFAULT 0")
             conn.commit()
+        # 2) 계좌 분리 마이그레이션 — 예전 행은 미국 계좌(1)로 옮긴다.
+        if "account_id" not in _sqlite_columns(conn, TABLE_POSITIONS):
+            _sqlite_split_accounts(conn)
+            conn.commit()
+        # 3) 계좌 테이블의 market_scope.
+        account_columns = _sqlite_columns(conn, TABLE_ACCOUNT)
+        if "market_scope" not in account_columns:
+            conn.execute(f"ALTER TABLE {TABLE_ACCOUNT} ADD COLUMN market_scope TEXT")
+        conn.execute(f"UPDATE {TABLE_ACCOUNT}"
+                     " SET market_scope = CASE WHEN id = 2 THEN 'KR' ELSE 'US' END"
+                     " WHERE market_scope IS NULL OR market_scope = ''")
+        conn.execute(f"UPDATE {TABLE_ACCOUNT} SET markets = market_scope"
+                     " WHERE markets IS NULL OR markets = '' OR markets = 'ALL'"
+                     " OR markets <> market_scope")
+        conn.commit()
         _SQLITE_READY.add(key)
+
+
+def _sqlite_columns(conn, table: str) -> set[str]:
+    columns: set[str] = set()
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall() or []
+    except Exception:
+        return columns
+    for row in rows:
+        try:
+            columns.add(str(row[1]))
+        except (IndexError, KeyError, TypeError):
+            try:
+                columns.add(str(dict(row).get("name")))
+            except (TypeError, ValueError):
+                pass
+    return columns
+
+
+# 계좌별 유니크로 다시 만드는 테이블(예전 스키마에는 account_id도, 계좌별 유니크도 없다).
+_SQLITE_REBUILDS = {
+    TABLE_POSITIONS: (
+        f"""CREATE TABLE {{tmp}} (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL DEFAULT 1,
+            ticker     TEXT    NOT NULL,
+            market     TEXT    NOT NULL,
+            name       TEXT    NOT NULL DEFAULT '',
+            currency   TEXT    NOT NULL DEFAULT 'USD',
+            shares     REAL    NOT NULL,
+            avg_price  REAL    NOT NULL,
+            fx_rate    REAL    NOT NULL DEFAULT 1,
+            cost_krw   REAL    NOT NULL,
+            reason     TEXT    NOT NULL DEFAULT '',
+            opened_at  TEXT,
+            UNIQUE(account_id, ticker)
+        )""",
+        "id, ticker, market, name, currency, shares, avg_price, fx_rate, cost_krw, reason, opened_at",
+    ),
+    TABLE_TRADES: (
+        f"""CREATE TABLE {{tmp}} (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id        INTEGER NOT NULL DEFAULT 1,
+            run_id            TEXT,
+            trade_date        TEXT    NOT NULL,
+            traded_at         TEXT    NOT NULL,
+            ticker            TEXT    NOT NULL,
+            market            TEXT    NOT NULL,
+            name              TEXT    NOT NULL DEFAULT '',
+            side              TEXT    NOT NULL,
+            shares            REAL    NOT NULL,
+            price             REAL    NOT NULL,
+            currency          TEXT    NOT NULL DEFAULT 'USD',
+            fx_rate           REAL    NOT NULL DEFAULT 1,
+            amount_krw        REAL    NOT NULL,
+            fee_krw           REAL    NOT NULL DEFAULT 0,
+            realized_pnl_krw  REAL,
+            reason            TEXT    NOT NULL DEFAULT '',
+            ai_source         TEXT    NOT NULL DEFAULT ''
+        )""",
+        "id, run_id, trade_date, traded_at, ticker, market, name, side, shares, price, currency,"
+        " fx_rate, amount_krw, fee_krw, realized_pnl_krw, reason, ai_source",
+    ),
+    TABLE_EQUITY: (
+        f"""CREATE TABLE {{tmp}} (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id      INTEGER NOT NULL DEFAULT 1,
+            date            TEXT    NOT NULL,
+            total_value_krw REAL    NOT NULL,
+            cash_krw        REAL    NOT NULL,
+            stock_value_krw REAL    NOT NULL,
+            return_pct      REAL,
+            recorded_at     TEXT,
+            UNIQUE(account_id, date)
+        )""",
+        "id, date, total_value_krw, cash_krw, stock_value_krw, return_pct, recorded_at",
+    ),
+}
+
+
+def _sqlite_split_accounts(conn) -> None:
+    """`account_id`가 없던 테이블을 계좌별 유니크 스키마로 다시 만들고 기존 행은 계좌 1로."""
+    for table, (create_sql, columns) in _SQLITE_REBUILDS.items():
+        tmp = f"{table}_account_migration"
+        conn.execute(f"DROP TABLE IF EXISTS {tmp}")
+        conn.execute(create_sql.format(tmp=tmp))
+        conn.execute(f"INSERT INTO {tmp} (account_id, {columns})"
+                     f" SELECT 1, {columns} FROM {table}")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")
+    logger.info("모의투자 DB를 시장별 계좌(US=1 · KR=2) 구조로 마이그레이션했습니다.")
 
 
 def _split_statements(sql: str) -> list[str]:
@@ -327,13 +531,17 @@ def kst_today_str() -> str:
 # --- 계좌 ---------------------------------------------------------------------
 
 
-def _default_account() -> dict:
+def _default_account(account_id: int = ACCOUNT_US, seed: float | None = None) -> dict:
     stamp = _now()
+    aid = normalize_account_id(account_id)
+    market = ACCOUNT_MARKETS[aid]
+    cash = float(DEFAULT_INITIAL_CASH_KRW if seed is None else seed)
     return {
-        "id": ACCOUNT_ID,
-        "initial_cash_krw": DEFAULT_INITIAL_CASH_KRW,
-        "cash_krw": DEFAULT_INITIAL_CASH_KRW,
-        "markets": DEFAULT_MARKETS,
+        "id": aid,
+        "market_scope": market,
+        "initial_cash_krw": cash,
+        "cash_krw": cash,
+        "markets": market,
         "strategy": DEFAULT_STRATEGY,
         "auto_enabled": 1,
         "last_run_date": None,
@@ -344,39 +552,44 @@ def _default_account() -> dict:
     }
 
 
-def get_account(db_path: str | None = None) -> dict:
-    """계좌 한 행(KST 기준). 없으면 기본값($1만 → ₩1,000만)으로 만들어 돌려준다."""
+def get_account(account_id: Any = ACCOUNT_US, db_path: str | None = None) -> dict:
+    """계좌 한 행(KST 기준). 없으면 그 계좌의 기본값(₩100만)으로 만들어 돌려준다."""
+    aid = normalize_account_id(account_id)
     with _connection(db_path) as (conn, backend):
-        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (ACCOUNT_ID,))
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (aid,))
         account = _row(cur)
     if account:
         return _normalize_account(account)
 
-    account = _default_account()
+    account = _default_account(aid)
     with _connection(db_path, write=True) as (conn, backend):
-        cur = conn.execute(_sql(f"SELECT id FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (ACCOUNT_ID,))
+        cur = conn.execute(_sql(f"SELECT id FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (aid,))
         if _row(cur) is None:
             conn.execute(
-                _sql(f"INSERT INTO {TABLE_ACCOUNT} (id, initial_cash_krw, cash_krw, markets, strategy,"
-                     " auto_enabled, last_run_date, last_run_us_date, last_run_kr_date,"
-                     " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", backend),
-                (ACCOUNT_ID, account["initial_cash_krw"], account["cash_krw"], account["markets"],
-                 account["strategy"], account["auto_enabled"], None, None, None,
+                _sql(f"INSERT INTO {TABLE_ACCOUNT} (id, market_scope, initial_cash_krw, cash_krw,"
+                     " markets, strategy, auto_enabled, last_run_date, last_run_us_date,"
+                     " last_run_kr_date, created_at, updated_at)"
+                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", backend),
+                (aid, account["market_scope"], account["initial_cash_krw"], account["cash_krw"],
+                 account["markets"], account["strategy"], account["auto_enabled"], None, None, None,
                  account["created_at"], account["updated_at"]),
             )
-        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (ACCOUNT_ID,))
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (aid,))
         stored = _row(cur)
-    logger.info("모의투자 계좌 생성: 시드 ₩%.0f · 시장 %s", account["initial_cash_krw"], account["markets"])
+    logger.info("모의투자 계좌 생성: %s · 시드 ₩%.0f", account["market_scope"],
+                account["initial_cash_krw"])
     return _normalize_account(stored or account)
 
 
 def _normalize_account(row: dict) -> dict:
     out = dict(row)
+    aid = normalize_account_id(out.get("id"))
+    market = ACCOUNT_MARKETS[aid]
+    out["id"] = aid
+    out["market_scope"] = market
+    out["markets"] = market          # 계좌의 시장은 계좌가 정한다(설정으로 바뀌지 않는다).
     out["initial_cash_krw"] = float(out.get("initial_cash_krw") or DEFAULT_INITIAL_CASH_KRW)
     out["cash_krw"] = float(out.get("cash_krw") or 0.0)
-    out["markets"] = str(out.get("markets") or DEFAULT_MARKETS).upper()
-    if out["markets"] not in MARKETS:
-        out["markets"] = DEFAULT_MARKETS
     out["strategy"] = str(out.get("strategy") or DEFAULT_STRATEGY)
     if out["strategy"] not in STRATEGIES:
         out["strategy"] = DEFAULT_STRATEGY
@@ -384,30 +597,35 @@ def _normalize_account(row: dict) -> dict:
     return out
 
 
-def update_account(fields: dict, db_path: str | None = None) -> dict:
+def update_account(fields: dict, db_path: str | None = None,
+                   account_id: Any = ACCOUNT_US) -> dict:
     """계좌의 지정 필드만 갱신하고 갱신된 행을 돌려준다(계좌가 없으면 먼저 만든다)."""
-    get_account(db_path)  # 행이 없으면 기본값으로 만들어 둔다(UPDATE 0건 방지)
+    aid = normalize_account_id(account_id)
+    get_account(aid, db_path)  # 행이 없으면 기본값으로 만들어 둔다(UPDATE 0건 방지)
     allowed = {"initial_cash_krw", "cash_krw", "markets", "strategy", "auto_enabled",
                "last_run_date", "last_run_us_date", "last_run_kr_date"}
     payload = {k: v for k, v in (fields or {}).items() if k in allowed}
     if not payload:
-        return get_account(db_path)
+        return get_account(aid, db_path)
+    payload.pop("markets", None)  # 계좌의 시장은 계좌 id가 정한다
     payload["updated_at"] = _now()
     assignments = ", ".join(f"{name} = ?" for name in payload)
     with _connection(db_path, write=True) as (conn, backend):
         conn.execute(_sql(f"UPDATE {TABLE_ACCOUNT} SET {assignments} WHERE id = ?", backend),
-                     (*payload.values(), ACCOUNT_ID))
-        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (ACCOUNT_ID,))
+                     (*payload.values(), aid))
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (aid,))
         stored = _row(cur)
-    return _normalize_account(stored or get_account(db_path))
+    return _normalize_account(stored or get_account(aid, db_path))
 
 
 # --- 포지션 -------------------------------------------------------------------
 
 
-def list_positions(db_path: str | None = None) -> list[dict]:
+def list_positions(db_path: str | None = None, account_id: Any = ACCOUNT_US) -> list[dict]:
+    aid = normalize_account_id(account_id)
     with _connection(db_path) as (conn, backend):
-        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} ORDER BY id", backend))
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE account_id = ?"
+                                " ORDER BY id", backend), (aid,))
         rows = _rows(cur)
     return [_normalize_position(row) for row in rows]
 
@@ -421,20 +639,24 @@ def _normalize_position(row: dict) -> dict:
     return out
 
 
-def get_position(ticker: str, db_path: str | None = None) -> dict | None:
+def get_position(ticker: str, db_path: str | None = None,
+                 account_id: Any = ACCOUNT_US) -> dict | None:
+    aid = normalize_account_id(account_id)
     sym = str(ticker or "").strip().upper()
     if not sym:
         return None
     with _connection(db_path) as (conn, backend):
-        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE ticker = ?", backend), (sym,))
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE account_id = ?"
+                                " AND ticker = ?", backend), (aid, sym))
         row = _row(cur)
     return _normalize_position(row) if row else None
 
 
 def add_position(ticker: str, market: str, currency: str, shares: float, price: float,
                  fx_rate: float, cost_krw: float, name: str = "", reason: str = "",
-                 db_path: str | None = None) -> dict:
+                 db_path: str | None = None, account_id: Any = ACCOUNT_US) -> dict:
     """포지션을 더한다. 이미 있으면 평단가·원가를 가중평균으로 합친다(추가 매수)."""
+    aid = normalize_account_id(account_id)
     sym = str(ticker or "").strip().upper()
     shares = float(shares)
     price = float(price)
@@ -442,7 +664,7 @@ def add_position(ticker: str, market: str, currency: str, shares: float, price: 
     if not sym or shares <= 0 or price <= 0 or cost_krw <= 0:
         raise ValueError("invalid_position")
 
-    existing = get_position(sym, db_path)
+    existing = get_position(sym, db_path, aid)
     stamp = _now()
     with _connection(db_path, write=True) as (conn, backend):
         if existing:
@@ -452,60 +674,69 @@ def add_position(ticker: str, market: str, currency: str, shares: float, price: 
             fx = (existing["fx_rate"] * existing["cost_krw"] + float(fx_rate) * cost_krw) / total_cost
             conn.execute(
                 _sql(f"UPDATE {TABLE_POSITIONS} SET shares = ?, avg_price = ?, fx_rate = ?,"
-                     " cost_krw = ?, reason = ? WHERE ticker = ?", backend),
+                     " cost_krw = ?, reason = ? WHERE account_id = ? AND ticker = ?", backend),
                 (total_shares, avg_price, fx, total_cost,
-                 (reason or existing.get("reason") or "")[:400], sym),
+                 (reason or existing.get("reason") or "")[:400], aid, sym),
             )
         else:
             conn.execute(
-                _sql(f"INSERT INTO {TABLE_POSITIONS} (ticker, market, name, currency, shares,"
-                     " avg_price, fx_rate, cost_krw, reason, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                     backend),
-                (sym, market, name or "", currency, shares, price, float(fx_rate), cost_krw,
+                _sql(f"INSERT INTO {TABLE_POSITIONS} (account_id, ticker, market, name, currency,"
+                     " shares, avg_price, fx_rate, cost_krw, reason, opened_at)"
+                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", backend),
+                (aid, sym, market, name or "", currency, shares, price, float(fx_rate), cost_krw,
                  (reason or "")[:400], stamp),
             )
-        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE ticker = ?", backend), (sym,))
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE account_id = ?"
+                                " AND ticker = ?", backend), (aid, sym))
         stored = _row(cur)
     return _normalize_position(stored or {})
 
 
-def reduce_position(ticker: str, shares: float, db_path: str | None = None) -> dict | None:
+def reduce_position(ticker: str, shares: float, db_path: str | None = None,
+                    account_id: Any = ACCOUNT_US) -> dict | None:
     """보유 수량을 줄인다. 0 이하가 되면 행을 지운다(전량 매도).
 
     반환은 남은 포지션(전량 매도면 None). 원가는 수량 비율로 줄어 평단가·매수환율이 유지된다.
     """
+    aid = normalize_account_id(account_id)
     sym = str(ticker or "").strip().upper()
     shares = float(shares)
-    position = get_position(sym, db_path)
+    position = get_position(sym, db_path, aid)
     if not position:
         return None
     remaining = round(position["shares"] - shares, 8)
     with _connection(db_path, write=True) as (conn, backend):
         if remaining <= 0.0000001:
-            conn.execute(_sql(f"DELETE FROM {TABLE_POSITIONS} WHERE ticker = ?", backend), (sym,))
+            conn.execute(_sql(f"DELETE FROM {TABLE_POSITIONS} WHERE account_id = ? AND ticker = ?",
+                              backend), (aid, sym))
             return None
         ratio = remaining / position["shares"]
         conn.execute(
-            _sql(f"UPDATE {TABLE_POSITIONS} SET shares = ?, cost_krw = ? WHERE ticker = ?", backend),
-            (remaining, round(position["cost_krw"] * ratio, 2), sym),
+            _sql(f"UPDATE {TABLE_POSITIONS} SET shares = ?, cost_krw = ?"
+                 " WHERE account_id = ? AND ticker = ?", backend),
+            (remaining, round(position["cost_krw"] * ratio, 2), aid, sym),
         )
-        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE ticker = ?", backend), (sym,))
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE account_id = ?"
+                                " AND ticker = ?", backend), (aid, sym))
         stored = _row(cur)
     return _normalize_position(stored or {})
 
 
-def clear_positions(db_path: str | None = None) -> int:
+def clear_positions(db_path: str | None = None, account_id: Any = ACCOUNT_US) -> int:
+    aid = normalize_account_id(account_id)
     with _connection(db_path, write=True) as (conn, backend):
-        cur = conn.execute(f"DELETE FROM {TABLE_POSITIONS}")
+        cur = conn.execute(_sql(f"DELETE FROM {TABLE_POSITIONS} WHERE account_id = ?", backend),
+                           (aid,))
         return int(getattr(cur, "rowcount", 0) or 0)
 
 
 # --- 체결 ---------------------------------------------------------------------
 
 
-def _trade_payload(trade: dict) -> dict:
+def _trade_payload(trade: dict, account_id: Any = ACCOUNT_US) -> dict:
     """체결 dict → DB 컬럼 순서가 고정된 payload."""
     return {
+        "account_id": normalize_account_id(account_id),
         "run_id": trade.get("run_id") or "",
         "trade_date": trade.get("trade_date") or kst_today_str(),
         "traded_at": trade.get("traded_at") or _now(),
@@ -540,81 +771,92 @@ def _insert_trade(conn, backend: str, payload: dict) -> int | None:
     return getattr(cur, "lastrowid", None)
 
 
-def record_trade(trade: dict, db_path: str | None = None) -> dict:
+def record_trade(trade: dict, db_path: str | None = None,
+                 account_id: Any = ACCOUNT_US) -> dict:
     """체결 한 건을 남긴다(BUY/SELL). `amount_krw`는 원화 환산 금액(양수)."""
-    payload = _trade_payload(trade)
+    payload = _trade_payload(trade, account_id)
     with _connection(db_path, write=True) as (conn, backend):
         payload["id"] = _insert_trade(conn, backend, payload)
     return payload
 
 
-def _apply_cash_delta(conn, backend: str, delta: float, stamp: str) -> float | None:
+def _apply_cash_delta(conn, backend: str, delta: float, stamp: str,
+                      account_id: Any = ACCOUNT_US) -> float | None:
     """현금을 **원자적으로** 더한다(음수면 잔고 부족 시 실패). 새 잔고 또는 None.
 
     절대값을 덮어쓰지 않고 `cash_krw + delta`로 계산하므로, 자동 실행과 수동 실행이 겹쳐도
     한쪽의 차감이 다른 쪽에 의해 지워지지 않는다(현금 초과 매수 방지).
     """
+    aid = normalize_account_id(account_id)
     amount = round(float(delta), 2)
     if amount < 0:
         cur = conn.execute(
             _sql(f"UPDATE {TABLE_ACCOUNT} SET cash_krw = cash_krw + ?, updated_at = ?"
                  " WHERE id = ? AND cash_krw + ? >= 0", backend),
-            (amount, stamp, ACCOUNT_ID, amount))
+            (amount, stamp, aid, amount))
     else:
         cur = conn.execute(
             _sql(f"UPDATE {TABLE_ACCOUNT} SET cash_krw = cash_krw + ?, updated_at = ? WHERE id = ?",
                  backend),
-            (amount, stamp, ACCOUNT_ID))
+            (amount, stamp, aid))
     if int(getattr(cur, "rowcount", 0) or 0) == 0:
         return None
     row = _row(conn.execute(
-        _sql(f"SELECT cash_krw FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (ACCOUNT_ID,)))
+        _sql(f"SELECT cash_krw FROM {TABLE_ACCOUNT} WHERE id = ?", backend), (aid,)))
     return round(float((row or {}).get("cash_krw") or 0.0), 2)
+
+
+def _upsert_position(conn, backend: str, aid: int, sym: str, market: str, name: str,
+                     currency: str, shares: float, price: float, fx_rate: float,
+                     cost_krw: float, reason: str, stamp: str) -> None:
+    cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE account_id = ?"
+                            " AND ticker = ?", backend), (aid, sym))
+    existing = _row(cur)
+    if existing:
+        total_shares = float(existing["shares"]) + shares
+        total_cost = float(existing["cost_krw"]) + cost_krw
+        avg_price = (float(existing["avg_price"]) * float(existing["shares"]) + price * shares) / total_shares
+        fx = (float(existing["fx_rate"]) * float(existing["cost_krw"]) + float(fx_rate) * cost_krw) / total_cost
+        conn.execute(
+            _sql(f"UPDATE {TABLE_POSITIONS} SET shares = ?, avg_price = ?, fx_rate = ?,"
+                 " cost_krw = ?, reason = ? WHERE account_id = ? AND ticker = ?", backend),
+            (total_shares, avg_price, fx, total_cost,
+             (reason or existing.get("reason") or "")[:400], aid, sym),
+        )
+        return
+    conn.execute(
+        _sql(f"INSERT INTO {TABLE_POSITIONS} (account_id, ticker, market, name, currency, shares,"
+             " avg_price, fx_rate, cost_krw, reason, opened_at)"
+             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", backend),
+        (aid, sym, market, name or "", currency, shares, price, float(fx_rate), cost_krw,
+         (reason or "")[:400], stamp),
+    )
 
 
 def apply_buy(ticker: str, market: str, name: str, currency: str, shares: float, price: float,
               fx_rate: float, cost_krw: float, reason: str, cash_delta: float,
-              trade: dict, db_path: str | None = None) -> dict:
+              trade: dict, db_path: str | None = None,
+              account_id: Any = ACCOUNT_US) -> dict:
     """매수 체결을 **한 트랜잭션으로** 반영한다(포지션 + 계좌 현금 + 체결 기록).
 
     `cash_delta`는 보통 `-cost_krw`다. 잔고보다 많이 차감하려 하면 `cash_below_zero`로
     실패하고 포지션도 남기지 않는다.
     """
+    aid = normalize_account_id(account_id)
     sym = str(ticker or "").strip().upper()
     shares = float(shares)
     price = float(price)
     cost_krw = float(cost_krw)
     if not sym or shares <= 0 or price <= 0 or cost_krw <= 0:
         raise ValueError("invalid_position")
-    get_account(db_path)  # 계좌 행이 없으면 먼저 만든다(현금 UPDATE가 0건이 되지 않게)
+    get_account(aid, db_path)  # 계좌 행이 없으면 먼저 만든다(현금 UPDATE가 0건이 되지 않게)
 
-    payload = _trade_payload(trade)
+    payload = _trade_payload(trade, aid)
     stamp = _now()
     with _connection(db_path, write=True) as (conn, backend):
-        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE ticker = ?", backend), (sym,))
-        existing = _row(cur)
-        if existing:
-            total_shares = float(existing["shares"]) + shares
-            total_cost = float(existing["cost_krw"]) + cost_krw
-            avg_price = (float(existing["avg_price"]) * float(existing["shares"])
-                         + price * shares) / total_shares
-            fx = (float(existing["fx_rate"]) * float(existing["cost_krw"])
-                  + float(fx_rate) * cost_krw) / total_cost
-            conn.execute(
-                _sql(f"UPDATE {TABLE_POSITIONS} SET shares = ?, avg_price = ?, fx_rate = ?,"
-                     " cost_krw = ?, reason = ? WHERE ticker = ?", backend),
-                (total_shares, avg_price, fx, total_cost,
-                 (reason or existing.get("reason") or "")[:400], sym),
-            )
-        else:
-            conn.execute(
-                _sql(f"INSERT INTO {TABLE_POSITIONS} (ticker, market, name, currency, shares,"
-                     " avg_price, fx_rate, cost_krw, reason, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                     backend),
-                (sym, market, name or "", currency, shares, price, float(fx_rate), cost_krw,
-                 (reason or "")[:400], stamp),
-            )
-        cash = _apply_cash_delta(conn, backend, cash_delta, stamp)
+        _upsert_position(conn, backend, aid, sym, market, name, currency, shares, price,
+                         fx_rate, cost_krw, reason, stamp)
+        cash = _apply_cash_delta(conn, backend, cash_delta, stamp, aid)
         if cash is None:  # 잔고 부족 → 트랜잭션 전체 취소(포지션도 남지 않는다)
             raise ValueError("cash_below_zero")
         payload["id"] = _insert_trade(conn, backend, payload)
@@ -624,31 +866,36 @@ def apply_buy(ticker: str, market: str, name: str, currency: str, shares: float,
 
 
 def apply_sell(ticker: str, shares: float, cost_krw_sold: float, cash_delta: float,
-               trade: dict, db_path: str | None = None) -> dict:
+               trade: dict, db_path: str | None = None,
+               account_id: Any = ACCOUNT_US) -> dict:
     """매도 체결을 한 트랜잭션으로 반영한다(포지션 축소/삭제 + 현금 증가 + 체결 기록)."""
+    aid = normalize_account_id(account_id)
     sym = str(ticker or "").strip().upper()
     shares = float(shares)
     if not sym or shares <= 0:
         raise ValueError("invalid_position")
-    get_account(db_path)
+    get_account(aid, db_path)
 
-    payload = _trade_payload(trade)
+    payload = _trade_payload(trade, aid)
     stamp = _now()
     with _connection(db_path, write=True) as (conn, backend):
-        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE ticker = ?", backend), (sym,))
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_POSITIONS} WHERE account_id = ?"
+                                " AND ticker = ?", backend), (aid, sym))
         position = _row(cur)
         if not position:
             raise ValueError("position_not_found")
         remaining = round(float(position["shares"]) - shares, 8)
         if remaining <= 0.0000001:
-            conn.execute(_sql(f"DELETE FROM {TABLE_POSITIONS} WHERE ticker = ?", backend), (sym,))
+            conn.execute(_sql(f"DELETE FROM {TABLE_POSITIONS} WHERE account_id = ? AND ticker = ?",
+                              backend), (aid, sym))
         else:
             kept_cost = max(0.0, round(float(position["cost_krw"]) - float(cost_krw_sold), 2))
             conn.execute(
-                _sql(f"UPDATE {TABLE_POSITIONS} SET shares = ?, cost_krw = ? WHERE ticker = ?", backend),
-                (remaining, kept_cost, sym),
+                _sql(f"UPDATE {TABLE_POSITIONS} SET shares = ?, cost_krw = ?"
+                     " WHERE account_id = ? AND ticker = ?", backend),
+                (remaining, kept_cost, aid, sym),
             )
-        cash = _apply_cash_delta(conn, backend, cash_delta, stamp)
+        cash = _apply_cash_delta(conn, backend, cash_delta, stamp, aid)
         if cash is None:  # 계좌 행이 없을 수 없다 — 있으면 실패로 본다
             raise ValueError("cash_update_failed")
         payload["id"] = _insert_trade(conn, backend, payload)
@@ -658,10 +905,13 @@ def apply_sell(ticker: str, shares: float, cost_krw_sold: float, cash_delta: flo
     return payload
 
 
-def recent_trades(limit: int = 40, db_path: str | None = None) -> list[dict]:
+def recent_trades(limit: int = 40, db_path: str | None = None,
+                  account_id: Any = ACCOUNT_US) -> list[dict]:
+    aid = normalize_account_id(account_id)
     n = max(1, min(int(limit or 40), 500))
     with _connection(db_path) as (conn, backend):
-        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_TRADES} ORDER BY id DESC LIMIT ?", backend), (n,))
+        cur = conn.execute(_sql(f"SELECT * FROM {TABLE_TRADES} WHERE account_id = ?"
+                                " ORDER BY id DESC LIMIT ?", backend), (aid, n))
         rows = _rows(cur)
     for row in rows:
         row["shares"] = float(row.get("shares") or 0.0)
@@ -677,9 +927,29 @@ def recent_trades(limit: int = 40, db_path: str | None = None) -> list[dict]:
     return rows
 
 
-def clear_trades(db_path: str | None = None) -> int:
+def realized_pnl(db_path: str | None = None, account_id: Any = ACCOUNT_US) -> float:
+    """계좌의 누적 실현손익(매도 체결의 `realized_pnl_krw` 합)."""
+    aid = normalize_account_id(account_id)
+    with _connection(db_path) as (conn, backend):
+        row = _row(conn.execute(_sql(
+            f"SELECT COALESCE(SUM(realized_pnl_krw), 0) AS total FROM {TABLE_TRADES}"
+            " WHERE account_id = ? AND side = 'SELL'", backend), (aid,)))
+    return round(float((row or {}).get("total") or 0.0), 2)
+
+
+def trade_count(db_path: str | None = None, account_id: Any = ACCOUNT_US) -> int:
+    aid = normalize_account_id(account_id)
+    with _connection(db_path) as (conn, backend):
+        row = _row(conn.execute(_sql(f"SELECT COUNT(*) AS n FROM {TABLE_TRADES}"
+                                     " WHERE account_id = ?", backend), (aid,)))
+    return int((row or {}).get("n") or 0)
+
+
+def clear_trades(db_path: str | None = None, account_id: Any = ACCOUNT_US) -> int:
+    aid = normalize_account_id(account_id)
     with _connection(db_path, write=True) as (conn, backend):
-        cur = conn.execute(f"DELETE FROM {TABLE_TRADES}")
+        cur = conn.execute(_sql(f"DELETE FROM {TABLE_TRADES} WHERE account_id = ?", backend),
+                           (aid,))
         return int(getattr(cur, "rowcount", 0) or 0)
 
 
@@ -687,9 +957,12 @@ def clear_trades(db_path: str | None = None) -> int:
 
 
 def record_equity(day: str, total_value_krw: float, cash_krw: float, stock_value_krw: float,
-                  return_pct: float | None, db_path: str | None = None) -> dict:
-    """하루 한 행(KST 날짜 UNIQUE). 같은 날 다시 실행하면 최신 값으로 덮어쓴다."""
+                  return_pct: float | None, db_path: str | None = None,
+                  account_id: Any = ACCOUNT_US) -> dict:
+    """계좌별 하루 한 행(KST 날짜 UNIQUE). 같은 날 다시 실행하면 최신 값으로 덮어쓴다."""
+    aid = normalize_account_id(account_id)
     payload = {
+        "account_id": aid,
         "date": day or kst_today_str(),
         "total_value_krw": round(float(total_value_krw), 2),
         "cash_krw": round(float(cash_krw), 2),
@@ -699,21 +972,25 @@ def record_equity(day: str, total_value_krw: float, cash_krw: float, stock_value
     }
     with _connection(db_path, write=True) as (conn, backend):
         conn.execute(
-            _sql(f"INSERT INTO {TABLE_EQUITY} (date, total_value_krw, cash_krw, stock_value_krw,"
-                 " return_pct, recorded_at) VALUES (?, ?, ?, ?, ?, ?)"
-                 " ON CONFLICT (date) DO UPDATE SET total_value_krw = excluded.total_value_krw,"
-                 " cash_krw = excluded.cash_krw, stock_value_krw = excluded.stock_value_krw,"
-                 " return_pct = excluded.return_pct, recorded_at = excluded.recorded_at", backend),
+            _sql(f"INSERT INTO {TABLE_EQUITY} (account_id, date, total_value_krw, cash_krw,"
+                 " stock_value_krw, return_pct, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                 " ON CONFLICT (account_id, date) DO UPDATE SET"
+                 " total_value_krw = excluded.total_value_krw, cash_krw = excluded.cash_krw,"
+                 " stock_value_krw = excluded.stock_value_krw, return_pct = excluded.return_pct,"
+                 " recorded_at = excluded.recorded_at", backend),
             tuple(payload.values()),
         )
     return payload
 
 
-def equity_history(limit: int = 180, db_path: str | None = None) -> list[dict]:
+def equity_history(limit: int = 180, db_path: str | None = None,
+                   account_id: Any = ACCOUNT_US) -> list[dict]:
+    aid = normalize_account_id(account_id)
     n = max(1, min(int(limit or 180), 1000))
     with _connection(db_path) as (conn, backend):
         cur = conn.execute(_sql(
-            f"SELECT * FROM {TABLE_EQUITY} ORDER BY date DESC LIMIT ?", backend), (n,))
+            f"SELECT * FROM {TABLE_EQUITY} WHERE account_id = ? ORDER BY date DESC LIMIT ?",
+            backend), (aid, n))
         rows = _rows(cur)
     rows.reverse()  # 오래된 날짜부터(차트 x축)
     for row in rows:
@@ -725,9 +1002,11 @@ def equity_history(limit: int = 180, db_path: str | None = None) -> list[dict]:
     return rows
 
 
-def clear_equity(db_path: str | None = None) -> int:
+def clear_equity(db_path: str | None = None, account_id: Any = ACCOUNT_US) -> int:
+    aid = normalize_account_id(account_id)
     with _connection(db_path, write=True) as (conn, backend):
-        cur = conn.execute(f"DELETE FROM {TABLE_EQUITY}")
+        cur = conn.execute(_sql(f"DELETE FROM {TABLE_EQUITY} WHERE account_id = ?", backend),
+                           (aid,))
         return int(getattr(cur, "rowcount", 0) or 0)
 
 
@@ -799,35 +1078,39 @@ def count_fcm_tokens(db_path: str | None = None) -> int:
 
 
 def reset(db_path: str | None = None, initial_cash_krw: float | None = None,
-          keep_settings: bool = True) -> dict:
-    """포지션·체결·스냅샷을 지우고 새 시드머니로 계좌를 다시 시작한다.
+          keep_settings: bool = True, account_id: Any = ACCOUNT_US) -> dict:
+    """한 계좌의 포지션·체결·스냅샷을 지우고 새 시드머니로 다시 시작한다.
 
-    설정(시장·전략·자동 실행)은 기본으로 유지하고, `initial_cash_krw`를 주면 그 값으로
-    시드머니를 바꾼다. `last_run_*` 날짜는 지워 오늘 자동 실행이 다시 가능하게 한다.
+    다른 계좌는 손대지 않는다. 설정(전략·자동 실행)은 기본으로 유지하고,
+    `initial_cash_krw`를 주면 그 값으로 시드머니를 바꾼다. `last_run_*` 날짜는 지워
+    오늘 자동 실행이 다시 가능하게 한다.
     """
-    account = get_account(db_path)
+    aid = normalize_account_id(account_id)
+    account = get_account(aid, db_path)
     seed = float(initial_cash_krw) if initial_cash_krw is not None else account["initial_cash_krw"]
-    clear_positions(db_path)
-    clear_trades(db_path)
-    clear_equity(db_path)
+    clear_positions(db_path, aid)
+    clear_trades(db_path, aid)
+    clear_equity(db_path, aid)
     updated = update_account({
         "initial_cash_krw": seed,
         "cash_krw": seed,
         "last_run_date": None,
         "last_run_us_date": None,
         "last_run_kr_date": None,
-    }, db_path)
-    record_equity(kst_today_str(), seed, seed, 0.0, 0.0, db_path)
-    logger.info("모의투자 계좌 초기화: 시드 ₩%.0f", seed)
+    }, db_path, aid)
+    record_equity(kst_today_str(), seed, seed, 0.0, 0.0, db_path, aid)
+    logger.info("모의투자 %s 계좌 초기화: 시드 ₩%.0f", account["market_scope"], seed)
     return updated
 
 
-def init_store(db_path: str | None = None) -> dict:
-    """스키마를 확인하고 계좌·시드 스냅샷을 준비한다(기동 시 1회)."""
-    account = get_account(db_path)
-    if not equity_history(1, db_path):
-        record_equity(kst_today_str(), account["cash_krw"], account["cash_krw"], 0.0, 0.0, db_path)
-    return account
+def init_store(db_path: str | None = None, account_id: Any = None) -> dict:
+    """두 계좌를 준비하고(스키마·시드 스냅샷), 지정 계좌(기본 미국)를 돌려준다."""
+    for aid in ACCOUNTS:
+        account = get_account(aid, db_path)
+        if not equity_history(1, db_path, aid):
+            record_equity(kst_today_str(), account["cash_krw"], account["cash_krw"], 0.0, 0.0,
+                          db_path, aid)
+    return get_account(account_id or ACCOUNT_US, db_path)
 
 
 def as_int_krw(value: Any) -> int:
