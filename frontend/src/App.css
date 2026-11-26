@@ -998,7 +998,14 @@ th { color: #94a3b8; font-weight: 600; }
 .paper-form label.inline input[type="checkbox"] {
   width: 16px;
   height: 16px;
+  /* 전역 `input { appearance: none }`이 체크 표시까지 지운다 — 체크박스만 네이티브로 되돌린다. */
+  appearance: auto;
+  -webkit-appearance: auto;
   accent-color: #38bdf8;
+  border: none;
+  background: none;
+  border-radius: 4px;
+  flex: none;
 }
 
 .seg { display: flex; gap: 6px; flex-wrap: wrap; }
