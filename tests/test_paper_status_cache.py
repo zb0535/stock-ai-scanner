@@ -113,6 +113,56 @@ class SnapshotTests(StatusCase):
         self.assertEqual(snap["accounts"][1]["cash_krw"], SEED)
 
 
+class SetupConnectionTests(StatusCase):
+    """계좌 준비·초기화도 연결을 한 번만 연다(`configure`·`초기화` 클릭이 느리지 않게)."""
+
+    def test_ensure_accounts_uses_one_connection(self):
+        opened = []
+        original = paper_store._connection
+
+        def counting(*args, **kwargs):
+            opened.append(1)
+            return original(*args, **kwargs)
+
+        with patch.object(paper_store, "_connection", counting):
+            accounts = paper_store.ensure_accounts(self.db_path)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(accounts[1]["initial_cash_krw"], SEED)
+        self.assertEqual(accounts[2]["market_scope"], "KR")
+
+    def test_reset_uses_one_connection_and_clears_one_account(self):
+        paper_store.add_position("AAPL", "US", "USD", 1.0, 100.0, 1300.0, 130_000.0, account_id=1)
+        paper_store.add_position("005930.KS", "KR", "KRW", 2.0, 70_000.0, 1.0, 140_000.0,
+                                account_id=2)
+        opened = []
+        original = paper_store._connection
+
+        def counting(*args, **kwargs):
+            opened.append(1)
+            return original(*args, **kwargs)
+
+        with patch.object(paper_store, "_connection", counting):
+            account = paper_store.reset(initial_cash_krw=2_000_000, db_path=self.db_path,
+                                       account_id=1)
+        self.assertEqual(len(opened), 1, "초기화는 연결 한 번으로 끝낸다")
+        self.assertEqual(account["cash_krw"], 2_000_000)
+        self.assertIsNone(account["last_run_us_date"])
+        self.assertEqual(paper_store.list_positions(self.db_path, 1), [])
+        self.assertEqual(paper_store.recent_trades(5, self.db_path, 1), [])
+        equity = paper_store.equity_history(10, self.db_path, 1)
+        self.assertEqual([row["total_value_krw"] for row in equity], [2_000_000.0])
+        # 다른 계좌(한국)는 그대로
+        self.assertEqual(len(paper_store.list_positions(self.db_path, 2)), 1)
+        self.assertEqual(paper_store.get_account(2, self.db_path)["cash_krw"], SEED)
+
+    def test_reset_keeps_settings(self):
+        paper_store.update_account({"strategy": "momentum", "auto_enabled": 0},
+                                   self.db_path, 2)
+        account = paper_store.reset(db_path=self.db_path, account_id=2)
+        self.assertEqual(account["strategy"], "momentum")
+        self.assertFalse(account["auto_enabled"])
+
+
 # ---------------------------------------------------------------------------
 # 2. 캐시 — 재사용·만료·백그라운드 갱신
 # ---------------------------------------------------------------------------

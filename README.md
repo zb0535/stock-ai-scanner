@@ -147,7 +147,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     `POST /api/paper/configure`(`market`·`initial_cash_krw`·`strategy`·`auto_enabled`·`reset` — 그 계좌에만 적용),
     `POST /api/paper/run`(`market`·`force`, 그 계좌만 매매, 실행 결과 + 갱신된 status). 실행은 한 번에 하나만
     돌고(`_RUN_LOCK`), 자동 실행과 수동 실행이 겹치면 두 번째는 `skipped: "already_running"`을 받는다.
-    현금은 `cash_krw + ?`로 원자 증감해 잔고보다 많이 차감하려 하면 체결 전체이 취소된다
+    현금은 `cash_krw + ?`로 원자 증감해 잔고보다 많이 차감하려 하면 체결 전체가 취소된다
     (포지션·체결이 반쪽만 남지 않는다).
   - **status 응답 속도**: 두 계좌의 화면 데이터를 `paper_store.snapshot`으로 **DB 연결 1회**로 읽고,
     환율·보유 종목 시세를 **병렬**로 받아 한 벌의 평가 스냅샷을 만든 뒤 `PAPER_STATUS_TTL`(기본 25초)
@@ -160,6 +160,8 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     9번에서 6번으로 줄였다. 응답의 `cache`(적중·나이·TTL)와
     `timings`(DB·환율·시세·전체 ms)로 어느 단계가 느린지 바로 알 수 있다. 예전에는 status 한 번에
     연결을 14번 열어 탭 전환마다 **약 19초**를 기다렸다(렌더→Neon 연결 1회가 1초 안팎).
+    설정 저장(`configure`)·계좌 초기화(`reset`)도 계좌 준비·삭제·갱신을 **연결 1회**로 처리해
+    예전에 비해 절반 아래로 줄였다.
   - 저장: 기존 `recommendations`(성적표) 테이블은 그대로 두고 `paper_account`·`paper_positions`·
     `paper_trades`·`paper_equity_history` 네 테이블을 새로 만든다(`DATABASE_URL`이 있으면 PostgreSQL,
     없으면 같은 SQLite 파일). 세 테이블 모두 `account_id`를 갖고 유니크는 `(account_id, ticker)`·

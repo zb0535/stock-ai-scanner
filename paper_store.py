@@ -1096,21 +1096,36 @@ def reset(db_path: str | None = None, initial_cash_krw: float | None = None,
     오늘 자동 실행이 다시 가능하게 한다.
     """
     aid = normalize_account_id(account_id)
-    account = get_account(aid, db_path)
-    seed = float(initial_cash_krw) if initial_cash_krw is not None else account["initial_cash_krw"]
-    clear_positions(db_path, aid)
-    clear_trades(db_path, aid)
-    clear_equity(db_path, aid)
-    updated = update_account({
-        "initial_cash_krw": seed,
-        "cash_krw": seed,
-        "last_run_date": None,
-        "last_run_us_date": None,
-        "last_run_kr_date": None,
-    }, db_path, aid)
-    record_equity(kst_today_str(), seed, seed, 0.0, 0.0, db_path, aid)
+    stamp = _now()
+    # 지우기·계좌 갱신·시드 스냅샷을 **연결 1회**로 처리한다(예전엔 연결을 8번 열었다).
+    with _connection(db_path, write=True) as (conn, backend):
+        _ensure_accounts(conn, backend)
+        account = _normalize_account(
+            _row(conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT} WHERE id = ?", backend),
+                              (aid,))) or _default_account(aid))
+        seed = (float(initial_cash_krw) if initial_cash_krw is not None
+                else account["initial_cash_krw"])
+        for table in (TABLE_POSITIONS, TABLE_TRADES, TABLE_EQUITY):
+            conn.execute(_sql(f"DELETE FROM {table} WHERE account_id = ?", backend), (aid,))
+        conn.execute(
+            _sql(f"UPDATE {TABLE_ACCOUNT} SET initial_cash_krw = ?, cash_krw = ?,"
+                 " last_run_date = NULL, last_run_us_date = NULL, last_run_kr_date = NULL,"
+                 " updated_at = ? WHERE id = ?", backend),
+            (seed, seed, stamp, aid),
+        )
+        conn.execute(
+            _sql(f"INSERT INTO {TABLE_EQUITY} (account_id, date, total_value_krw, cash_krw,"
+                 " stock_value_krw, return_pct, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                 " ON CONFLICT (account_id, date) DO UPDATE SET"
+                 " total_value_krw = excluded.total_value_krw, cash_krw = excluded.cash_krw,"
+                 " stock_value_krw = excluded.stock_value_krw, return_pct = excluded.return_pct,"
+                 " recorded_at = excluded.recorded_at", backend),
+            (aid, kst_today_str(), seed, seed, 0.0, 0.0, stamp),
+        )
+        stored = _row(conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT} WHERE id = ?", backend),
+                                   (aid,)))
     logger.info("모의투자 %s 계좌 초기화: 시드 ₩%.0f", account["market_scope"], seed)
-    return updated
+    return _normalize_account(stored or account)
 
 
 def init_store(db_path: str | None = None, account_id: Any = None) -> dict:
@@ -1121,6 +1136,34 @@ def init_store(db_path: str | None = None, account_id: Any = None) -> dict:
             record_equity(kst_today_str(), account["cash_krw"], account["cash_krw"], 0.0, 0.0,
                           db_path, aid)
     return get_account(account_id or ACCOUNT_US, db_path)
+
+
+def _ensure_accounts(conn, backend: str) -> dict[int, dict]:
+    """계좌 두 행을 보장하고(한 문장) 정규화한 계좌 행을 돌려준다 — 연결 안에서 한 번만."""
+    columns = ("id", "market_scope", "initial_cash_krw", "cash_krw", "markets", "strategy",
+               "auto_enabled", "last_run_date", "last_run_us_date", "last_run_kr_date",
+               "created_at", "updated_at")
+    defaults = [_default_account(aid) for aid in ACCOUNTS]
+    row_sql = "(" + ", ".join("?" for _ in columns) + ")"
+    conn.execute(
+        _sql(f"INSERT INTO {TABLE_ACCOUNT} ({', '.join(columns)})"
+             f" VALUES {', '.join(row_sql for _ in defaults)}"
+             " ON CONFLICT (id) DO NOTHING", backend),
+        tuple(default[column] for default in defaults for column in columns),
+    )
+    rows = {int(row["id"]): row for row in
+            _rows(conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT}", backend)))}
+    return {aid: _normalize_account(rows.get(aid) or _default_account(aid)) for aid in ACCOUNTS}
+
+
+def ensure_accounts(db_path: str | None = None) -> dict[int, dict]:
+    """두 계좌 행을 **연결 1회**로 준비해 돌려준다(`init_store`의 계좌 조회를 대신).
+
+    `/api/paper/configure`처럼 계좌 한 행만 필요한 호출이 예전 `init_store`(연결 5번)를
+    거치면 원격 PostgreSQL에서 10초 넘게 걸렸다. 행만 필요하면 이 함수를 쓴다.
+    """
+    with _connection(db_path, write=True) as (conn, backend):
+        return _ensure_accounts(conn, backend)
 
 
 def _recent_per_account(conn, backend: str, table: str, order_column: str, limit: int,
@@ -1171,21 +1214,10 @@ def snapshot(limit_trades: int = 40, limit_equity: int = 180,
     """
     trades_n = max(1, min(int(limit_trades or 40), 500))
     equity_n = max(1, min(int(limit_equity or 180), 1000))
-    columns = ("id", "market_scope", "initial_cash_krw", "cash_krw", "markets", "strategy",
-               "auto_enabled", "last_run_date", "last_run_us_date", "last_run_kr_date",
-               "created_at", "updated_at")
     with _connection(db_path, write=True) as (conn, backend):
         # 1) 두 계좌 행을 보장한다 — 한 문장으로 넣어 왕복을 한 번만 쓴다.
-        defaults = [_default_account(aid) for aid in ACCOUNTS]
-        row_sql = "(" + ", ".join("?" for _ in columns) + ")"
-        conn.execute(
-            _sql(f"INSERT INTO {TABLE_ACCOUNT} ({', '.join(columns)})"
-                 f" VALUES {', '.join(row_sql for _ in defaults)}"
-                 " ON CONFLICT (id) DO NOTHING", backend),
-            tuple(default[column] for default in defaults for column in columns),
-        )
-        accounts_raw = {int(row["id"]): row for row in
-                        _rows(conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT}", backend)))}
+        accounts = _ensure_accounts(conn, backend)
+        accounts_raw = {aid: account for aid, account in accounts.items()}
 
         # 2) 보유 종목 — 두 계좌 모두 한 요청으로(account_id로 나뉨).
         positions: dict[int, list[dict]] = {aid: [] for aid in ACCOUNTS}
@@ -1215,7 +1247,7 @@ def snapshot(limit_trades: int = 40, limit_equity: int = 180,
             if equity[aid]:
                 continue
             # 스냅샷이 하나도 없는 계좌는 시드 시점을 남긴다(기존 init_store 동작).
-            account = _normalize_account(accounts_raw.get(aid) or _default_account(aid))
+            account = accounts[aid]
             conn.execute(
                 _sql(f"INSERT INTO {TABLE_EQUITY} (account_id, date, total_value_krw, cash_krw,"
                      " stock_value_krw, return_pct, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -1233,8 +1265,7 @@ def snapshot(limit_trades: int = 40, limit_equity: int = 180,
             equity[aid] = [_normalize_equity_row(row) for row in seeded]
 
     return {
-        "accounts": {aid: _normalize_account(accounts_raw.get(aid) or _default_account(aid))
-                     for aid in ACCOUNTS},
+        "accounts": accounts,
         "positions": {aid: positions.get(aid, []) for aid in ACCOUNTS},
         "realized": {aid: realized.get(aid, 0.0) for aid in ACCOUNTS},
         "trades": {aid: trades.get(aid, []) for aid in ACCOUNTS},

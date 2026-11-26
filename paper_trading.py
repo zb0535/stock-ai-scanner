@@ -1333,7 +1333,8 @@ def configure(account: str | None = None, initial_cash_krw=None, markets=None, s
     """
     scope = account_scope(account)
     account_id = account_id_of(scope)
-    current = paper_store.init_store(db_path, account_id)
+    # 계좌 한 행만 필요하다 — 연결 1회로 읽는다(예전 init_store는 연결 5번 = 10초 넘음).
+    current = paper_store.ensure_accounts(db_path)[account_id]
 
     seed = None
     if initial_cash_krw is not None:
