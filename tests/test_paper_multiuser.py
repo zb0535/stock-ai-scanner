@@ -301,6 +301,29 @@ class TokenScopeTests(MultiUserCase):
         self.assertEqual(b_accounts["KR"]["initial_cash_krw"], SEED)
         self.assertEqual(paper_store.get_account(2, self.db_path)["initial_cash_krw"], SEED)
 
+    def test_run_on_friend_account_leaves_admin_untouched(self):
+        import json
+
+        a, _, _ = self.login("민수")
+        accounts = paper_store.accounts_for_user(self.db_path, a["id"])
+        admin_cash = paper_store.get_account(1, self.db_path)["cash_krw"]
+        candidates = [{"ticker": "AAPL", "name": "Apple", "market": "US",
+                       "currency": "USD", "price": 200.0, "quant_score": 90, "signals": []}]
+        result = paper_trading.run(
+            market="US", force=True, user_id=a["id"], db_path=self.db_path,
+            ai_call=lambda prompt: json.dumps({"buys": [
+                {"ticker": "AAPL", "amount_krw": 100_000, "reason": "테스트"}]}),
+            candidate_fn=lambda market, criteria: candidates,
+            price_fn=lambda symbols: ({sym: 200.0 for sym in symbols}, {}),
+            fx_fn=lambda: {"rate": 1300.0, "source": "test"})
+        self.assertEqual(len(result["buys"]), 1)
+        self.assertEqual([p["ticker"] for p in
+                          paper_store.list_positions(self.db_path, accounts["US"]["id"])],
+                         ["AAPL"])
+        self.assertEqual(paper_store.list_positions(self.db_path, 1), [])
+        self.assertEqual(paper_store.get_account(1, self.db_path)["cash_krw"], admin_cash)
+        self.assertEqual(len(paper_store.recent_trades(10, self.db_path, 1)), 0)
+
 
 # ---------------------------------------------------------------------------
 # 4. 랭킹
