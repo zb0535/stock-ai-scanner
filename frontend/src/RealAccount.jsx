@@ -45,7 +45,8 @@ export function RealAccountCard({ broker, onOpen }) {
       </span>
       <em className="sub">{registered.length ? hintText(registered[0]) : "모의투자로만 돌고 있어요"}</em>
       <em className="sub">
-        {broker?.dry_run ? "드라이런" : "드라이런 꺼짐"} · 등록 {registered.length}/{broker?.adapters?.length ?? 0}
+        {broker?.dry_run ? "드라이런" : "드라이런 꺼짐"} · 등록 {registered.length}/
+        {(broker?.adapters || []).filter((row) => row.name !== "paper").length}
       </em>
       <em className="sub real-account-cta">실제 계좌로 해보기 →</em>
     </button>
@@ -161,9 +162,7 @@ export function RealAccountModal({ status, onClose, onChanged }) {
         <div className="sheet-head">
           <div>
             <h3 className="score-title">🔌 실제 계좌로 해보기 · 경고와 등록 안내</h3>
-            <p className="score-sub">
-              {stateLine(live)} — {live?.summary || ""}
-            </p>
+            <p className="score-sub">{live?.summary || stateLine(live)}</p>
           </div>
           <button type="button" className="ghost" onClick={onClose}>
             닫기
@@ -316,7 +315,7 @@ export function RealAccountModal({ status, onClose, onChanged }) {
                     onChange={(event) =>
                       setForm((prev) => ({ ...prev, [field.field]: event.target.value }))
                     }
-                    placeholder={field.secret ? "붙여넣기는 직접, 저장되지 않습니다" : "예: 50123456-01"}
+                    placeholder={field.secret ? "발급받은 값을 붙여넣기" : "예: 50123456-01"}
                   />
                   <em>{field.env}</em>
                 </label>

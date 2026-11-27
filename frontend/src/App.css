@@ -1198,3 +1198,11 @@ th { color: #94a3b8; font-weight: 600; }
   .paper-compare-three { grid-template-columns: 1fr; }
   .real-account-sheet { padding: 16px; }
 }
+
+.real-account-sheet .sheet-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.real-account-sheet .sheet-head .score-title { margin: 0 0 4px; font-size: 16px; }
