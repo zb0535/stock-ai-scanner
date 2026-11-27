@@ -124,7 +124,7 @@ _STATUS_CACHE: dict[str, dict] = {}       # 키 -> {"ts": float, "snapshot": dic
 _RANK_CACHE: dict[str, dict] = {}         # db 키 -> {"ts": float, "data": dict}
 STATUS_TTL = float(os.environ.get("PAPER_STATUS_TTL", "25"))
 STATUS_STALE_SEC = float(os.environ.get("PAPER_STATUS_STALE", "180"))
-RANK_TTL = float(os.environ.get("PAPER_RANK_TTL", "30"))
+RANK_TTL = float(os.environ.get("PAPER_RANK_TTL", "90"))
 STATUS_WARM_DELAY = float(os.environ.get("PAPER_STATUS_WARM_DELAY", "20"))
 STATUS_WARM_INTERVAL = float(os.environ.get("PAPER_STATUS_WARM_INTERVAL", "60"))
 _STATUS_CACHE: dict[str, dict] = {}       # 키 -> {"ts": float, "snapshot": dict}
@@ -1303,15 +1303,27 @@ def warm_status_cache(delay: float | None = None) -> None:
 
 
 def _warm_once() -> bool:
-    """캐시가 비었거나 TTL이 지났으면 스냅샷을 새로 만들어 둔다. 실패는 삼킨다."""
+    """캐시가 비었거나 TTL이 지났으면 스냅샷을 새로 만들어 둔다. 실패는 삼킨다.
+
+    같은 주기로 지인 랭킹도 미리 계산해 둔다 — 사용자가 랭킹 카드를 열 때 시세·DB를
+    기다리지 않고 `PAPER_RANK_TTL`(90초) 안의 결과를 바로 받는다.
+    """
     try:
+        rebuilt = False
         with _STATUS_BUILD_LOCK:
             item = _cached_snapshot(None)
             age = time.time() - float(item.get("ts") or 0.0) if item else None
-            if age is not None and age < STATUS_TTL:
-                return False
-            _store_snapshot(None, _build_snapshot())
-            return True
+            if age is None or age >= STATUS_TTL:
+                _store_snapshot(None, _build_snapshot())
+                rebuilt = True
+        rank = _RANK_CACHE.get("default")
+        rank_age = time.time() - float(rank.get("ts") or 0.0) if rank else None
+        if rank_age is None or rank_age >= RANK_TTL:
+            try:
+                leaderboard()
+            except Exception as exc:  # 랭킹 예열 실패는 다음 주기에 다시 시도한다
+                logger.warning("지인 랭킹 예열 실패: %s: %s", type(exc).__name__, str(exc)[:160])
+        return rebuilt
     except Exception as exc:  # 예열 실패는 다음 요청·다음 주기가 다시 시도한다
         logger.warning("모의투자 상태 예열 실패: %s: %s", type(exc).__name__, str(exc)[:160])
         return False
