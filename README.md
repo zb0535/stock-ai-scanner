@@ -126,6 +126,32 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
     굳이 파일로 유지하려면 Render Persistent Disk를 붙이고 `HISTORY_DB_PATH=/var/data/recommendations.db`처럼 지정한다.
 - **🤖 AI 모의투자(페이퍼 트레이딩)**(`paper_store.py` · `paper_trading.py`): 스크리너 결과로 AI가
   **미국·한국 두 계좌**에서 주식을 가상으로 사고팔아 수익률을 서로 비교한다. 실제 주문은 나가지 않는다.
+  - **👥 닉네임 + 4자리 PIN 멀티 유저(v2.11)**: 지인끼리 각자 닉네임과 4자리 PIN으로 들어와
+    **자기 미국·한국 계좌(각 100만 원)**를 따로 굴리고, 🏆 지인 수익률 랭킹으로 겨룬다.
+    - `POST /api/paper/auth` `{nickname, pin}` → 처음 보는 닉네임이면 `paper_users`에 유저를 만들고
+      전용 계좌 두 개를 생성, 기존 닉네임은 PIN 검증(불일치 **401**, 10분에 10번 틀리면 **429**).
+      성공 시 HMAC-SHA256 서명 토큰(`token`, 30일) + `{user_id, nickname, is_admin}`. PIN은
+      **PBKDF2-HMAC-SHA256(랜덤 salt, 12만 회)** 해시만 저장하고 평문·응답 어디에도 남기지 않는다.
+      토큰 서명 키는 `PAPER_TOKEN_SECRET`(없으면 DB `paper_settings`에 1회 생성)로 재배포에도 유지된다.
+    - 모의투자 API(`status`·`run`·`configure`·`fcm/*`)는 `X-Paper-User-Token` 헤더의 유저 계좌만
+      읽고 쓴다(헤더가 없으면 예전 클라이언트·기존 웹을 위해 기본 관리자 `현우` 계좌 = 하위 호환).
+      상태 응답에 `user: {id, nickname, is_admin}`이 실린다.
+    - **기본 관리자(user 1, 닉네임 `현우`)**: 기존 계좌(id 1=US, 2=KR)·체결 그대로의 주인이다.
+      기동 시 `paper_users`에 관리자 행이 없으면 만들고(계좌는 건드리지 않는다), 첫 로그인에서 입력한
+      PIN을 그 계정의 PIN으로 잠근다. `ADMIN_PIN`(4자리) 환경변수가 있으면 그 PIN으로 바로 잠근다.
+    - **🏆 `GET /api/paper/leaderboard`**: 모든 유저의 `nickname`·미국/한국/합산 수익률·총자산·순위를
+      합산 수익률 내림차순으로 돌려준다. 시세·환율은 **한 번만** 조회해 전원을 평가하고, PIN·토큰·
+      실계좌 비밀값은 응답에 절대 넣지 않는다(랭킹 전용 `accounts_bulk` 1회 연결).
+    - **자동 실행**: 활성 유저 전체의 미국/한국 계좌를 한국 15:40 · 미국 06:20 KST에 하루 1회
+      순서대로 돌린다. 같은 `(시장, 전략)`의 스크리너 후보는 한 번만 수집해 모든 유저가 재사용하고,
+      계좌 사이마다 `memory_guard.headroom`(32MB)을 확인해 Render 512MB에서 메모리 피크가 겹치지 않게
+      하며, 부족하면 남은 계좌는 다음 5분 주기로 미룬다. FCM 기기 토큰은 유저별로 분리되어
+      자기 체결 알림만 받는다.
+    - **실제 계좌(브로커) 카드·API는 관리자 전용**: `/api/broker/*`는 지인(비관리자) 토큰에 **403**,
+      비관리자 `status`의 `broker`는 `null`이라 화면에서 카드가 사라진다(토큰 없는 구 클라이언트는 허용).
+    - **웹·안드로이드 v2.11 UI**: 모의투자 맨 위 **닉네임 칩 + `계정 전환/로그인`**(닉네임 + 4자리
+      PIN 시트, 토큰은 localStorage/SharedPreferences에 저장해 재접속 유지, 로그아웃 가능), 🏆 랭킹 카드,
+      비관리자에게는 실제 계좌 카드 숨김.
   - 계좌: **미국(US, id=1)·한국(KR, id=2)** 두 계좌가 **서로 완전히 분리**되어 있고, 각각 시드머니
     **기본 1,000,000원**(10만~10억, 계좌별 설정/리셋)을 가진다. 현금·보유 종목·체결·일별 수익률이
     `account_id`로 갈라져 한쪽 매매가 다른 쪽 숫자를 건드리지 않는다. 계좌 안의 금액은 모두 `₩`,
@@ -287,7 +313,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자(두 계좌 분리·수수료·세금·환차·마이그레이션)·FCM 체결 푸시·메모리 가드(RSS/한도·슬롯 직렬화·프리워밍 단계 락·캐시 상한)·브로커 어댑터/실주문 안전장치(킬 스위치·1회/1일 한도·중복 주문·드라이런·재기동 영속) 검증, 667개)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자(두 계좌 분리·수수료·세금·환차·마이그레이션)·FCM 체결 푸시·메모리 가드(RSS/한도·슬롯 직렬화·프리워밍 단계 락·캐시 상한)·브로커 어댑터/실주문 안전장치(킬 스위치·1회/1일 한도·중복 주문·드라이런·재기동 영속)·닉네임+PIN 멀티 유저(PIN 해시·토큰·계좌 분리·랭킹·관리자 전용 브로커)·자동 실행 멀티 유저 검증, 709개)
 
 ## 환경변수
 | 이름 | 설명 |
@@ -305,6 +331,9 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `GEMINI_FALLBACK_MODEL` | 주 모델이 과부하·타임아웃일 때 2순위로 부를 모델(기본 `gemini-3.8-flash`) |
 | `GEMINI_THINKING_BUDGET` | Gemini 사고 토큰 예산(기본 `0`=끔, 빠름). `-1`이면 모델 자동 |
 | `PAPER_AUTO` | AI 모의투자 자동 실행(기본 켜짐). `0`이면 끔 |
+| `PAPER_TOKEN_SECRET` | 닉네임+PIN 세션 토큰 서명 키(없으면 DB `paper_settings`에 1회 생성해 재배포에도 유지) |
+| `PAPER_ADMIN_NICKNAME` | 기본 관리자 닉네임(기본 `현우`) — 기존 계좌 1·2의 주인 |
+| `ADMIN_PIN` | 관리자 계정을 처음부터 잠글 4자리 PIN(없으면 첫 로그인에서 정한 PIN으로 잠금) |
 | `PAPER_AUTO_INTERVAL` | 자동 실행 확인 주기(초, 기본 300) |
 | `PAPER_STOP_LOSS_PCT` / `PAPER_TAKE_PROFIT_PCT` | 모의투자 손절·익절 기준(기본 -8 / +25) |
 | `PAPER_MAX_POSITION_WEIGHT` / `PAPER_MAX_POSITIONS` | 한 종목 비중 상한(기본 0.30) · 최대 보유 종목 수(기본 8) |

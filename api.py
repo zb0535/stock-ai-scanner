@@ -28,6 +28,7 @@ import realtime_quotes
 import extended_quotes
 import fcm
 import sector_pe
+import paper_auth
 import paper_store
 import broker
 import broker_credentials
@@ -108,6 +109,7 @@ async def lifespan(_app: FastAPI):
     # DB가 잠시 죽어 있어도 서버는 뜨고, 자동 루프는 5분마다 다시 시도한다(PAPER_AUTO=0으로 끔).
     try:
         paper_store.init_store()
+        paper_auth.ensure_admin()   # 닉네임 + PIN 계정의 기본 관리자(기존 계좌 1·2 소유자)
     except Exception as exc:  # 저장소 장애가 기동을 막지 않게
         logger.warning("모의투자 계좌 초기화 실패: %s: %s", type(exc).__name__, str(exc)[:200])
     paper_trading.start_auto(ai_call=_paper_ai_call)
@@ -1166,6 +1168,85 @@ def _paper_ai_call(prompt: str) -> str | None:
     return _gemini_text(prompt)
 
 
+# --- 닉네임 + 4자리 PIN 인증 --------------------------------------------------
+# 토큰(`X-Paper-User-Token`)이 있으면 그 유저의 계좌만 읽고 쓴다. 헤더가 없으면 예전
+# 클라이언트(앱 v2.10 이하·기존 웹)를 위해 기본 관리자(user 1 = 현우님 계좌)로 동작한다.
+
+def _paper_user(request: Request) -> dict:
+    """요청 헤더의 세션 토큰 → 유저. 토큰이 없으면 기본 관리자(하위 호환)."""
+    token = (request.headers.get(paper_auth.HEADER_NAME)
+             or request.headers.get("x-paper-user-token") or "").strip()
+    if not token:
+        return paper_auth.ensure_admin()
+    payload = paper_auth.verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail={
+            "code": "paper_token_invalid",
+            "message": "로그인이 만료됐어요. 닉네임과 PIN으로 다시 로그인해 주세요.",
+        })
+    # 서명이 확인된 토큰의 값만 쓴다 — 요청마다 DB를 열지 않아 status가 빨라진다.
+    return {"id": payload["user_id"], "nickname": payload["nickname"],
+            "is_admin": payload["is_admin"]}
+
+
+def _paper_admin(request: Request) -> dict:
+    """관리자 전용 — 지인 계정 토큰으로는 403. 토큰이 없으면 예전처럼 허용(하위 호환)."""
+    user = _paper_user(request)
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail={
+            "code": "admin_only",
+            "message": "실제 계좌 연동은 관리자 계정에서만 할 수 있어요.",
+        })
+    return user
+
+
+class PaperAuthRequest(BaseModel):
+    """`POST /api/paper/auth` — 닉네임 + 4자리 PIN.
+
+    처음 보는 닉네임이면 새 계정과 전용 미국·한국 계좌(각 100만 원)를 만든다.
+    """
+
+    nickname: str | None = None
+    pin: str | None = None
+
+
+@app.post("/api/paper/auth")
+def paper_auth_login(req: PaperAuthRequest):
+    """닉네임 + 4자리 PIN → `token`(서명된 세션) + `{user_id, nickname, is_admin}`."""
+    try:
+        user, created = paper_auth.authenticate(req.nickname, req.pin)
+    except paper_auth.AuthError as exc:
+        status = {"pin_mismatch": 401, "too_many_attempts": 429,
+                  "nickname_taken": 409}.get(exc.code, 400)
+        raise HTTPException(status_code=status,
+                            detail={"code": exc.code, "message": exc.message})
+    except Exception as exc:
+        logger.exception("모의투자 로그인 실패: %s", exc)
+        raise HTTPException(status_code=503, detail={
+            "code": "auth_storage_unavailable",
+            "message": "로그인 저장소에 연결하지 못했어요. 잠시 뒤 다시 시도해 주세요.",
+        })
+    token, exp = paper_auth.sign_token(user)
+    logger.info("모의투자 로그인: #%s %s (신규=%s)", user.get("id"), user.get("nickname"), created)
+    return {"ok": True, "token": token, "expires_in": max(0, exp - int(time.time())),
+            "user": paper_auth.public_user(user), "created": created}
+
+
+@app.get("/api/paper/leaderboard")
+def paper_leaderboard(request: Request, fresh: bool = False):
+    """🏆 지인 수익률 랭킹 — 닉네임·미장/국장/합산 수익률 순위(PIN·토큰은 절대 포함하지 않는다)."""
+    try:
+        body = paper_trading.leaderboard()
+    except Exception as exc:
+        logger.exception("모의투자 랭킹 계산 실패: %s", exc)
+        raise HTTPException(status_code=503, detail="paper_storage_unavailable")
+    token = (request.headers.get(paper_auth.HEADER_NAME) or "").strip()
+    payload = paper_auth.verify_token(token) if token else None
+    if payload:
+        body["me"] = payload["user_id"]
+    return body
+
+
 class PaperConfigureRequest(BaseModel):
     """`POST /api/paper/configure` — 한 계좌의 시드머니·전략·자동 실행 설정/리셋.
 
@@ -1199,16 +1280,20 @@ class PaperRunRequest(BaseModel):
 
 
 @app.get("/api/paper/status")
-def paper_status(trades: int = 40, history: int = 180, market: str = "US", fresh: bool = False):
+def paper_status(request: Request, trades: int = 40, history: int = 180, market: str = "US",
+                 fresh: bool = False):
     """한 계좌의 요약·보유·체결·수익률 + 미국·한국 두 계좌 비교 요약(`accounts`).
 
+    `X-Paper-User-Token`이 있으면 그 유저의 두 계좌만 본다(없으면 기본 관리자).
     두 계좌 평가를 한 벌로 계산해 `PAPER_STATUS_TTL`(기본 25초) 동안 재사용한다 — 앱이
     미국↔한국 탭을 오가도 시세·DB를 다시 부르지 않아 바로 응답한다. `fresh=true`면 캐시를
     건너뛰고 새로 계산한다(진단용). 매매·설정 직후엔 캐시가 자동으로 버려진다.
     """
+    user = _paper_user(request)
     try:
         return paper_trading.status(limit_trades=trades, limit_equity=history, market=market,
-                                    use_cache=False if fresh else None)
+                                    use_cache=False if fresh else None, user_id=user["id"],
+                                    include_broker=bool(user.get("is_admin")))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -1217,8 +1302,9 @@ def paper_status(trades: int = 40, history: int = 180, market: str = "US", fresh
 
 
 @app.post("/api/paper/configure")
-def paper_configure(req: PaperConfigureRequest):
+def paper_configure(req: PaperConfigureRequest, request: Request):
     """시드머니 설정·계좌 리셋·전략·자동 실행 설정(지정한 시장 계좌만)."""
+    user = _paper_user(request)
     market = req.market or req.markets or "US"
     try:
         result = paper_trading.configure(
@@ -1228,33 +1314,39 @@ def paper_configure(req: PaperConfigureRequest):
             strategy=req.strategy,
             auto_enabled=req.auto_enabled,
             reset=req.reset,
+            user_id=user["id"],
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         logger.exception("모의투자 설정 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_storage_unavailable")
-    return {"ok": True, **result, "status": paper_trading.status(market=market, use_cache=False)}
+    return {"ok": True, **result,
+            "status": paper_trading.status(market=market, use_cache=False, user_id=user["id"],
+                                           include_broker=bool(user.get("is_admin")))}
 
 
 @app.post("/api/paper/run")
-def paper_run(req: PaperRunRequest | None = None):
+def paper_run(request: Request, req: PaperRunRequest | None = None):
     """AI 일일 매매 1회 실행(한 계좌) — 매도(손절·익절·AI) → 매수(현금 한도) → 스냅샷.
 
     응답에는 실행 결과(`result`: 매수/매도 체결·건너뛴 이유·요약·`push` 발송 결과)와 갱신된
     `status`가 함께 온다. 체결이 있으면 등록된 기기로 FCM 푸시가 바로 나간다.
     """
+    user = _paper_user(request)
     payload = req or PaperRunRequest()
     market = payload.market or payload.markets or "US"
     try:
         result = paper_trading.run(market=market, force=payload.force,
-                                   trigger="manual", ai_call=_paper_ai_call)
+                                   trigger="manual", ai_call=_paper_ai_call, user_id=user["id"])
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         logger.exception("모의투자 실행 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_run_failed")
-    return {"ok": True, "result": result, "status": paper_trading.status(market=market, use_cache=False)}
+    return {"ok": True, "result": result,
+            "status": paper_trading.status(market=market, use_cache=False, user_id=user["id"],
+                                           include_broker=bool(user.get("is_admin")))}
 
 
 # --- 체결 푸시 알림(FCM) ------------------------------------------------------
@@ -1272,8 +1364,10 @@ class FcmRegisterRequest(BaseModel):
 
 
 @app.post("/api/paper/fcm/register")
-def paper_fcm_register(req: FcmRegisterRequest):
-    """기기 토큰을 저장한다 — 체결이 나면 이 기기들로 푸시가 간다."""
+def paper_fcm_register(req: FcmRegisterRequest, request: Request):
+    """기기 토큰을 이 유저 소유로 저장한다 — 그 유저의 체결이 나면 이 기기로 푸시가 간다."""
+    user = _paper_user(request)
+    uid = user["id"]
     token = (req.token or "").strip()
     if not token:
         raise HTTPException(status_code=400, detail="empty_token")
@@ -1281,9 +1375,10 @@ def paper_fcm_register(req: FcmRegisterRequest):
     try:
         if req.enabled is False:
             paper_store.remove_fcm_token(token)
-            return {"ok": True, "registered": False, "tokens": paper_store.count_fcm_tokens()}
-        paper_store.register_fcm_token(token, platform)
-        count = paper_store.count_fcm_tokens()
+            return {"ok": True, "registered": False,
+                    "tokens": paper_store.count_fcm_tokens(user_id=uid)}
+        paper_store.register_fcm_token(token, platform, user_id=uid)
+        count = paper_store.count_fcm_tokens(user_id=uid)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -1295,15 +1390,17 @@ def paper_fcm_register(req: FcmRegisterRequest):
 
 
 @app.delete("/api/paper/fcm/register")
-def paper_fcm_unregister(token: str | None = None):
-    """토큰을 지운다(알림 끄기). `token`을 비우면 등록된 모든 기기를 지운다."""
+def paper_fcm_unregister(request: Request, token: str | None = None):
+    """토큰을 지운다(알림 끄기). `token`을 비우면 이 유저의 등록 기기를 모두 지운다."""
+    user = _paper_user(request)
+    uid = user["id"]
     try:
         if token and token.strip():
             removed = paper_store.remove_fcm_token(token.strip())
         else:
             removed = paper_store.remove_fcm_tokens(
-                [row["token"] for row in paper_store.list_fcm_tokens()])
-        count = paper_store.count_fcm_tokens()
+                [row["token"] for row in paper_store.list_fcm_tokens(user_id=uid)])
+        count = paper_store.count_fcm_tokens(user_id=uid)
     except Exception as exc:
         logger.exception("FCM 토큰 삭제 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_storage_unavailable")
@@ -1311,10 +1408,13 @@ def paper_fcm_unregister(token: str | None = None):
 
 
 @app.get("/api/paper/fcm/status")
-def paper_fcm_status():
+def paper_fcm_status(request: Request):
     """푸시 설정 여부와 등록 기기 수 — 앱 설정 항목·배포 점검용(키 본문은 노출하지 않는다)."""
+    user = _paper_user(request)
     try:
-        return {"ok": True, **fcm.status()}
+        body = {"ok": True, **fcm.status()}
+        body["tokens"] = paper_store.count_fcm_tokens(user_id=user["id"])
+        return body
     except Exception as exc:
         logger.exception("FCM 상태 조회 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_storage_unavailable")
@@ -1355,11 +1455,13 @@ def _broker_error(exc: broker_credentials.CredentialsError) -> HTTPException:
 
 
 @app.get("/api/broker/status")
-def broker_status():
+def broker_status(request: Request):
     """실제 계좌 연동 상태 — 모드·킬 스위치·한도·어댑터별 키 등록 여부(마스킹)·등록 안내.
 
     키 원문은 어디에도 없다. `credentials.adapters[kis].hint_label`이 화면에 보여 줄 마스킹이다.
+    지인 계정(비관리자) 토큰에는 403 — 실제 계좌 카드는 관리자 전용이다.
     """
+    _paper_admin(request)
     try:
         return broker_credentials.full_status()
     except Exception as exc:
@@ -1379,6 +1481,7 @@ def broker_credentials_save(req: BrokerCredentialsRequest, request: Request):
             "code": "confirm_risk_required",
             "message": "실제 계좌 경고를 확인했다는 표시(confirm_risk)가 필요합니다.",
         })
+    _paper_admin(request)
     values = {"app_key": req.app_key, "app_secret": req.app_secret,
               "account_no": req.account_no}
     try:
@@ -1399,6 +1502,7 @@ def broker_credentials_save(req: BrokerCredentialsRequest, request: Request):
 @app.delete("/api/broker/credentials/{adapter}")
 def broker_credentials_delete(adapter: str, request: Request):
     """등록된 키 삭제(연동 해제). 지운 행 수와 갱신된 상태를 돌려준다."""
+    _paper_admin(request)
     try:
         broker_credentials.check_write_token(request.headers.get("x-broker-token"))
         removed = broker_credentials.delete(adapter)
@@ -1415,10 +1519,11 @@ def broker_credentials_delete(adapter: str, request: Request):
 
 
 @app.post("/api/paper/fcm/test")
-def paper_fcm_test():
+def paper_fcm_test(request: Request):
     """등록된 기기로 테스트 푸시 1건(체결·계좌에는 영향 없음)."""
+    user = _paper_user(request)
     try:
-        result = fcm.send_test()
+        result = fcm.send_test(user_id=user["id"])
     except Exception as exc:
         logger.exception("테스트 푸시 실패: %s", exc)
         raise HTTPException(status_code=503, detail="push_failed")

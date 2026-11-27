@@ -364,19 +364,23 @@ def _send_with_deadline(tokens: list[str], title: str, body: str, data: dict) ->
     return holder.get("outcome") or SendOutcome(failure=len(tokens))
 
 
-def _dispatch(title: str, body: str, data: dict, db_path: str | None) -> dict:
-    """등록 토큰 전체로 보내고, 죽은 토큰을 DB에서 정리한 결과를 돌려준다."""
+def _dispatch(title: str, body: str, data: dict, db_path: str | None,
+              user_id: int | None = None) -> dict:
+    """지정 유저의 등록 토큰으로 보내고, 죽은 토큰을 DB에서 정리한 결과를 돌려준다.
+
+    `user_id`가 없으면 예전처럼 전체 기기(관리자 알림 — 기존 동작)로 보낸다.
+    """
     ready = is_configured()
     if not ready:
         logger.info("FCM 미설정(%s) — 푸시를 건너뜁니다", _INIT_ERROR or "not_configured")
         try:
-            registered = paper_store.count_fcm_tokens(db_path)
+            registered = paper_store.count_fcm_tokens(db_path, user_id)
         except Exception:
             registered = 0
         return {"configured": False, "reason": _INIT_ERROR or "not_configured",
                 "sent": 0, "failed": 0, "removed": 0, "tokens": registered}
     try:
-        tokens = [row["token"] for row in paper_store.list_fcm_tokens(db_path)]
+        tokens = [row["token"] for row in paper_store.list_fcm_tokens(db_path, user_id)]
     except Exception as exc:
         logger.warning("FCM 토큰 조회 실패: %s: %s", type(exc).__name__, str(exc)[:200])
         return {"configured": True, "sent": 0, "failed": 0, "removed": 0, "tokens": 0,
@@ -399,22 +403,22 @@ def _dispatch(title: str, body: str, data: dict, db_path: str | None) -> dict:
 
 
 def notify_fills(sells: list[dict] | None, buys: list[dict] | None,
-                 db_path: str | None = None) -> dict:
-    """체결 직후 호출 — 실제 체결이 있을 때만 알림을 보낸다. 예외는 밖으로 던지지 않는다."""
+                 db_path: str | None = None, user_id: int | None = None) -> dict:
+    """체결 직후 호출 — 실제 체결이 있을 때만 그 유저의 기기로 알림을 보낸다. 예외는 밖으로 던지지 않는다."""
     try:
         message = build_fill_message(sells, buys)
         if not message:
             return {"configured": is_configured(), "sent": 0, "failed": 0, "removed": 0, "tokens": 0}
-        return _dispatch(message["title"], message["body"], message["data"], db_path)
+        return _dispatch(message["title"], message["body"], message["data"], db_path, user_id)
     except Exception as exc:  # 발송은 부가 기능 — 매매 결과를 깨지 않는다
         logger.warning("체결 푸시 처리 실패: %s: %s", type(exc).__name__, str(exc)[:200])
         return {"configured": False, "sent": 0, "failed": 0, "removed": 0, "tokens": 0,
                 "error": "push_failed"}
 
 
-def send_test(db_path: str | None = None) -> dict:
-    """`POST /api/paper/fcm/test` — 등록된 기기로 테스트 푸시 1건. 체결·계좌에는 손대지 않는다."""
+def send_test(db_path: str | None = None, user_id: int | None = None) -> dict:
+    """`POST /api/paper/fcm/test` — 이 유저의 등록 기기로 테스트 푸시 1건. 체결·계좌에는 손대지 않는다."""
     title = "🔔 테스트 알림 · AI 모의투자"
     body = "푸시 알림이 정상 동작합니다. 매수·매도가 체결되면 바로 알려드릴게요."
     data = {"screen": "paper", "market": "ALL", "test": "1"}
-    return _dispatch(title, body, data, db_path)
+    return _dispatch(title, body, data, db_path, user_id)

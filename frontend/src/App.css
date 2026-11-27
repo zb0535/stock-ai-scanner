@@ -1206,3 +1206,63 @@ th { color: #94a3b8; font-weight: 600; }
   gap: 12px;
 }
 .real-account-sheet .sheet-head .score-title { margin: 0 0 4px; font-size: 16px; }
+
+/* --- v2.11 닉네임 + PIN · 지인 랭킹 -------------------------------------------- */
+.paper-userbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.paper-user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  color: #e2e8f0;
+  background: rgba(30, 41, 59, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.24);
+}
+
+.paper-user-chip em {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 700;
+  color: #38bdf8;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.14);
+}
+
+.paper-auth-hero, .paper-auth-sheet { padding: 20px 22px; }
+.paper-auth-form { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; }
+.paper-auth-form input { letter-spacing: 0.08em; }
+
+.paper-auth-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(2, 6, 23, 0.72);
+  backdrop-filter: blur(3px);
+}
+
+.paper-auth-sheet { width: min(460px, 100%); }
+
+.paper-rank { padding: 18px 20px; }
+.paper-rank-table .rank-cell { font-weight: 700; color: #f8fafc; white-space: nowrap; }
+.paper-rank-table tr.me { background: rgba(56, 189, 248, 0.1); }
+.paper-rank-table tr.me td { color: #e2e8f0; }
+.paper-rank-table .mini-tag { margin-left: 6px; }
+
+@media (max-width: 720px) {
+  .paper-auth-form { grid-template-columns: 1fr; }
+  .paper-userbar { flex-wrap: wrap; }
+}

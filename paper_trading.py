@@ -61,7 +61,9 @@ import extended_quotes
 import fcm
 import history_store
 import kospi200_scanner
+import memory_guard
 import naver_finance
+import paper_auth
 import paper_store
 import realtime_quotes
 import scoring
@@ -777,24 +779,27 @@ def _position_views(positions: list[dict], price_fn, fx_rate: float) -> dict:
 
 def run(market=None, force: bool = False, trigger: str = "manual", db_path: str | None = None,
         ai_call=None, price_fn=None, candidate_fn=None, fx_fn=None,
-        now: datetime | None = None, push_fn=None) -> dict:
+        now: datetime | None = None, push_fn=None, user_id: int | None = None) -> dict:
     """지정한 시장 계좌에서 AI 모의투자 1회 실행(매도 → 매수 → 스냅샷). 동시에 두 번 돌지 않는다.
 
     `market`: "US"(미국 계좌) 또는 "KR"(한국 계좌). 비우면 미국 계좌.
+    `user_id`: 어느 닉네임 유저의 계좌인지(기본 관리자 1).
     이미 다른 실행이 돌고 있으면 기다리지 않고 `skipped: "already_running"`을 돌려준다 —
     두 실행이 같은 현금을 보고 각자 매수하면 시드머니를 넘겨 살 수 있기 때문이다.
     """
     scope = account_scope(market)
+    uid = int(user_id or paper_store.DEFAULT_USER_ID)
     if not _RUN_LOCK.acquire(blocking=False):
         return {
             "ok": True, "skipped": "already_running", "market": scope, "markets": [scope],
+            "user_id": uid,
             "message": f"{account_label(scope)} 계좌의 AI 매매가 실행 중입니다. 끝나면 결과가 계좌에 반영됩니다.",
             "ran_at": paper_store._now(),
         }
     try:
         return _run_locked(market=scope, force=force, trigger=trigger, db_path=db_path,
                            ai_call=ai_call, price_fn=price_fn, candidate_fn=candidate_fn,
-                           fx_fn=fx_fn, now=now, push_fn=push_fn)
+                           fx_fn=fx_fn, now=now, push_fn=push_fn, user_id=uid)
     finally:
         # 매매가 끝나면 상태 스냅샷은 반드시 새로 만든다(체결 직후 탭은 최신 값이어야 한다).
         invalidate_status_cache(db_path)
@@ -803,7 +808,8 @@ def run(market=None, force: bool = False, trigger: str = "manual", db_path: str 
 
 def _run_locked(market=None, force: bool = False, trigger: str = "manual",
                 db_path: str | None = None, ai_call=None, price_fn=None, candidate_fn=None,
-                fx_fn=None, now: datetime | None = None, push_fn=None) -> dict:
+                fx_fn=None, now: datetime | None = None, push_fn=None,
+                user_id: int | None = None) -> dict:
     """실제 실행 본체(`run`이 락을 잡고 부른다) — 한 시장 계좌만 건드린다.
 
     `market`: "US"/"KR". 그 계좌의 현금·보유·설정만 보고, 그 계좌에만 기록한다.
@@ -817,7 +823,8 @@ def _run_locked(market=None, force: bool = False, trigger: str = "manual",
     fx_fn = fx_fn or get_usd_krw
 
     scope = account_scope(market)
-    account_id = account_id_of(scope)
+    uid = int(user_id or paper_store.DEFAULT_USER_ID)
+    account_id = paper_store.account_id_for(uid, scope, db_path)
     # 실계좌 모드에서는 이 실행기가 모의투자 원장을 보고 주문 금액을 정하면 안 된다
     # (가짜 잔고로 실주문을 내는 사고). 실계좌 주문 경로는 어댑터를 붙일 때 따로 연결한다
     # — docs/BROKER_INTEGRATION.md '4. 새 증권사 붙이기 → 3) 실행기 연결'.
@@ -825,13 +832,14 @@ def _run_locked(market=None, force: bool = False, trigger: str = "manual",
     if adapter.is_live:
         return {
             "ok": True, "skipped": "live_broker_not_wired", "market": scope, "markets": [scope],
+            "user_id": uid,
             "broker": {"mode": adapter.name, "live": True,
                        "status": "not_configured" if not adapter.configured else "wired_pending"},
             "message": (f"{account_label(scope)} 계좌는 실계좌 모드(BROKER_MODE={adapter.name})입니다. "
                         "모의투자 실행기로는 실주문을 내지 않습니다 — 모의투자는 BROKER_MODE=paper입니다."),
             "ran_at": paper_store._now(),
         }
-    account = paper_store.init_store(db_path, account_id)
+    account = paper_store.init_store(db_path, account_id, user_id=uid)
     targets = [scope]
 
     today = paper_store.kst_today_str()
@@ -1010,7 +1018,7 @@ def _run_locked(market=None, force: bool = False, trigger: str = "manual",
     # 발송은 fcm 안에서 예외·시간 초과를 흡수하므로, 여기서 실패해도 매매·기록은 그대로 끝난다.
     push: dict | None = None
     if sells or buys:
-        sender = push_fn or (lambda s, b, p: fcm.notify_fills(s, b, p))
+        sender = push_fn or (lambda s, b, p: fcm.notify_fills(s, b, p, user_id=uid))
         try:
             push = sender(sells, buys, db_path)
         except Exception as exc:  # 주입된 발송기까지 막아 둔다
@@ -1065,18 +1073,20 @@ def _status_cache_enabled() -> bool:
     return (os.environ.get("PAPER_STATUS_CACHE") or "1").strip() not in ("0", "false", "False")
 
 
-def _cache_key(db_path: str | None) -> str:
-    return str(db_path or "default")
+def _cache_key(db_path: str | None, user_id: int | None = None) -> str:
+    """상태 캐시 키 — 유저마다 계좌가 다르므로 유저를 키에 넣는다."""
+    return f"{db_path or 'default'}::u{int(user_id or paper_store.DEFAULT_USER_ID)}"
 
 
-def _cached_snapshot(db_path: str | None) -> dict | None:
+def _cached_snapshot(db_path: str | None, user_id: int | None = None) -> dict | None:
     with _STATUS_LOCK:
-        return _STATUS_CACHE.get(_cache_key(db_path))
+        return _STATUS_CACHE.get(_cache_key(db_path, user_id))
 
 
-def _store_snapshot(db_path: str | None, snapshot: dict) -> None:
+def _store_snapshot(db_path: str | None, snapshot: dict,
+                    user_id: int | None = None) -> None:
     with _STATUS_LOCK:
-        _STATUS_CACHE[_cache_key(db_path)] = {"ts": time.time(), "snapshot": snapshot}
+        _STATUS_CACHE[_cache_key(db_path, user_id)] = {"ts": time.time(), "snapshot": snapshot}
 
 
 def invalidate_status_cache(db_path: str | None = None) -> None:
@@ -1087,7 +1097,9 @@ def invalidate_status_cache(db_path: str | None = None) -> None:
         if db_path is None:
             _STATUS_CACHE.clear()
         else:
-            _STATUS_CACHE.pop(_cache_key(db_path), None)
+            prefix = f"{db_path}::u"
+            for key in [k for k in _STATUS_CACHE if k == db_path or k.startswith(prefix)]:
+                _STATUS_CACHE.pop(key, None)
 
 
 def _timed_call(fn, *args) -> tuple[object, Exception | None, float]:
@@ -1100,19 +1112,21 @@ def _timed_call(fn, *args) -> tuple[object, Exception | None, float]:
 
 
 def _build_snapshot(db_path: str | None = None, price_fn=None, fx_fn=None,
-                    limit_trades: int = 40, limit_equity: int = 180) -> dict:
-    """두 계좌의 평가 스냅샷 한 벌 — DB 1회 · 환율/시세 병렬 · 계좌별 평가.
+                    limit_trades: int = 40, limit_equity: int = 180,
+                    user_id: int | None = None) -> dict:
+    """한 유저의 두 계좌 평가 스냅샷 — DB 1회 · 환율/시세 병렬 · 계좌별 평가.
 
     단계별 소요(ms)를 `timings`에 남긴다 — 탭 전환이 느릴 때 어느 단계인지 응답만 보고 안다.
     `price_fn`/`fx_fn`은 테스트·대체 경로 주입점이다(없으면 실시간 시세·네이버 환율).
     """
     started = time.perf_counter()
     data = paper_store.snapshot(limit_trades=limit_trades, limit_equity=limit_equity,
-                                db_path=db_path)
+                                db_path=db_path, user_id=user_id)
     db_ms = (time.perf_counter() - started) * 1000
+    account_ids = list(data["accounts"])
 
     tickers: list[str] = []
-    for aid in paper_store.ACCOUNTS:
+    for aid in account_ids:
         for row in data["positions"][aid]:
             if row["ticker"] not in tickers:
                 tickers.append(row["ticker"])
@@ -1147,12 +1161,12 @@ def _build_snapshot(db_path: str | None = None, price_fn=None, fx_fn=None,
 
     fx_rate = float(fx["rate"])
     views = {aid: _valuation(data["positions"][aid], prices, sources, fx_rate)
-             for aid in paper_store.ACCOUNTS}
+             for aid in account_ids}
 
     rows: dict[str, dict] = {}
-    for aid in paper_store.ACCOUNTS:
+    for aid in account_ids:
         account = data["accounts"][aid]
-        mkt = paper_store.account_market(aid)
+        mkt = account["market_scope"]
         summary = _summary(account, account["cash_krw"], views[aid]["stock_value_krw"])
         rows[mkt] = {
             **summary,
@@ -1190,7 +1204,8 @@ def _build_snapshot(db_path: str | None = None, price_fn=None, fx_fn=None,
 
 
 def _refresh_in_background(key: str, db_path: str | None, price_fn, fx_fn,
-                          limit_trades: int, limit_equity: int) -> None:
+                          limit_trades: int, limit_equity: int,
+                          user_id: int | None = None) -> None:
     """만료된 스냅샷을 뒤에서 새로 만든다(기다리던 요청은 옛 값을 바로 받는다)."""
     with _STATUS_LOCK:
         if key in _STATUS_REFRESHING:
@@ -1201,11 +1216,17 @@ def _refresh_in_background(key: str, db_path: str | None, price_fn, fx_fn,
     def _work() -> None:
         try:
             with _STATUS_BUILD_LOCK:
-                snapshot = _build_snapshot(db_path, price_fn, fx_fn, limit_trades, limit_equity)
+                # 기본 관리자 경로는 예전 호출 모양(5인자)을 그대로 쓴다 — 기존 주입·테스트 호환.
+                if int(user_id or paper_store.DEFAULT_USER_ID) == paper_store.DEFAULT_USER_ID:
+                    snapshot = _build_snapshot(db_path, price_fn, fx_fn, limit_trades,
+                                               limit_equity)
+                else:
+                    snapshot = _build_snapshot(db_path, price_fn, fx_fn, limit_trades,
+                                               limit_equity, user_id=user_id)
                 with _STATUS_LOCK:  # 만드는 사이 매매·설정이 있었다면 옛 상태를 덮어쓰지 않는다
                     stale = generation != _STATUS_GENERATION
                 if not stale:
-                    _store_snapshot(db_path, snapshot)
+                    _store_snapshot(db_path, snapshot, user_id)
         except Exception as exc:  # 백그라운드 실패는 응답을 막지 않는다
             logger.warning("모의투자 상태 백그라운드 갱신 실패: %s: %s",
                            type(exc).__name__, str(exc)[:160])
@@ -1217,39 +1238,46 @@ def _refresh_in_background(key: str, db_path: str | None, price_fn, fx_fn,
 
 
 def _snapshot(db_path: str | None = None, price_fn=None, fx_fn=None, limit_trades: int = 40,
-              limit_equity: int = 180, use_cache: bool = True) -> tuple[dict, bool, float]:
-    """`(스냅샷, 캐시 적중 여부, 캐시 나이 초)`.
+              limit_equity: int = 180, use_cache: bool = True,
+              user_id: int | None = None) -> tuple[dict, bool, float]:
+    """`(스냅샷, 캐시 적중 여부, 캐시 나이 초)` — 유저별로 따로 캐시한다.
 
     - `STATUS_TTL`(25초) 안이면 그대로 재사용 — 미국↔한국 탭을 오가도 즉시 응답.
     - `STATUS_STALE_SEC`(3분) 안이면 옛 값을 먼저 주고 백그라운드에서 새로 채운다.
     - 동시에 여러 요청이 들어와도 만드는 일은 한 번(`_STATUS_BUILD_LOCK`).
     """
-    key = _cache_key(db_path)
+    key = _cache_key(db_path, user_id)
     if use_cache:
-        item = _cached_snapshot(db_path)
+        item = _cached_snapshot(db_path, user_id)
         if item:
             age = max(0.0, time.time() - float(item.get("ts") or 0.0))
             if age < STATUS_TTL:
                 return item["snapshot"], True, age
             if age < STATUS_STALE_SEC:
-                _refresh_in_background(key, db_path, price_fn, fx_fn, limit_trades, limit_equity)
+                _refresh_in_background(key, db_path, price_fn, fx_fn, limit_trades, limit_equity,
+                                       user_id)
                 return item["snapshot"], True, age
-    seen = _cached_snapshot(db_path) if use_cache else None  # 락 대기 중 새 결과 구분용
+    seen = _cached_snapshot(db_path, user_id) if use_cache else None  # 락 대기 중 새 결과 구분용
     with _STATUS_LOCK:
         generation = _STATUS_GENERATION
     with _STATUS_BUILD_LOCK:
         if use_cache:
-            item = _cached_snapshot(db_path)
+            item = _cached_snapshot(db_path, user_id)
             if item is not None and item is not seen:
                 age = max(0.0, time.time() - float(item.get("ts") or 0.0))
                 if age < STATUS_TTL:
                     return item["snapshot"], True, age
-        snapshot = _build_snapshot(db_path, price_fn, fx_fn, limit_trades, limit_equity)
+        if int(user_id or paper_store.DEFAULT_USER_ID) == paper_store.DEFAULT_USER_ID:
+            # 기본 관리자 경로는 예전 호출 모양(5인자)을 그대로 쓴다 — 기존 주입·테스트 호환.
+            snapshot = _build_snapshot(db_path, price_fn, fx_fn, limit_trades, limit_equity)
+        else:
+            snapshot = _build_snapshot(db_path, price_fn, fx_fn, limit_trades, limit_equity,
+                                       user_id=user_id)
         with _STATUS_LOCK:  # 계산 중 매매·설정이 있었으면 이 결과는 버린다(다음 요청이 새로 만든다)
             stale = generation != _STATUS_GENERATION
         if price_fn is None and fx_fn is None and not stale:
             # 주입된 대체 경로 결과는 캐시에 남기지 않는다
-            _store_snapshot(db_path, snapshot)
+            _store_snapshot(db_path, snapshot, user_id)
         return snapshot, False, 0.0
 
 
@@ -1311,8 +1339,9 @@ def start_status_warm(delay: float | None = None, interval: float | None = None)
 
 def status(db_path: str | None = None, price_fn=None, fx_fn=None,
            limit_trades: int = 40, limit_equity: int = 180, market: str | None = None,
-           use_cache: bool | None = None) -> dict:
-    """한 계좌의 상세(보유·체결·수익률) + **두 계좌를 나란히 비교하는 요약**.
+           use_cache: bool | None = None, user_id: int | None = None,
+           include_broker: bool | None = None) -> dict:
+    """한 계좌의 상세(보유·체결·수익률) + **그 유저의 두 계좌를 나란히 비교하는 요약**.
 
     반환: `market`이 지정한 계좌(기본 미국)의 `account`·`positions`·`trades`·`equity_history`와
     함께, `accounts`(US·KR 각각의 총자산·수익률·현금·보유 수·마지막 실행일)와 앱이
@@ -1322,12 +1351,16 @@ def status(db_path: str | None = None, price_fn=None, fx_fn=None,
     미국↔한국 탭을 오갈 때마다 시세·DB를 다시 부르지 않는다. `use_cache=False`면 새로
     계산한다(매매·설정 직후 응답). `cache`·`timings`가 어느 단계가 얼마나 걸렸는지 알려준다.
     """
+    uid = int(user_id or paper_store.DEFAULT_USER_ID)
     scope = account_scope(market)
-    account_id = account_id_of(scope)
+    user = paper_auth.get_user(uid, db_path) or {
+        "id": uid, "nickname": "", "is_admin": uid == paper_store.DEFAULT_USER_ID}
+    account_id = paper_store.account_id_for(uid, scope, db_path)
     if use_cache is None:
         use_cache = _status_cache_enabled() and price_fn is None and fx_fn is None
     snapshot, cache_hit, cache_age = _snapshot(
-        db_path, price_fn, fx_fn, limit_trades, limit_equity, use_cache=bool(use_cache))
+        db_path, price_fn, fx_fn, limit_trades, limit_equity, use_cache=bool(use_cache),
+        user_id=uid)
 
     accounts = snapshot["accounts"]
     rows = snapshot["rows"]
@@ -1336,14 +1369,18 @@ def status(db_path: str | None = None, price_fn=None, fx_fn=None,
     account = accounts[account_id]
     summary = _summary(account, account["cash_krw"], views[account_id]["stock_value_krw"])
     schedule = [
-        {"market": mkt, "account_id": aid, "label": f"{ACCOUNT_NAMES[mkt]} 장 마감 후",
-         "at": f"{RUN_AT[mkt][0]:02d}:{RUN_AT[mkt][1]:02d}",
-         "enabled": accounts[aid]["auto_enabled"],
-         "done_today": (accounts[aid].get(f"last_run_{mkt.lower()}_date") or "") == today}
-        for mkt, aid in (("KR", paper_store.ACCOUNT_KR), ("US", paper_store.ACCOUNT_US))
+        {"market": acc["market_scope"], "account_id": aid,
+         "label": f"{ACCOUNT_NAMES[acc['market_scope']]} 장 마감 후",
+         "at": f"{RUN_AT[acc['market_scope']][0]:02d}:{RUN_AT[acc['market_scope']][1]:02d}",
+         "enabled": acc["auto_enabled"],
+         "done_today": (acc.get(f"last_run_{acc['market_scope'].lower()}_date") or "") == today}
+        for aid, acc in sorted(accounts.items(), key=lambda item: item[1]["market_scope"] != "KR")
     ]
+    is_admin = bool(user.get("is_admin"))
+    show_broker = is_admin if include_broker is None else bool(include_broker and is_admin)
     return {
         "market": scope,
+        "user": paper_auth.public_user(user),
         "account": {
             **summary,
             "id": account_id,
@@ -1373,7 +1410,7 @@ def status(db_path: str | None = None, price_fn=None, fx_fn=None,
         "fee_policy": fee_policy(),
         # 실제 계좌(테스트) 카드 — 어댑터 모드·킬 스위치·한도·키 등록 여부(마스킹).
         # 키 원문은 없다. 캐시된 스냅샷과 별개로 매번 만들지만 조회는 20초 캐시를 탄다.
-        "broker": broker_credentials.full_status(db_path),
+        "broker": broker_credentials.full_status(db_path) if show_broker else None,
         "as_of": snapshot["as_of"],
         "storage_backend": snapshot["storage_backend"],
         "cache": {"hit": cache_hit, "age_sec": round(cache_age, 1), "ttl_sec": STATUS_TTL},
@@ -1413,7 +1450,8 @@ def next_auto_info(account: dict, now: datetime | None = None) -> dict:
 
 
 def configure(account: str | None = None, initial_cash_krw=None, markets=None, strategy=None,
-              auto_enabled=None, reset: bool = False, db_path: str | None = None) -> dict:
+              auto_enabled=None, reset: bool = False, db_path: str | None = None,
+              user_id: int | None = None) -> dict:
     """한 계좌(미국/한국)의 시드머니·전략·자동 실행 설정. `reset=True`면 그 계좌만 초기화한다.
 
     검증: 시드머니 10만~10억 원, 전략 4종.
@@ -1424,9 +1462,10 @@ def configure(account: str | None = None, initial_cash_krw=None, markets=None, s
     무시한다 — 계좌의 시장은 계좌가 정한다(미국 계좌는 미국 종목만 산다).
     """
     scope = account_scope(account)
-    account_id = account_id_of(scope)
+    uid = int(user_id or paper_store.DEFAULT_USER_ID)
+    account_id = paper_store.account_id_for(uid, scope, db_path)
     # 계좌 한 행만 필요하다 — 연결 1회로 읽는다(예전 init_store는 연결 5번 = 10초 넘음).
-    current = paper_store.ensure_accounts(db_path)[account_id]
+    current = paper_store.ensure_accounts(db_path, uid)[account_id]
 
     seed = None
     if initial_cash_krw is not None:
@@ -1505,29 +1544,115 @@ def auto_due_markets(now: datetime | None = None) -> list[str]:
     return due
 
 
+def auto_due_accounts(now: datetime | None = None,
+                      include_admin: bool = False) -> list[tuple[int, str]]:
+    """지금 자동 실행해야 할 `(user_id, 시장)` 목록 — 가입한 모든 유저의 계좌를 순서대로.
+
+    `include_admin=False`면 기본 관리자(user 1)는 빼고 본다(`_auto_tick`이 기존
+    `auto_due_markets()` 결과와 합친다 — 기존 동작·테스트를 그대로 두기 위해서다).
+    """
+    current = now or datetime.now(KST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=KST)
+    current = current.astimezone(KST)
+    today = current.date().isoformat()
+    minutes = current.hour * 60 + current.minute
+    due: list[tuple[int, str]] = []
+    try:
+        users = paper_auth.list_users()
+    except Exception as exc:  # 사용자 테이블 장애 — 관리자 계좌만 돈다
+        logger.warning("모의투자 유저 목록 조회 실패: %s: %s", type(exc).__name__, str(exc)[:160])
+        users = []
+    user_ids = [int(user["id"]) for user in users]
+    if include_admin and paper_store.DEFAULT_USER_ID not in user_ids:
+        user_ids.insert(0, paper_store.DEFAULT_USER_ID)
+    for uid in user_ids:
+        if not include_admin and uid == paper_store.DEFAULT_USER_ID:
+            continue
+        try:
+            accounts = paper_store.ensure_accounts(user_id=uid)
+        except Exception as exc:  # 저장소 장애 — 다음 유저로
+            logger.warning("모의투자 자동 실행 계좌 조회 실패(user %s): %s: %s",
+                           uid, type(exc).__name__, str(exc)[:160])
+            continue
+        by_market = {acc["market_scope"]: acc for acc in accounts.values()}
+        for market in ACCOUNT_ORDER:
+            hour, minute = RUN_AT[market]
+            if minutes < hour * 60 + minute:
+                continue
+            if _AUTO_FAILURES.get(_failure_key(uid, market, today), 0) >= 3:
+                continue
+            account = by_market.get(market)
+            if not account or not account.get("auto_enabled"):
+                continue
+            if (account.get(f"last_run_{market.lower()}_date") or "") == today:
+                continue
+            due.append((uid, market))
+    return due
+
+
+def _failure_key(user_id: int, market: str, today: str | None = None) -> tuple:
+    """자동 실행 실패 카운터 키 — 관리자는 예전 키(`(시장, 날짜)`)를 그대로 쓴다."""
+    day = today or paper_store.kst_today_str()
+    if int(user_id) == paper_store.DEFAULT_USER_ID:
+        return (market, day)
+    return (f"u{int(user_id)}", market, day)
+
+
 def _auto_tick(ai_call=None) -> dict | None:
-    due = auto_due_markets()
+    """하루 1회씩 밀린 계좌를 **순서대로** 실행한다.
+
+    같은 실행 안에서 같은 `(시장, 전략)`의 스크리너 후보는 한 번만 수집해 모든 유저가 나눠 쓴다
+    (`default_candidates`는 S&P 500·코스피 200을 훑는 무거운 작업이라 유저마다 다시 돌리면
+    시간·메모리가 배로 든다). 계좌 사이마다 메모리 여유를 확인하고, 부족하면 남은 계좌는
+    다음 주기(5분 뒤)로 미룬다.
+    """
+    legacy_due = [(paper_store.DEFAULT_USER_ID, market) for market in auto_due_markets()]
+    due = legacy_due + [pair for pair in auto_due_accounts() if pair not in legacy_due]
     AUTO_STATE["last_check"] = paper_store._now()
     if not due:
         return None
-    market = due[0]
-    try:
-        result = run(market=market, force=False, trigger="auto", ai_call=ai_call)
-        AUTO_STATE["last_run"] = {"market": market, "label": account_label(market),
-                                  "at": paper_store._now(),
-                                  "summary": result.get("summary"),
-                                  "buys": len(result.get("buys") or []),
-                                  "sells": len(result.get("sells") or [])}
-        AUTO_STATE["last_error"] = None
-        return result
-    except Exception as exc:
-        today = paper_store.kst_today_str()
-        _AUTO_FAILURES[(market, today)] = _AUTO_FAILURES.get((market, today), 0) + 1
-        AUTO_STATE["last_error"] = {"market": market, "at": paper_store._now(),
-                                    "type": type(exc).__name__, "message": str(exc)[:300]}
-        logger.exception("모의투자 자동 실행 실패(%s, %d/3)", market,
-                         _AUTO_FAILURES[(market, today)])
-        return None
+
+    candidate_cache: dict[tuple[str, str], list[dict]] = {}
+
+    def memo_candidates(market: str, criteria: str) -> list[dict]:
+        key = (str(market), str(criteria))
+        if key not in candidate_cache:
+            candidate_cache[key] = default_candidates(market, criteria) or []
+        return candidate_cache[key]
+
+    results: list[dict] = []
+    for index, (uid, market) in enumerate(due):
+        if index and not memory_guard.headroom(need_mb=32, wait=5.0):
+            AUTO_STATE["last_error"] = {"user_id": uid, "market": market,
+                                        "at": paper_store._now(), "type": "MemoryGuard",
+                                        "message": "메모리 여유 부족 — 남은 계좌는 다음 주기로 미룸"}
+            logger.warning("모의투자 자동 실행: 메모리 여유 부족 — 남은 %d개 계좌를 다음 주기로 미룸",
+                           len(due) - index)
+            break
+        try:
+            result = run(market=market, force=False, trigger="auto", ai_call=ai_call,
+                         candidate_fn=memo_candidates, user_id=uid)
+            results.append(result)
+            AUTO_STATE["last_run"] = {"user_id": uid, "market": market,
+                                      "label": account_label(market),
+                                      "at": paper_store._now(),
+                                      "summary": result.get("summary"),
+                                      "buys": len(result.get("buys") or []),
+                                      "sells": len(result.get("sells") or [])}
+            AUTO_STATE["last_error"] = None
+        except Exception as exc:
+            today = paper_store.kst_today_str()
+            key = _failure_key(uid, market, today)
+            _AUTO_FAILURES[key] = _AUTO_FAILURES.get(key, 0) + 1
+            AUTO_STATE["last_error"] = {"user_id": uid, "market": market,
+                                        "at": paper_store._now(), "type": type(exc).__name__,
+                                        "message": str(exc)[:300]}
+            logger.exception("모의투자 자동 실행 실패(user %s, %s, %d/3)", uid, market,
+                             _AUTO_FAILURES[key])
+    if len(results) <= 1:
+        return results[0] if results else None
+    return {"ok": True, "runs": results, "ran_at": paper_store._now()}
 
 
 def _auto_loop(ai_call=None) -> None:
@@ -1573,6 +1698,92 @@ def auto_status() -> dict:
         "us_run_at": f"{US_RUN_AT[0]:02d}:{US_RUN_AT[1]:02d}",
         **{key: AUTO_STATE.get(key) for key in ("last_check", "last_run", "last_error")},
     }
+
+
+def leaderboard(db_path: str | None = None, price_fn=None, fx_fn=None) -> dict:
+    """지인 수익률 랭킹 — 모든 유저의 미국·한국 계좌를 한 번에 평가해 합산 수익률 순으로 돌려준다.
+
+    시세·환율은 **한 번만** 조회해 모든 유저의 보유 종목을 한꺼번에 평가한다(유저마다 부르면
+    지인 5명이면 시세를 5번 받는다). 응답에는 닉네임·수익률·총자산만 넣고 PIN·토큰·계좌
+    비밀값은 절대 넣지 않는다.
+    """
+    started = time.perf_counter()
+    users = paper_auth.list_users(db_path)
+    bulk = paper_store.accounts_bulk(db_path)
+    accounts = bulk["accounts"]
+    positions = bulk["positions"]
+
+    tickers: list[str] = []
+    for rows in positions.values():
+        for row in rows:
+            if row["ticker"] not in tickers:
+                tickers.append(row["ticker"])
+
+    fx: object = None
+    prices: dict = {}
+    sources: dict = {}
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="paper-rank") as pool:
+        fx_future = pool.submit(_timed_call, fx_fn or get_usd_krw)
+        price_future = (pool.submit(_timed_call, price_fn or default_prices, tickers)
+                        if tickers else None)
+        fx, fx_error, _ = fx_future.result()
+        if fx_error is not None:
+            logger.warning("랭킹 환율 조회 실패: %s: %s", type(fx_error).__name__, str(fx_error)[:160])
+        if price_future is not None:
+            got, price_error, _ = price_future.result()
+            if isinstance(got, tuple) and len(got) == 2:
+                prices, sources = got[0] or {}, got[1] or {}
+            if price_error is not None:
+                logger.warning("랭킹 시세 조회 실패: %s: %s",
+                               type(price_error).__name__, str(price_error)[:160])
+    if not isinstance(fx, dict) or not _num(fx.get("rate")):
+        fx = {"rate": DEFAULT_USD_KRW, "source": "fixed_fallback"}
+    fx_rate = float(fx["rate"])
+
+    rows: list[dict] = []
+    for user in users:
+        uid = int(user["id"])
+        per: dict[str, dict] = {}
+        total_value = 0.0
+        total_initial = 0.0
+        positions_count = 0
+        for aid, account in (accounts.get(uid) or {}).items():
+            mkt = account["market_scope"]
+            view = _valuation(positions.get(aid, []), prices, sources, fx_rate)
+            summary = _summary(account, account["cash_krw"], view["stock_value_krw"])
+            per[mkt] = {**summary, "account_id": aid,
+                        "label": account_label(mkt),
+                        "positions_count": len(positions.get(aid, []))}
+            total_value += summary["total_value_krw"]
+            total_initial += summary["initial_cash_krw"]
+            positions_count += len(positions.get(aid, []))
+        pnl = total_value - total_initial
+        rows.append({
+            "user_id": uid,
+            "nickname": user.get("nickname") or "",
+            "is_admin": bool(user.get("is_admin")),
+            "total_value_krw": round(total_value, 2),
+            "total_pnl_krw": round(pnl, 2),
+            "total_return_pct": (round(pnl / total_initial * 100, 2)
+                                 if total_initial > 0 else None),
+            "positions_count": positions_count,
+            "us": per.get("US"),
+            "kr": per.get("KR"),
+        })
+    rows.sort(key=lambda row: (row["total_return_pct"] is None,
+                               -(row["total_return_pct"] or 0.0)))
+    previous: float | None = None
+    rank = 0
+    for index, row in enumerate(rows, start=1):
+        value = row["total_return_pct"]
+        if value is None or value != previous:
+            rank = index
+            previous = value
+        row["rank"] = rank
+    return {"ok": True, "rows": rows, "count": len(rows), "fx_rate": round(fx_rate, 2),
+            "fx_source": fx.get("source"), "as_of": paper_store._now(),
+            "storage_backend": bulk.get("storage_backend"),
+            "took_ms": round((time.perf_counter() - started) * 1000, 1)}
 
 
 def clear_caches() -> None:

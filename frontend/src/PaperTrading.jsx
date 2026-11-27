@@ -13,6 +13,32 @@ import {
 
 const API_BASE = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/+$/, "");
 
+// 닉네임 + 4자리 PIN 세션 — 토큰은 localStorage에만 두고, 새로고침·재접속에도 유지한다.
+const SESSION_KEY = "paper:session:v1";
+
+const readSession = () => {
+  try {
+    const raw = window.localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed?.token) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
+const authHeaders = (session) =>
+  session?.token ? { "X-Paper-User-Token": session.token } : {};
+
+const AUTH_ERROR = (status, detail) => {
+  if (detail?.message) return detail.message;
+  if (status === 401) return "PIN이 맞지 않습니다.";
+  if (status === 429) return "PIN을 여러 번 틀렸습니다. 10분 뒤 다시 시도해 주세요.";
+  if (status === 400) return "닉네임과 4자리 PIN을 확인해 주세요.";
+  return `로그인하지 못했습니다 (${status})`;
+};
+
 const MARKETS = [
   { value: "US", label: "🇺🇸 미국 계좌" },
   { value: "KR", label: "🇰🇷 한국 계좌" },
@@ -101,6 +127,124 @@ const kstDateTime = (iso) => {
   return `${pad(kst.getUTCMonth() + 1)}-${pad(kst.getUTCDate())} ${pad(kst.getUTCHours())}:${pad(kst.getUTCMinutes())}`;
 };
 
+// 🏆 지인 수익률 랭킹 — 순위·닉네임·합산/미장/국장 수익률. PIN·토큰은 서버가 보내지 않는다.
+function LeaderboardCard({ rows, me }) {
+  if (!rows?.length) return null;
+  return (
+    <section className="panel paper-rank">
+      <div className="score-head">
+        <div>
+          <h3 className="score-title">🏆 지인 수익률 랭킹</h3>
+          <p className="score-sub">미국·한국 두 계좌를 합친 수익률 순위입니다(평가 시점 환율 기준).</p>
+        </div>
+      </div>
+      <div className="table-scroll">
+        <table className="paper-table paper-rank-table">
+          <thead>
+            <tr>
+              <th>순위</th>
+              <th>닉네임</th>
+              <th>합산</th>
+              <th>🇺🇸 미국</th>
+              <th>🇰🇷 한국</th>
+              <th>총자산</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.user_id} className={row.user_id === me ? "me" : ""}>
+                <td className="rank-cell">
+                  {row.rank === 1 ? "🥇" : row.rank === 2 ? "🥈" : row.rank === 3 ? "🥉" : row.rank}
+                </td>
+                <td>
+                  <b>{row.nickname}</b>
+                  {row.is_admin && <span className="mini-tag">관리자</span>}
+                  {row.user_id === me && <span className="mini-tag">나</span>}
+                </td>
+                <td>
+                  <span className={`ret ${retClass(row.total_return_pct)}`}>
+                    {pct(row.total_return_pct)}
+                  </span>
+                </td>
+                <td>
+                  <span className={`ret ${retClass(row.us?.total_return_pct)}`}>
+                    {pct(row.us?.total_return_pct)}
+                  </span>
+                </td>
+                <td>
+                  <span className={`ret ${retClass(row.kr?.total_return_pct)}`}>
+                    {pct(row.kr?.total_return_pct)}
+                  </span>
+                </td>
+                <td>{won(row.total_value_krw)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+// 닉네임 + 4자리 PIN 입력 시트(처음 입장·계정 전환·로그아웃).
+function AuthSheet({ session, onClose, onSubmit, busy, error, nickname, pin, setNickname,
+                     setPin, onLogout }) {
+  return (
+    <div className="paper-auth-backdrop" role="dialog" aria-modal="true">
+      <form className="panel paper-auth-sheet" onSubmit={onSubmit}>
+        <div className="score-head">
+          <div>
+            <h3 className="score-title">👥 계정 전환 · 로그인</h3>
+            <p className="score-sub">
+              {session
+                ? `지금 ${session.nickname}님으로 접속 중입니다. 다른 닉네임은 PIN으로 들어오세요.`
+                : "닉네임과 4자리 PIN으로 입장하세요. 처음 보는 닉네임이면 계좌가 새로 만들어집니다."}
+            </p>
+          </div>
+          {session && (
+            <button type="button" className="ghost" onClick={onClose}>
+              닫기
+            </button>
+          )}
+        </div>
+        <div className="paper-form paper-auth-form">
+          <label>
+            닉네임
+            <input
+              value={nickname}
+              onChange={(event) => setNickname(event.target.value.slice(0, 20))}
+              placeholder="예: 민수"
+              autoFocus
+            />
+          </label>
+          <label>
+            4자리 PIN
+            <input
+              type="password"
+              inputMode="numeric"
+              maxLength={4}
+              value={pin}
+              onChange={(event) => setPin(event.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+              placeholder="0000"
+            />
+          </label>
+        </div>
+        {error && <div className="error">⚠️ {error}</div>}
+        <div className="paper-form-actions">
+          <button type="submit" className="run-btn" disabled={busy}>
+            {busy ? "확인 중..." : "입장 / 로그인"}
+          </button>
+          {session && (
+            <button type="button" className="ghost danger" onClick={onLogout}>
+              로그아웃
+            </button>
+          )}
+        </div>
+      </form>
+    </div>
+  );
+}
+
 export default function PaperTradingView() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -114,6 +258,13 @@ export default function PaperTradingView() {
   const [runResult, setRunResult] = useState(null);
   const [realOpen, setRealOpen] = useState(false);
   const [broker, setBroker] = useState(null);
+  const [session, setSession] = useState(readSession);
+  const [authOpen, setAuthOpen] = useState(() => !readSession());
+  const [authNick, setAuthNick] = useState("");
+  const [authPin, setAuthPin] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [ranking, setRanking] = useState(null);
 
   const apply = useCallback((body) => {
     setData(body);
@@ -124,10 +275,20 @@ export default function PaperTradingView() {
   }, []);
 
   const load = useCallback(
-    async (silent = false, scope = market) => {
+    async (silent = false, scope = market, active = session) => {
+      if (!active?.token) return;
       if (!silent) setLoading(true);
       try {
-        const res = await fetch(`${API_BASE}/api/paper/status?market=${scope}`);
+        const res = await fetch(`${API_BASE}/api/paper/status?market=${scope}`, {
+          headers: authHeaders(active),
+        });
+        if (res.status === 401) {
+          window.localStorage.removeItem(SESSION_KEY);
+          setSession(null);
+          setData(null);
+          setAuthOpen(true);
+          throw new Error("로그인이 만료됐어요. 닉네임과 PIN으로 다시 로그인해 주세요.");
+        }
         if (!res.ok) throw new Error(`계좌를 불러오지 못했습니다 (${res.status})`);
         apply(await res.json());
         setError("");
@@ -137,14 +298,81 @@ export default function PaperTradingView() {
         setLoading(false);
       }
     },
-    [apply, market]
+    [apply, market, session]
   );
 
+  const loadRanking = useCallback(async (active = session) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/paper/leaderboard`, {
+        headers: authHeaders(active),
+      });
+      if (!res.ok) return;
+      setRanking(await res.json());
+    } catch {
+      // 랭킹은 부가 정보 — 실패해도 계좌 화면은 그대로 보여 준다.
+    }
+  }, [session]);
+
   useEffect(() => {
-    load(false, market);
+    if (session?.token) {
+      load(false, market);
+      loadRanking();
+    } else {
+      setLoading(false);
+    }
     setRunResult(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [market]);
+  }, [market, session]);
+
+  const submitAuth = async (event) => {
+    event?.preventDefault?.();
+    const nickname = authNick.trim();
+    if (!nickname || !/^\d{4}$/.test(authPin)) {
+      setAuthError("닉네임과 4자리 PIN을 입력해 주세요.");
+      return;
+    }
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/paper/auth`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nickname, pin: authPin }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(AUTH_ERROR(res.status, body.detail));
+      const next = {
+        token: body.token,
+        userId: body.user?.id,
+        nickname: body.user?.nickname || nickname,
+        isAdmin: Boolean(body.user?.is_admin),
+      };
+      window.localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+      setSession(next);
+      setAuthOpen(false);
+      setAuthPin("");
+      setData(null);
+      setRanking(null);
+      if (body.created) setError("");
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const logout = () => {
+    window.localStorage.removeItem(SESSION_KEY);
+    setSession(null);
+    setData(null);
+    setRanking(null);
+    setBroker(null);
+    setError("");
+    setAuthNick("");
+    setAuthPin("");
+    setAuthError("");
+    setAuthOpen(true);
+  };
 
   const saveSettings = async (reset = false) => {
     const amount = Number(String(seed).replace(/[^0-9.]/g, ""));
@@ -160,7 +388,7 @@ export default function PaperTradingView() {
     try {
       const res = await fetch(`${API_BASE}/api/paper/configure`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders(session) },
         body: JSON.stringify({
           market,
           initial_cash_krw: amount,
@@ -181,6 +409,7 @@ export default function PaperTradingView() {
       }
       apply(body.status);
       setRunResult(null);
+      loadRanking();
     } catch (err) {
       setError(err.message);
     } finally {
@@ -195,13 +424,14 @@ export default function PaperTradingView() {
     try {
       const res = await fetch(`${API_BASE}/api/paper/run`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders(session) },
         body: JSON.stringify({ market, force: true }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(`AI 매매 실행 실패 (${res.status})`);
       setRunResult(body.result);
       apply(body.status);
+      loadRanking();
     } catch (err) {
       setError(err.message);
     } finally {
@@ -226,13 +456,73 @@ export default function PaperTradingView() {
     [data]
   );
 
+  if (!session?.token) {
+    return (
+      <div className="paper">
+        <section className="panel paper-auth-hero">
+          <div className="score-head">
+            <div>
+              <h2 className="score-title">👥 지인 모의투자 · 닉네임 + 4자리 PIN</h2>
+              <p className="score-sub">
+                각자 닉네임과 PIN으로 자기 계좌(미국·한국 각 100만 원)를 따로 굴리고, 수익률을
+                나란히 겨룹니다. 처음 보는 닉네임이면 계좌가 새로 만들어집니다.
+              </p>
+            </div>
+          </div>
+          <form className="paper-form paper-auth-form" onSubmit={submitAuth}>
+            <label>
+              닉네임
+              <input
+                value={authNick}
+                onChange={(event) => setAuthNick(event.target.value.slice(0, 20))}
+                placeholder="예: 민수"
+                autoFocus
+              />
+            </label>
+            <label>
+              4자리 PIN
+              <input
+                type="password"
+                inputMode="numeric"
+                maxLength={4}
+                value={authPin}
+                onChange={(event) => setAuthPin(event.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+                placeholder="0000"
+              />
+            </label>
+          </form>
+          {authError && <div className="error">⚠️ {authError}</div>}
+          <div className="paper-form-actions">
+            <button type="button" className="run-btn" onClick={submitAuth} disabled={authBusy}>
+              {authBusy ? "확인 중..." : "입장 / 로그인"}
+            </button>
+          </div>
+          <p className="paper-disclaimer">
+            ※ 닉네임과 PIN은 지인끼리만 정해 쓰세요. 관리자(현우)는 기존 계좌를 그대로 이어받습니다 —
+            처음 한 번 PIN을 정하면 이후 그 PIN으로 들어옵니다.
+          </p>
+        </section>
+      </div>
+    );
+  }
+
   if (loading && !data) {
     return <div className="list-empty">🤖 AI 모의투자 계좌 불러오는 중...</div>;
   }
 
   return (
     <div className="paper">
-      <section className="paper-compare paper-compare-three">
+      <div className="paper-userbar">
+        <span className="paper-user-chip">
+          👤 <b>{session.nickname}</b>
+          {session.isAdmin && <em>관리자</em>}
+        </span>
+        <button type="button" className="ghost" onClick={() => setAuthOpen(true)}>
+          계정 전환 / 로그인
+        </button>
+      </div>
+
+      <section className={`paper-compare ${session.isAdmin ? "paper-compare-three" : ""}`}>
         {comparison.map((row) => (
             <button
               key={row.market}
@@ -256,8 +546,13 @@ export default function PaperTradingView() {
               </em>
             </button>
           ))}
-        <RealAccountCard broker={broker} onOpen={() => setRealOpen(true)} />
+        {session.isAdmin && (
+          <RealAccountCard broker={broker} onOpen={() => setRealOpen(true)} />
+        )}
       </section>
+
+      <LeaderboardCard rows={ranking?.rows} me={session.userId} />
+
 
       <section className="panel paper-hero">
         <div className="score-head">
@@ -620,11 +915,26 @@ export default function PaperTradingView() {
         보장하지 않습니다.
       </p>
 
-      {realOpen && (
+      {realOpen && session.isAdmin && (
         <RealAccountModal
           status={broker}
           onClose={() => setRealOpen(false)}
           onChanged={(next) => setBroker(next)}
+        />
+      )}
+
+      {authOpen && (
+        <AuthSheet
+          session={session}
+          onClose={() => setAuthOpen(false)}
+          onSubmit={submitAuth}
+          busy={authBusy}
+          error={authError}
+          nickname={authNick}
+          pin={authPin}
+          setNickname={setAuthNick}
+          setPin={setAuthPin}
+          onLogout={logout}
         />
       )}
     </div>
