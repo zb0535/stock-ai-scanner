@@ -120,8 +120,11 @@ AUTO_INTERVAL_SEC = int(os.environ.get("PAPER_AUTO_INTERVAL", "300"))
 AUTO_START_GRACE_SEC = 120
 
 # 상태 스냅샷 캐시(탭 전환·새로고침) — 계좌 두 개를 한 번에 평가한 결과를 잠시 재사용한다.
+_STATUS_CACHE: dict[str, dict] = {}       # 키 -> {"ts": float, "snapshot": dict}
+_RANK_CACHE: dict[str, dict] = {}         # db 키 -> {"ts": float, "data": dict}
 STATUS_TTL = float(os.environ.get("PAPER_STATUS_TTL", "25"))
 STATUS_STALE_SEC = float(os.environ.get("PAPER_STATUS_STALE", "180"))
+RANK_TTL = float(os.environ.get("PAPER_RANK_TTL", "30"))
 STATUS_WARM_DELAY = float(os.environ.get("PAPER_STATUS_WARM_DELAY", "20"))
 STATUS_WARM_INTERVAL = float(os.environ.get("PAPER_STATUS_WARM_INTERVAL", "60"))
 _STATUS_CACHE: dict[str, dict] = {}       # 키 -> {"ts": float, "snapshot": dict}
@@ -1090,16 +1093,18 @@ def _store_snapshot(db_path: str | None, snapshot: dict,
 
 
 def invalidate_status_cache(db_path: str | None = None) -> None:
-    """상태 스냅샷 캐시를 지운다 — 매매·설정 변경 직후엔 항상 최신 값을 보여야 한다."""
+    """상태·랭킹 캐시를 지운다 — 매매·설정 변경 직후엔 항상 최신 값을 보여야 한다."""
     global _STATUS_GENERATION
     with _STATUS_LOCK:
         _STATUS_GENERATION += 1   # 이전에 시작한 백그라운드 갱신은 결과를 버린다
         if db_path is None:
             _STATUS_CACHE.clear()
+            _RANK_CACHE.clear()
         else:
             prefix = f"{db_path}::u"
             for key in [k for k in _STATUS_CACHE if k == db_path or k.startswith(prefix)]:
                 _STATUS_CACHE.pop(key, None)
+            _RANK_CACHE.pop(str(db_path), None)
 
 
 def _timed_call(fn, *args) -> tuple[object, Exception | None, float]:
@@ -1705,8 +1710,14 @@ def leaderboard(db_path: str | None = None, price_fn=None, fx_fn=None) -> dict:
 
     시세·환율은 **한 번만** 조회해 모든 유저의 보유 종목을 한꺼번에 평가한다(유저마다 부르면
     지인 5명이면 시세를 5번 받는다). 응답에는 닉네임·수익률·총자산만 넣고 PIN·토큰·계좌
-    비밀값은 절대 넣지 않는다.
+    비밀값은 절대 넣지 않는다. `PAPER_RANK_TTL`(기본 30초) 동안 결과를 재사용한다.
     """
+    cache_key = str(db_path or "default")
+    if price_fn is None and fx_fn is None:
+        cached = _RANK_CACHE.get(cache_key)
+        if cached and time.time() - float(cached.get("ts") or 0.0) < RANK_TTL:
+            return {**cached["data"], "cache": {"hit": True,
+                                                "age_sec": round(time.time() - cached["ts"], 1)}}
     started = time.perf_counter()
     users = paper_auth.list_users(db_path)
     bulk = paper_store.accounts_bulk(db_path)
@@ -1780,15 +1791,20 @@ def leaderboard(db_path: str | None = None, price_fn=None, fx_fn=None) -> dict:
             rank = index
             previous = value
         row["rank"] = rank
-    return {"ok": True, "rows": rows, "count": len(rows), "fx_rate": round(fx_rate, 2),
+    body = {"ok": True, "rows": rows, "count": len(rows), "fx_rate": round(fx_rate, 2),
             "fx_source": fx.get("source"), "as_of": paper_store._now(),
             "storage_backend": bulk.get("storage_backend"),
-            "took_ms": round((time.perf_counter() - started) * 1000, 1)}
+            "took_ms": round((time.perf_counter() - started) * 1000, 1),
+            "cache": {"hit": False}}
+    if price_fn is None and fx_fn is None:
+        _RANK_CACHE[cache_key] = {"ts": time.time(), "data": body}
+    return body
 
 
 def clear_caches() -> None:
     """테스트용 캐시 초기화."""
     reset_fx_cache()
+    _RANK_CACHE.clear()
     invalidate_status_cache()
     broker.clear_cache()
     _AUTO_FAILURES.clear()
