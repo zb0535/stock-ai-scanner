@@ -1280,13 +1280,24 @@ def accounts_for_user(db_path: str | None = None, user_id: int | None = None) ->
     return {acc["market_scope"]: acc for acc in ensure_accounts(db_path, user_id).values()}
 
 
-def accounts_bulk(db_path: str | None = None) -> dict:
+def accounts_bulk(db_path: str | None = None, include_users: bool = False) -> dict:
     """모든 유저의 계좌·보유 종목을 **연결 1회**로 읽는다(랭킹용).
 
     반환: `{"accounts": {user_id: {account_id: 계좌}}, "positions": {account_id: [포지션]}}`.
-    사용자 행(닉네임)은 `paper_auth.list_users`가 따로 준다.
+    사용자 행(닉네임)은 `paper_auth.list_users`가 따로 주지만, `include_users=True`면 같은
+    연결에서 읽어 `users`에 넣는다(원격 DB 왕복을 한 번 줄인다).
     """
     with _connection(db_path) as (conn, backend):
+        users = None
+        if include_users:
+            try:
+                users = _rows(conn.execute(_sql(
+                    f"SELECT id, nickname, is_admin, created_at, last_login_at"
+                    f" FROM {TABLE_USERS} ORDER BY is_admin DESC, id", backend)))
+            except Exception as exc:  # 사용자 테이블이 아직 없으면 호출부가 따로 읽는다
+                logger.warning("랭킹용 사용자 조회 실패: %s: %s",
+                               type(exc).__name__, str(exc)[:120])
+                users = None
         rows = _rows(conn.execute(_sql(f"SELECT * FROM {TABLE_ACCOUNT} ORDER BY user_id, id",
                                       backend)))
         accounts: dict[int, dict[int, dict]] = {}
@@ -1299,7 +1310,7 @@ def accounts_bulk(db_path: str | None = None) -> dict:
             aid = normalize_account_id(row.get("account_id"))
             positions.setdefault(aid, []).append(_normalize_position(row))
     return {"accounts": accounts, "positions": positions, "storage_backend": backend,
-            "queried_at": _now()}
+            "users": users, "queried_at": _now()}
 
 
 def _recent_per_account(conn, backend: str, table: str, order_column: str, limit: int,

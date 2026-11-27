@@ -1719,8 +1719,8 @@ def leaderboard(db_path: str | None = None, price_fn=None, fx_fn=None) -> dict:
             return {**cached["data"], "cache": {"hit": True,
                                                 "age_sec": round(time.time() - cached["ts"], 1)}}
     started = time.perf_counter()
-    users = paper_auth.list_users(db_path)
-    bulk = paper_store.accounts_bulk(db_path)
+    bulk = paper_store.accounts_bulk(db_path, include_users=True)
+    users = bulk.get("users") or paper_auth.list_users(db_path)
     accounts = bulk["accounts"]
     positions = bulk["positions"]
 
