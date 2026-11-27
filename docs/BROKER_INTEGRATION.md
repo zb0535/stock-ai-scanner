@@ -212,7 +212,8 @@ assert result.status == "blocked" and result.reason == "real_trading_disabled"
 
 - **저장 방식**(`broker_credentials.py`): `cryptography.fernet`(AES-128-CBC + HMAC-SHA256) 암호문만
   `broker_credentials` 테이블(`cipher` 컬럼)에 넣는다. 화면·로그·에러 메시지 어디에도 원문이 없고,
-  상태 응답은 `hint_label`(`App Key ••••3f9a · 계좌번호 ••••-01`)만 준다.
+  상태 응답은 `hint_label`(`App Key ••••3f9a · App Secret •••• · 계좌번호 ••••-01`)만 준다.
+  상태 API는 인증 없이 읽히므로 **App Secret은 끝자리도 남기지 않는다**(통째로 `••••`).
 - **암호화 재료**: `BROKER_CRED_KEY`(권장) → 없으면 `DATABASE_URL` → `FIREBASE_SERVICE_ACCOUNT_JSON`
   → `GOOGLE_API_KEY`/`GEMINI_API_KEY` → `FINN_API_KEY`에서 PBKDF2-HMAC-SHA256(20만 회)로 유도.
   재료가 바뀌면 기존 암호문은 못 읽는다(상태에 "다시 등록" 안내, 원문은 절대 안 나옴).

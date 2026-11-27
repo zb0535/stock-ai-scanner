@@ -202,6 +202,17 @@ def mask(value: str) -> str:
     return "••••"
 
 
+def _hint_value(field: str, value: str) -> str:
+    """화면에 남길 힌트 — **App Secret은 한 글자도 남기지 않는다**.
+
+    상태 API는 인증 없이 읽히는 공개 엔드포인트라, 식별자(App Key·계좌번호)는 계좌를 구분할 수
+    있게 끝 4자리를 두되 가장 민감한 시크릿은 통째로 가린다.
+    """
+    if field == FIELD_APP_SECRET:
+        return "••••"
+    return mask(value)
+
+
 def _hint_label(hint: dict) -> str:
     """`App Key ••••3f9a · 계좌번호 ••••-01` — 카드에 한 줄로 쓰는 표시."""
     parts = []
@@ -284,7 +295,8 @@ def save(adapter: str, values: dict, db_path: str | None = None) -> dict:
     fernet, _ = _fernet()          # 키 재료가 없으면 여기서 KeyUnavailable(평문 저장 없음)
     plaintext = json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     cipher = fernet.encrypt(plaintext).decode("ascii")
-    hint = {field_for_env(env): mask(value) for env, value in normalized.items()}
+    hint = {field_for_env(env): _hint_value(field_for_env(env), value)
+            for env, value in normalized.items()}
     fields = ",".join(sorted({field_for_env(env) for env in normalized}))
     stamp = paper_store._now()
     with paper_store._connection(db_path, write=True) as (conn, backend):

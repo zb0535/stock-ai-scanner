@@ -76,6 +76,8 @@ class CredentialsStoreTest(unittest.TestCase):
         self.assertEqual(entry["adapter"], "kis")
         self.assertIn("app_key", entry["hint"])
         self.assertTrue(entry["hint"]["app_key"].startswith("••••"))
+        # App Secret은 끝자리도 남기지 않는다(공개 상태 API로 새지 않게).
+        self.assertEqual(entry["hint"]["app_secret"], "••••")
 
         # DB 파일 바이트 어디에도 원문이 없다(암호문만).
         with open(self.db_path, "rb") as handle:
@@ -91,6 +93,8 @@ class CredentialsStoreTest(unittest.TestCase):
         self.assertTrue(row["registered"])
         self.assertEqual(row["fields"], ["account_no", "app_key", "app_secret"])
         self.assertEqual(row["hint"]["app_key"][-4:], APP_KEY[-4:])
+        self.assertEqual(row["hint"]["app_secret"], "••••")
+        self.assertNotIn(APP_SECRET[-4:], row["hint_label"])
         self.assertEqual(row["hint_label"].count("••••"), 3)
         dumped = json.dumps(snapshot, ensure_ascii=False)
         for secret in (APP_KEY, APP_SECRET, ACCOUNT_NO):
