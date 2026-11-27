@@ -58,6 +58,19 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   상태는 `GET /`의 `kospi200_cache`(`warm`·`fresh`·`tickers`·`age_sec`·`ttl_sec`·
   `universe_source`·`prewarm_enabled`·`prewarm_running`·`prewarm_last_ok_sec`)로 확인한다.
   구성종목 목록은 `GET /api/kospi200`(`{"results","source","count"}`)으로도 볼 수 있다.
+- **메모리 보호(`memory_guard.py`, Render 무료 512MB)**: 무료 플랜은 인스턴스 메모리가
+  512MB를 넘으면 프로세스를 강제로 재시작한다(`503 hibernate-wake-error` / `502`). 2026-11-27
+  실측으로 피크의 주범은 **SEC companyfacts 원본**이었다 — 회사당 3~9MB JSON이 파싱되면
+  Python 객체로 20~40MB가 되고, 3건 동시 파싱이면 +120MB, 원본 3건을 상주시키면 +60~120MB.
+  (참고: `yf.download` 100종목은 +12MB로 작다.) 지금은 ① 원본 캐시를 1건으로 줄이고 추출
+  지표만 6시간 보관 ② SEC 동시 파싱을 2건으로 제한 ③ 16MB가 넘는 응답은 받지 않음
+  ④ 여유가 없으면 SEC 조회·스캔 청크·재무 예열을 **건너뛰고** 이미 받은 값으로 응답
+  ⑤ 프리워밍 단계 락으로 S&P 500·코스피 200의 스캔·재무 예열을 직렬화 ⑥ 무거운 스캔 청크는
+  한 번에 하나 ⑦ `_HISTORY_CACHE`·`_METRICS_CACHE`·SEC·네이버·뉴스 캐시에 상한
+  ⑧ `gc.collect()` + glibc `malloc_trim`으로 힙을 OS에 반납.
+  가드는 컨테이너 한도가 2GB 이하일 때만 켜지고(`MEM_GUARD=auto`), 로컬·큰 머신에서는
+  아무것도 막지 않는다. 지금 상태는 `GET /`의 `memory`(`rss_mb`·`peak_rss_mb`·`limit_mb`·
+  `soft_mb`·`hard_mb`·`pressure_pct`·`heavy_owner`·`prewarm_phase`·`caches`)로 바로 본다.
 - Recharts 인터랙티브 차트 및 최근 뉴스 요약
 - **웹 UI**: 모드 토글 📋 내 관심 종목 / 🌐 S&P 500 자동 발굴 / 🇰🇷 코스피 200 발굴.
   종목 검색·선택 모달에도 같은 시장 토글(**🌐 S&P 500** / **🇰🇷 코스피 200**)이 있어
@@ -258,7 +271,7 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자(두 계좌 분리·수수료·세금·환차·마이그레이션)·FCM 체결 푸시 검증, 585개)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자(두 계좌 분리·수수료·세금·환차·마이그레이션)·FCM 체결 푸시·메모리 가드(RSS/한도·슬롯 직렬화·프리워밍 단계 락·캐시 상한) 검증, 637개)
 
 ## 환경변수
 | 이름 | 설명 |
@@ -289,3 +302,10 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | 체결 푸시(FCM) 서비스 계정 JSON 문자열 전체 또는 base64(선택). 없으면 푸시만 건너뜀 |
 | `FIREBASE_CREDENTIALS_PATH` | `FIREBASE_SERVICE_ACCOUNT_JSON` 대신 쓸 서비스 계정 JSON 파일 경로(선택) |
 | `SEC_EDGAR_FALLBACK` / `FINNHUB_FALLBACK` | Yahoo `t.info` 대체 경로 스위치(기본 켜짐). `0`이면 끔 |
+| `MEM_GUARD` | 메모리 보호 모드. `auto`(기본 — 컨테이너 한도가 2GB 이하일 때만 켬) / `1`(강제) / `0`(끔) |
+| `MEM_LIMIT_MB` · `MEM_SOFT_LIMIT_MB` · `MEM_HARD_LIMIT_MB` | 컨테이너 한도 수동 지정(cgroup을 못 읽을 때) · 캐시 정리 선(기본 한도의 75%) · 새 작업 거부 선(기본 88%) |
+| `SEC_FACTS_CACHE_MAX` / `SEC_METRICS_CACHE_MAX` | SEC companyfacts **원본** 캐시 개수(기본 1) · 추출 지표 캐시(기본 400). 원본을 버려도 지표는 6시간 남아 재다운로드가 없다 |
+| `SEC_MAX_CONCURRENCY` / `SEC_MAX_FACTS_MB` | SEC 원본 동시 파싱 수(기본 2) · 응답 크기 상한(기본 16MB) |
+| `HISTORY_CACHE_MAX` / `METRICS_CACHE_MAX` | 일봉 캐시 상한(기본 720 = S&P 500 503 + 코스피 200 201 + 여유) · 지표 캐시 상한(기본 240) |
+| `NAVER_CACHE_MAX` / `NEWS_CACHE_MAX` | 네이버 금융 캐시 상한(기본 900) · 뉴스 캐시 상한(기본 200) |
+| `SP500_SCAN_NEED_MB` / `SP500_FUND_NEED_MB` / `KOSPI_FUND_NEED_MB` / `SEC_PARSE_NEED_MB` | 스캔 청크·S&P 500 재무 예열 종목·코스피 재무 예열 종목·SEC 원본 1건에 요구하는 여유(MB) |

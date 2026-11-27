@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 import stock_tools
+import memory_guard
 import scoring
 import sp500_scanner
 import kospi200_scanner
@@ -260,6 +261,37 @@ _NEWS_FETCH_LIMIT = 5
 _NEWS_CACHE: dict[str, tuple[float, float, list[str]]] = {}
 # 병렬 스크리닝에서 여러 스레드가 동시에 뉴스를 조회하므로 캐시는 락으로 보호한다.
 _NEWS_LOCK = threading.Lock()
+# S&P 500·코스피 200 스크리닝이 같은 서버에서 도는 것을 감안한 제한.
+_NEWS_MAX_ENTRIES = max(1, int(os.environ.get("NEWS_CACHE_MAX", "200")))
+
+
+def _prune_news_locked(now: float) -> int:
+    """만료된 뉴스 캐시를 지우고, 상한을 넘으면 가장 오래된 것부터 버린다(`_NEWS_LOCK` 안에서)."""
+    removed = 0
+    for key in [k for k, e in _NEWS_CACHE.items() if now - e[0] >= e[1]]:
+        _NEWS_CACHE.pop(key, None)
+        removed += 1
+    extra = len(_NEWS_CACHE) - _NEWS_MAX_ENTRIES
+    if extra > 0:
+        oldest = sorted(_NEWS_CACHE.items(), key=lambda kv: kv[1][0])[:extra]
+        for key, _entry in oldest:
+            _NEWS_CACHE.pop(key, None)
+            removed += 1
+    return removed
+
+
+def _trim_news_cache(now: float | None = None) -> int:
+    stamp = time.time() if now is None else float(now)
+    with _NEWS_LOCK:
+        return _prune_news_locked(stamp)
+
+
+def _news_cache_sizes() -> dict:
+    with _NEWS_LOCK:
+        return {"entries": len(_NEWS_CACHE), "max": _NEWS_MAX_ENTRIES}
+
+
+memory_guard.register_cache("api_news", _trim_news_cache, _news_cache_sizes)
 
 
 def _get_recent_news(ticker: str, limit: int = 3) -> list[str]:
@@ -286,6 +318,7 @@ def _get_recent_news(ticker: str, limit: int = 3) -> list[str]:
 
     with _NEWS_LOCK:
         _NEWS_CACHE[sym] = (now, _NEWS_TTL if titles else _NEWS_TTL_EMPTY, titles)
+        _prune_news_locked(now)
     return list(titles[:limit])
 
 
@@ -427,6 +460,7 @@ def health():
     return {"status": "ok", "build": (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "local",
             "finnhub": finnhub_status(),
             "storage_backend": history_store.storage_backend(),
+            "memory": memory_guard.status(),
             "sp500_cache": sp500_scanner.cache_status(),
             "sp500_fund_prewarm": sp500_scanner.fundamental_prewarm_status(),
             "kospi200_cache": kospi200_scanner.cache_status(),

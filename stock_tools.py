@@ -10,6 +10,7 @@ import pandas as pd
 import yfinance as yf
 
 import finnhub_client
+import memory_guard
 import naver_finance
 import realtime_quotes
 import sec_edgar
@@ -63,6 +64,66 @@ _METRICS_CACHE: dict[str, tuple[float, dict]] = {}
 # 살아 있어야 다음 사용자 요청이 같은 6개월 일봉을 다시 받지 않는다.
 _HISTORY_CACHE: dict[str, tuple[float, object, float]] = {}
 _CACHE_LOCK = threading.Lock()
+
+# --- 캐시 상한 (Render 512MB 보호) -------------------------------------------
+# 프리 스캔이 종목별 6개월 일봉을 캐시에 미리 넣어 두므로(`TICKER:6mo`) S&P 500 503 +
+# 코스피 200 201 = 704개까지 쌓인다. 항목 하나가 8~12KB라 700개면 6~8MB로 작지만,
+# 예전 스캔의 만료 항목이 지워지지 않고 남으면 두 배가 된다(재스캔이 겹칠 때).
+# 그래서 만료 항목을 먼저 지우고, 그래도 넘으면 가장 오래된 항목부터 버리는 상한을 둔다.
+MAX_HISTORY_ENTRIES = max(1, int(os.environ.get("HISTORY_CACHE_MAX", "720")))
+MAX_METRICS_ENTRIES = max(1, int(os.environ.get("METRICS_CACHE_MAX", "240")))
+
+
+def _prune_history_locked(now: float) -> int:
+    """만료된 일봉을 먼저 지우고, 그래도 상한을 넘으면 가장 오래된 것부터 버린다.
+
+    `_CACHE_LOCK`을 잡은 채로만 부른다(아래 두 도우미 공통).
+    """
+    removed = 0
+    for key in [k for k, e in _HISTORY_CACHE.items() if now - e[0] >= _history_ttl(e)]:
+        _HISTORY_CACHE.pop(key, None)
+        removed += 1
+    extra = len(_HISTORY_CACHE) - MAX_HISTORY_ENTRIES
+    if extra > 0:
+        oldest = sorted(_HISTORY_CACHE.items(), key=lambda kv: kv[1][0])[:extra]
+        for key, _entry in oldest:
+            _HISTORY_CACHE.pop(key, None)
+            removed += 1
+    return removed
+
+
+def _prune_metrics_locked(now: float) -> int:
+    """만료된 재무·차트 지표 결과를 지우고, 상한을 넘으면 오래된 것부터 버린다."""
+    removed = 0
+    for key in [k for k, e in _METRICS_CACHE.items() if now - e[0] >= _metrics_ttl(e[1])]:
+        _METRICS_CACHE.pop(key, None)
+        removed += 1
+    extra = len(_METRICS_CACHE) - MAX_METRICS_ENTRIES
+    if extra > 0:
+        oldest = sorted(_METRICS_CACHE.items(), key=lambda kv: kv[1][0])[:extra]
+        for key, _entry in oldest:
+            _METRICS_CACHE.pop(key, None)
+            removed += 1
+    return removed
+
+
+def trim_caches(now: float | None = None) -> dict:
+    """만료·초과 캐시 정리 — `memory_guard`가 압력이 높을 때 부른다. 반환: 지운 개수."""
+    stamp = time.time() if now is None else float(now)
+    with _CACHE_LOCK:
+        return {"history": _prune_history_locked(stamp),
+                "metrics": _prune_metrics_locked(stamp)}
+
+
+def cache_sizes(now: float | None = None) -> dict:
+    """`GET /`의 `memory.caches`용 크기 — 지우지 않고 세기만 한다."""
+    stamp = time.time() if now is None else float(now)
+    with _CACHE_LOCK:
+        total = len(_HISTORY_CACHE)
+        alive = sum(1 for e in _HISTORY_CACHE.values() if stamp - e[0] < _history_ttl(e))
+        metrics = len(_METRICS_CACHE)
+    return {"history_entries": total, "history_alive": alive, "metrics_entries": metrics,
+            "history_max": MAX_HISTORY_ENTRIES, "metrics_max": MAX_METRICS_ENTRIES}
 
 # t.info에서 뽑아 쓰는 핵심 재무 지표 (응답 키 -> yfinance info 키)
 _FIN_FIELDS = {
@@ -553,6 +614,7 @@ def get_history(ticker: str, period: str = "6mo"):
     if hist is not None and not getattr(hist, "empty", True):
         with _CACHE_LOCK:
             _HISTORY_CACHE[key] = (now, hist, HISTORY_TTL)
+            _prune_history_locked(now)   # 만료·상한 초과 정리(같은 락 안에서)
         return hist
     if cached:  # 만료됐지만 이번 조회도 실패 → 직전 성공값 사용
         return clean_history(cached[1])
@@ -590,6 +652,7 @@ def prime_history(ticker: str, hist, period: str = "6mo", ttl: float | None = No
         return False
     with _CACHE_LOCK:
         _HISTORY_CACHE[f"{sym}:{period}"] = (time.time(), slim, HISTORY_TTL if ttl is None else float(ttl))
+        _prune_history_locked(time.time())
     return True
 
 
@@ -605,6 +668,9 @@ def history_cache_status() -> dict:
 def clear_history_cache() -> None:
     with _CACHE_LOCK:
         _HISTORY_CACHE.clear()
+
+
+memory_guard.register_cache("stock_tools", trim_caches, cache_sizes)
 
 
 def _fetch_info(sym: str):
@@ -920,6 +986,7 @@ def get_stock_metrics(ticker: str) -> dict:
 
     with _CACHE_LOCK:
         _METRICS_CACHE[sym] = (now, payload)
+        _prune_metrics_locked(now)
     return dict(payload)
 
 

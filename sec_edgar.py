@@ -17,13 +17,18 @@ XBRL 원본은 "기간(start~end)" 단위 값 목록이라 TTM(최근 12개월)�
 - 최신 값이 연간(10-K)이면 그 값이 곧 TTM이다.
 외국 ADR(예: TSM)처럼 US-GAAP 태그가 없는 회사는 조용히 None을 돌려준다.
 """
+import gc
+import json
 import logging
 import math
+import os
 import threading
 import time
 from datetime import date
 
 import requests
+
+import memory_guard
 
 logger = logging.getLogger("sec_edgar")
 
@@ -39,6 +44,20 @@ TICKERS_TTL = 24 * 3600       # 티커 목록은 하루에 한 번만 받는다
 FACTS_TTL = 6 * 3600          # 기업 재무 원본은 공시 때만 바뀐다
 FACTS_ERROR_TTL = 3600        # 실패(404/빈 응답)는 1시간 동안 기억해 재요청 폭주를 막는다
 
+# --- 메모리 보호 (Render 512MB) ----------------------------------------------
+# companyfacts 원본은 회사 하나가 3~8MB JSON이고, 파싱하면 Python 객체로 20~40MB가 된다
+# (2026-11-27 로컬 측정: AAPL 3.9MB → +17MB, JPM·BAC·XOM 3건 동시 파싱 → +123MB).
+# 그래서 (1) 원본을 오래 들고 있지 않고(기본 1건), (2) 동시 파싱을 2건으로 줄이고,
+# (3) 너무 큰 응답은 받지 않는다. 추출한 지표(수백 바이트)는 6시간 캐시해서
+# 원본을 버려도 다시 받지 않는다.
+MAX_FACTS_CACHE = max(0, int(os.environ.get("SEC_FACTS_CACHE_MAX", "1")))
+MAX_RAW_METRICS = max(0, int(os.environ.get("SEC_METRICS_CACHE_MAX", "400")))
+SEC_MAX_FACTS_MB = float(os.environ.get("SEC_MAX_FACTS_MB", "16"))
+MAX_FACTS_BYTES = int(max(1.0, SEC_MAX_FACTS_MB) * 1024 * 1024)
+# 원본 1건을 받아 파싱하는 데 필요한 여유(측정 17~40MB). 없으면 SEC를 건너뛰고
+# 이미 받은 Yahoo·Finnhub 값을 그대로 쓴다(스크리닝은 계속된다).
+SEC_PARSE_NEED_MB = float(os.environ.get("SEC_PARSE_NEED_MB", "40"))
+
 # --- 캐시 -------------------------------------------------------------------
 _TICKERS: dict[str, str] = {}
 _TICKERS_AT = 0.0
@@ -50,15 +69,14 @@ _TICKERS_LOCK = threading.Lock()
 # 뽑아낸 지표(수백 바이트)다.
 _FACTS_CACHE: dict[str, tuple[float, float, dict | None]] = {}
 _FACTS_LOCK = threading.Lock()
-MAX_FACTS_CACHE = 3
 
 # cik10 -> (저장 시각, 유지 시간, extract_metrics 결과)
 _RAW_METRICS_CACHE: dict[str, tuple[float, float, dict]] = {}
 _RAW_METRICS_LOCK = threading.Lock()
 
-# companyfacts는 한 건이 수~수십 MB다. 6개 종목을 동시에 파싱하면 메모리 피크가 커지므로
-# 동시에 처리하는 기업 수를 제한한다(스크리닝 속도는 유지).
-SEC_MAX_CONCURRENCY = 3
+# companyfacts는 한 건이 3~8MB(파싱 후 20~40MB)이다. 동시에 2건까지만 파싱해
+# Render 512MB에서 피크가 두 배로 튀지 않게 한다(예전 3).
+SEC_MAX_CONCURRENCY = max(1, int(os.environ.get("SEC_MAX_CONCURRENCY", "2")))
 _SEC_SLOTS = threading.BoundedSemaphore(SEC_MAX_CONCURRENCY)
 
 _THROTTLE_LOCK = threading.Lock()
@@ -95,10 +113,29 @@ def _throttle() -> None:
         _LAST_REQUEST_AT = time.time()
 
 
+def _read_limited(resp: requests.Response, max_bytes: int) -> bytes:
+    """응답 본문을 `max_bytes`까지만 읽는다(넘으면 ValueError).
+
+    companyfacts는 회사 규모에 따라 3~8MB이고, 파싱하면 그 몇 배가 메모리에 남는다.
+    한도를 넘는 응답은 받지 않고 실패로 처리해(1시간 기억) 프로세스를 지킨다.
+    """
+    declared = (resp.headers.get("Content-Length") or "").strip()
+    if declared.isdigit() and int(declared) > max_bytes:
+        raise ValueError(f"응답이 큼(Content-Length {int(declared) / 1e6:.1f}MB > {max_bytes / 1e6:.0f}MB)")
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=256 * 1024):
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"응답이 큼({total / 1e6:.1f}MB > {max_bytes / 1e6:.0f}MB)")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _http_get_json(url: str) -> dict:
     """SEC JSON을 받아온다. 테스트에서는 이 함수만 바꿔 끼우면 네트워크가 필요 없다."""
     _throttle()
-    resp = requests.get(
+    with requests.get(
         url,
         headers={
             "User-Agent": USER_AGENT,
@@ -106,9 +143,11 @@ def _http_get_json(url: str) -> dict:
             "Accept-Encoding": "gzip, deflate",
         },
         timeout=REQUEST_TIMEOUT,
-    )
-    resp.raise_for_status()
-    return resp.json()
+        stream=True,
+    ) as resp:
+        resp.raise_for_status()
+        body = _read_limited(resp, MAX_FACTS_BYTES)
+    return json.loads(body)
 
 
 # --- 티커 -> CIK -------------------------------------------------------------
@@ -206,17 +245,70 @@ def _get_raw_metrics(cik: str) -> dict | None:
         if cached and now - cached[0] < cached[1]:
             return cached[2]
 
-    # 다운로드·JSON 파싱·지표 계산까지 동시 3건으로 묶아 메모리 피크를 잡는다.
+    # 메모리 여유가 없으면 원본을 받지 않는다(Yahoo·Finnhub 값으로 스크리닝은 계속된다).
+    if not memory_guard.headroom(SEC_PARSE_NEED_MB, wait=2.0):
+        return None
+
+    # 다운로드·JSON 파싱·지표 계산까지 동시 SEC_MAX_CONCURRENCY(기본 2)건으로 묶아
+    # 512MB 환경에서 피크가 튀지 않게 한다.
     with _SEC_SLOTS:
         facts = get_company_facts(cik)
         if not facts:
             return None
         raw = extract_metrics(facts)
+        if MAX_FACTS_CACHE <= 0:            # 원본을 들고 있지 않는 모드 — 파싱 직후 버린다
+            with _FACTS_LOCK:
+                _FACTS_CACHE.pop(cik, None)
+            facts = None
     # 모든 값이 비었으면(외국 ADR 등) 1시간만 기억해 다음 공시를 놓치지 않게 한다.
     ttl = FACTS_TTL if any(v is not None for v in raw.values()) else FACTS_ERROR_TTL
     with _RAW_METRICS_LOCK:
         _RAW_METRICS_CACHE[cik] = (now, ttl, raw)
+        _prune_metrics_locked(now)
+    memory_guard.collect("sec_facts")   # 압력이 높으면 캐시 정리, 아니면 gc만
     return raw
+
+
+def _prune_metrics_locked(now: float) -> int:
+    """만료된 지표를 지우고, 상한을 넘으면 오래된 것부터 버린다(`_RAW_METRICS_LOCK` 안에서)."""
+    removed = 0
+    for key in [k for k, e in _RAW_METRICS_CACHE.items() if now - e[0] >= e[1]]:
+        _RAW_METRICS_CACHE.pop(key, None)
+        removed += 1
+    extra = len(_RAW_METRICS_CACHE) - MAX_RAW_METRICS
+    if extra > 0:
+        oldest = sorted(_RAW_METRICS_CACHE.items(), key=lambda kv: kv[1][0])[:extra]
+        for key, _entry in oldest:
+            _RAW_METRICS_CACHE.pop(key, None)
+            removed += 1
+    return removed
+
+
+def trim_caches(now: float | None = None) -> dict:
+    """만료된 원본·지표 캐시 정리(`memory_guard`가 압력이 높을 때 부른다).
+
+    압력이 높은 상황이므로 **만료되지 않은 원본 facts도 버린다** — 원본은 다시 받을 수 있고
+    (추출한 지표는 6시간 캐시로 남아 재다운로드가 없다), 지금 메모리를 가장 많이 쓰는 객체다.
+    """
+    stamp = time.time() if now is None else float(now)
+    with _FACTS_LOCK:
+        removed_facts = len(_FACTS_CACHE)
+        _FACTS_CACHE.clear()
+    with _RAW_METRICS_LOCK:
+        removed_metrics = _prune_metrics_locked(stamp)
+    gc.collect()
+    return {"facts": removed_facts, "metrics": removed_metrics}
+
+
+def cache_sizes() -> dict:
+    """`GET /`의 `memory.caches`용 크기 — 원본은 개수, 지표는 개수만 노출한다."""
+    with _FACTS_LOCK:
+        facts = len(_FACTS_CACHE)
+    with _RAW_METRICS_LOCK:
+        metrics = len(_RAW_METRICS_CACHE)
+    return {"facts": facts, "metrics": metrics,
+            "facts_max": MAX_FACTS_CACHE, "metrics_max": MAX_RAW_METRICS,
+            "concurrency": SEC_MAX_CONCURRENCY}
 
 
 # --- XBRL 파싱 도우미 --------------------------------------------------------
@@ -585,3 +677,6 @@ def clear_cache() -> None:
         _RAW_METRICS_CACHE.clear()
     with _THROTTLE_LOCK:
         _LAST_REQUEST_AT = 0.0
+
+
+memory_guard.register_cache("sec_edgar", trim_caches, cache_sizes)

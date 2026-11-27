@@ -21,6 +21,9 @@
   맞는 일이 없다(사용자는 2분이 아니라 몇 초 만에 응답). `SP500_PREWARM=0`으로 끈다.
 - **끊겨도 죽지 않는다**: 종목 리스트는 Wikipedia(짧은 타임아웃) → 실패 시 내장 폴백 목록,
   개별 종목 데이터가 없거나 NaN이어도 그 종목만 건너뛴다.
+- **메모리 여유가 없으면 멈춘다**: `memory_guard`가 청크 사이에 RSS와 한도를 보고
+  (512MB 컨테이너에서만 작동), 여유가 없으면 스캔을 중단하고 직전 스냅샷을 유지한다.
+  무거운 청크는 슬롯 1칸으로 직렬화해 다른 시장 스캔·사용자 요청과 겹치지 않는다.
 """
 import gc
 import io
@@ -36,6 +39,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+import memory_guard
 import scoring
 import stock_tools
 
@@ -53,6 +57,13 @@ CHUNK_SIZE = 100            # 한 번에 받는 종목 수 (메모리 상한)
 TOP_N = 15                  # Gemini에 넘길 후보 수
 MIN_BARS = 35               # 이보다 짧은 이력은 지표가 비어 후보에서 제외
 DOWNLOAD_TIMEOUT = 25       # 청크 하나의 yfinance 타임아웃(초)
+
+# 메모리 보호(Render 512MB): 청크 하나를 받고 지표를 계산하는 데 필요한 여유와,
+# SEC companyfacts 원본 1건을 파싱할 때 필요한 여유. `memory_guard`가 이 값으로
+# "지금 이 작업을 시작해도 되는가"를 판단하고, 아니면 이번 청크·종목을 건너뛴다.
+# (측정: 100종목 yf.download는 +12MB, SEC 원본 1건 파싱은 +17~40MB)
+SCAN_NEED_MB = float(os.environ.get("SP500_SCAN_NEED_MB", "40"))
+FUND_TICKER_NEED_MB = float(os.environ.get("SP500_FUND_NEED_MB", "30"))
 # 프리 스캔이 받은 6개월 일봉을 히스토리 캐시에 넣어 둘 때의 유지 시간 —
 # 스냅샷(PRESCAN_TTL 70분)과 같게 둔다. 그러면 스냅샷이 살아 있는 동안
 # `get_stock_metrics`·`_attach_chart`는 같은 일봉을 **다시 받지 않는다**.
@@ -351,27 +362,41 @@ def scan_rows(symbols: list[str], label: str = "프리 스캔") -> dict:
     다음 단계(15종목 `get_stock_metrics`·`_attach_chart`)가 같은 일봉을 다시 받으러
     Yahoo를 부르던 낭비(종목당 수 초)를 없앤다. 캐시에는 차트에 쓰는 기둥만 담는다.
 
-    반환: `{"rows", "universe", "skipped"}`
+    반환: `{"rows", "universe", "skipped", "stopped_for_memory"}` — `stopped_for_memory`는
+    메모리 여유가 없어 남은 청크를 건너뛰었는지(이때 rows는 부분 결과다).
     """
     rows: list[dict] = []
     skipped: list[str] = []
     primed = 0
+    stopped_for_memory = False
     for chunk in _chunks(list(symbols)):
-        batch = _download_batch(chunk)
-        for sym in chunk:
-            frame = _clean_frame(_sub_frame(batch, sym))
-            row = _row_from_frame(sym, frame)
-            if row is None:
-                skipped.append(sym)
-                continue
-            rows.append(row)
-            if stock_tools.prime_history(sym, frame, "6mo", ttl=HISTORY_PRIME_TTL):
-                primed += 1
-        del batch
-        gc.collect()  # 청크 DataFrame을 바로 버려 RSS를 낮게 유지한다
-    logger.info("%s: %d/%d 종목 지표 산출(건너뜀 %d, 일봉 캐시 적재 %d)",
-                label, len(rows), len(symbols), len(skipped), primed)
-    return {"rows": rows, "universe": len(symbols), "skipped": len(skipped)}
+        # 무거운 슬롯(기본 1칸): 다른 시장 스캔·사용자 요청과 청크가 겹쳐
+        # 메모리 피크가 두 배가 되지 않게 한다. 여유가 없으면 이번 스캔을 중단한다.
+        with memory_guard.heavy_slot("scan", need_mb=SCAN_NEED_MB, wait=5.0) as proceed:
+            if not proceed:
+                stopped_for_memory = True
+                break
+            batch = _download_batch(chunk)
+            for sym in chunk:
+                frame = _clean_frame(_sub_frame(batch, sym))
+                row = _row_from_frame(sym, frame)
+                if row is None:
+                    skipped.append(sym)
+                    continue
+                rows.append(row)
+                if stock_tools.prime_history(sym, frame, "6mo", ttl=HISTORY_PRIME_TTL):
+                    primed += 1
+            del batch
+            gc.collect()  # 청크 DataFrame을 바로 버려 RSS를 낮게 유지한다
+    if stopped_for_memory:
+        logger.warning("%s: 메모리 여유 부족으로 %d/%d종목에서 중단(다음 주기에 다시)",
+                       label, len(rows), len(symbols))
+    memory_guard.collect("%s 완료" % label)
+    logger.info("%s: %d/%d 종목 지표 산출(건너뜀 %d, 일봉 캐시 적재 %d%s)",
+                label, len(rows), len(symbols), len(skipped), primed,
+                ", 메모리로 중단" if stopped_for_memory else "")
+    return {"rows": rows, "universe": len(symbols), "skipped": len(skipped),
+            "stopped_for_memory": stopped_for_memory}
 
 
 def is_scanning() -> bool:
@@ -509,17 +534,31 @@ def _warm_candidate_metrics(rows: list[dict]) -> dict:
 
     pending = [t for t in targets if not stock_tools.has_metrics(t)][:FUND_PREWARM_LIMIT]
     warmed = 0
+    skipped_for_memory = 0
     if pending:
+        def _one(ticker: str) -> bool:
+            """한 종목 지표를 미리 받는다. 메모리 여유가 없으면 건너뛴다(다음 주기에 다시)."""
+            if not memory_guard.headroom(FUND_TICKER_NEED_MB, wait=3.0):
+                return False
+            stock_tools.get_stock_metrics(ticker)
+            return True
+
         try:
             with ThreadPoolExecutor(max_workers=min(FUND_PREWARM_WORKERS, len(pending)),
                                     thread_name_prefix="sp500-warm") as pool:
-                for _ in pool.map(stock_tools.get_stock_metrics, pending):
-                    warmed += 1
+                for done in pool.map(_one, pending):
+                    if done:
+                        warmed += 1
+                    else:
+                        skipped_for_memory += 1
         except Exception as exc:  # 예열 실패가 예열 루프를 죽이지 않는다
             logger.warning("S&P 500 재무 예열 실패: %s: %s", type(exc).__name__, str(exc)[:120])
+    memory_guard.collect("sp500 재무 예열")
     elapsed = round(time.time() - started, 1)
-    logger.info("S&P 500 재무 예열: 대상 %d종목 중 %d종목 새로 받음 %.1fs", len(pending), warmed, elapsed)
-    return {"targets": len(targets), "warmed": warmed, "elapsed_sec": elapsed}
+    logger.info("S&P 500 재무 예열: 대상 %d종목 중 %d종목 새로 받음 %.1fs%s", len(pending), warmed,
+                elapsed, f" (메모리로 {skipped_for_memory}종목 건너뜀)" if skipped_for_memory else "")
+    return {"targets": len(targets), "warmed": warmed, "elapsed_sec": elapsed,
+            "skipped_for_memory": skipped_for_memory}
 
 
 def _start_metric_prewarm(rows: list[dict]) -> bool:
@@ -534,10 +573,13 @@ def _start_metric_prewarm(rows: list[dict]) -> bool:
             return False
 
         def _run() -> None:
-            try:
-                _FUND_PREWARM_STATE["warmed"] = _warm_candidate_metrics(list(rows))["warmed"]
-            finally:
-                _FUND_PREWARM_STATE["last"] = time.time()
+            # 재무 예열(SEC companyfacts 파싱)은 다른 시장의 스캔·재무 예열과 겹치지 않게
+            # 단계 락 안에서 돌린다 — 기동 직후 메모리 피크의 주범이었다.
+            with memory_guard.prewarm_phase("sp500-fund"):
+                try:
+                    _FUND_PREWARM_STATE["warmed"] = _warm_candidate_metrics(list(rows))["warmed"]
+                finally:
+                    _FUND_PREWARM_STATE["last"] = time.time()
 
         worker = threading.Thread(target=_run, name="sp500-fund-prewarm", daemon=True)
         _FUND_PREWARM_STATE["thread"] = worker
@@ -586,7 +628,9 @@ def prewarm_once(max_age: float | None = None) -> dict:
     try:
         # force가 아니라 max_age로 부른다: 사용자 요청이 스캔 중이면 _SCAN_LOCK 뒤 재검사에서
         # "방금 채워짐"으로 판정돼 500종목을 두 번 받지 않는다.
-        result = prescan(max_age=limit)
+        # 단계 락: 코스피 200 스캔·재무 예열과 동시에 돌지 않게 한다(Render 512MB).
+        with memory_guard.prewarm_phase("sp500-scan"):
+            result = prescan(max_age=limit)
     except Exception as exc:  # 예열 실패가 스레드·서버를 죽이지 않게
         error = f"{type(exc).__name__}: {str(exc)[:160]}"
         tickers = cache_status()["tickers"]
@@ -609,6 +653,7 @@ def prewarm_once(max_age: float | None = None) -> dict:
         logger.info("S&P 500 예열 완료: %d종목 캐시=%s %.1fs",
                     len(rows), result.get("cached"), elapsed)
         _start_metric_prewarm(rows)   # 후보 재무를 백그라운드로 미리 받아 둔다
+        memory_guard.collect("sp500 예열")
     else:
         logger.warning("S&P 500 예열 실패 → 직전 스냅샷(%d종목) 유지", len(rows))
     return {"ok": ok, "scanned": not result.get("cached"), "tickers": len(rows),

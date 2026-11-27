@@ -35,6 +35,7 @@ yfinance는 `.KS`/`.KQ` 종목의 시세·차트는 잘 주지만, Render 같은
 """
 import logging
 import math
+import os
 import re
 import statistics
 import threading
@@ -43,6 +44,8 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+
+import memory_guard
 
 logger = logging.getLogger("naver_finance")
 
@@ -94,6 +97,24 @@ _MARKET_SUFFIX = {"KOSPI": ".KS", "KOSDAQ": ".KQ"}
 _MISS = object()
 _CACHE: dict[str, tuple[float, object]] = {}
 _CACHE_LOCK = threading.Lock()
+# 코스피 200(201종목) × 조회 종류(해석·재무·업종) 정도만 남긴다 — Render 512MB에서
+# 장수 프로세스가 오래된 항목을 무한정 쥐고 있지 않게 상한을 둔다.
+MAX_CACHE_ENTRIES = max(1, int(os.environ.get("NAVER_CACHE_MAX", "900")))
+
+
+def _prune_locked(now: float) -> int:
+    """만료된 항목을 지우고, 상한을 넘으면 가장 오래 쓰이지 않은(만료 시각이 이른) 것부터 버린다."""
+    removed = 0
+    for key in [k for k, item in _CACHE.items() if item[0] <= now]:
+        _CACHE.pop(key, None)
+        removed += 1
+    extra = len(_CACHE) - MAX_CACHE_ENTRIES
+    if extra > 0:
+        oldest = sorted(_CACHE.items(), key=lambda kv: kv[1][0])[:extra]
+        for key, _item in oldest:
+            _CACHE.pop(key, None)
+            removed += 1
+    return removed
 
 
 def _cache_get(key: str):
@@ -105,14 +126,31 @@ def _cache_get(key: str):
 
 
 def _cache_put(key: str, value, ttl: float) -> None:
+    now = time.time()
     with _CACHE_LOCK:
-        _CACHE[key] = (time.time() + ttl, value)
+        _CACHE[key] = (now + ttl, value)
+        _prune_locked(now)
+
+
+def trim_caches(now: float | None = None) -> dict:
+    """만료·초과 캐시 정리(`memory_guard`가 압력이 높을 때 부른다)."""
+    stamp = time.time() if now is None else float(now)
+    with _CACHE_LOCK:
+        return {"entries": _prune_locked(stamp)}
+
+
+def cache_sizes() -> dict:
+    with _CACHE_LOCK:
+        return {"entries": len(_CACHE), "max": MAX_CACHE_ENTRIES}
 
 
 def clear_cache() -> None:
     """테스트·수동 초기화용 캐시 비우기."""
     with _CACHE_LOCK:
         _CACHE.clear()
+
+
+memory_guard.register_cache("naver_finance", trim_caches, cache_sizes)
 
 
 # 업종별 계산은 한 번만: 같은 업종 종목이 병렬로 들어와도 이웃 PER을 중복 조회하지 않는다.
