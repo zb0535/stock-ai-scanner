@@ -21,6 +21,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import fcm  # noqa: E402
+import paper_auth  # noqa: E402
 import paper_store  # noqa: E402
 import paper_trading  # noqa: E402
 
@@ -28,6 +29,13 @@ try:
     from fastapi.testclient import TestClient
 except ImportError:  # pragma: no cover
     TestClient = None
+
+
+def admin_headers(db_path=None):
+    """기본 관리자(user 1) 세션 토큰 헤더 — 보호된 API는 토큰 없는 요청을 401로 막는다."""
+    user = paper_auth.ensure_admin(db_path)
+    token, _ = paper_auth.sign_token(user, db_path)
+    return {"X-Paper-User-Token": token}
 
 
 def us(ticker, price=100.0, score=80.0, name=""):
@@ -314,6 +322,7 @@ class FcmEndpointCase(unittest.TestCase):
         self.addCleanup(fcm.reset_init)
         import api
         self.client = TestClient(api.app)
+        self.client.headers.update(admin_headers(self.db_path))
 
     def test_register_and_unregister_endpoints(self):
         response = self.client.post("/api/paper/fcm/register",

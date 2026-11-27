@@ -2,6 +2,10 @@ import { useCallback, useEffect, useState } from "react";
 
 const API_BASE = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/+$/, "");
 
+// 모의투자 세션 토큰 — 브로커 API도 로그인 토큰이 있어야 통과한다(토큰 없으면 서버가 401).
+const authHeaders = (session) =>
+  session?.token ? { "X-Paper-User-Token": session.token } : {};
+
 const won = (value) => {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
   return `₩${Math.round(Number(value)).toLocaleString("ko-KR")}`;
@@ -53,7 +57,7 @@ export function RealAccountCard({ broker, onOpen }) {
   );
 }
 
-export function RealAccountModal({ status, onClose, onChanged }) {
+export function RealAccountModal({ status, session, onClose, onChanged }) {
   const [adapter, setAdapter] = useState("kis");
   const [form, setForm] = useState({ app_key: "", app_secret: "", account_no: "", token: "" });
   const [agree, setAgree] = useState(false);
@@ -64,7 +68,7 @@ export function RealAccountModal({ status, onClose, onChanged }) {
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/broker/status`);
+      const res = await fetch(`${API_BASE}/api/broker/status`, { headers: authHeaders(session) });
       if (!res.ok) throw new Error(`상태를 불러오지 못했습니다 (${res.status})`);
       const body = await res.json();
       setLive(body);
@@ -72,7 +76,7 @@ export function RealAccountModal({ status, onClose, onChanged }) {
     } catch (err) {
       setError(err.message);
     }
-  }, [onChanged]);
+  }, [onChanged, session]);
 
   useEffect(() => {
     load();
@@ -98,7 +102,7 @@ export function RealAccountModal({ status, onClose, onChanged }) {
     setError("");
     setNotice("");
     try {
-      const headers = { "Content-Type": "application/json" };
+      const headers = { "Content-Type": "application/json", ...authHeaders(session) };
       if (needsToken && form.token.trim()) headers["X-Broker-Token"] = form.token.trim();
       const res = await fetch(`${API_BASE}/api/broker/credentials`, {
         method: "POST",
@@ -137,7 +141,7 @@ export function RealAccountModal({ status, onClose, onChanged }) {
     setError("");
     setNotice("");
     try {
-      const headers = {};
+      const headers = { ...authHeaders(session) };
       if (needsToken && form.token.trim()) headers["X-Broker-Token"] = form.token.trim();
       const res = await fetch(`${API_BASE}/api/broker/credentials/${adapter}`, {
         method: "DELETE",

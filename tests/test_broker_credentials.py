@@ -25,6 +25,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import broker_credentials  # noqa: E402
+import paper_auth  # noqa: E402
 import paper_store  # noqa: E402
 
 try:
@@ -216,6 +217,10 @@ class CredentialsApiTest(unittest.TestCase):
     def setUp(self):
         broker_credentials.delete("kis")
         broker_credentials.delete("toss")
+        # 보호된 API는 토큰 필수 — 관리자(user 1) 토큰을 기본 헤더로 싣는다.
+        user = paper_auth.ensure_admin(self.db_path)
+        token, _ = paper_auth.sign_token(user, self.db_path)
+        self.client.headers.update({"X-Paper-User-Token": token})
 
     def test_register_requires_confirm_risk(self):
         res = self.client.post("/api/broker/credentials", json={
@@ -279,7 +284,11 @@ class CredentialsApiTest(unittest.TestCase):
         self.assertIn("broker_credentials", body)
         for secret in (APP_KEY, APP_SECRET, ACCOUNT_NO):
             self.assertNotIn(secret, res.text)
-        self.assertFalse(body["broker_credentials"]["adapters"].get("kis", False))
+        # 헬스 첵은 누구나 볼 수 있으므로 등록 건수만 — 어댑터별 설정·키 잠금 방식·주문 원장 경로는 없다.
+        self.assertEqual(body["broker_credentials"]["registered_count"], 0)
+        self.assertNotIn("adapters", body["broker_credentials"])
+        self.assertNotIn("state_path", res.text)
+        self.assertNotIn("key_source", res.text)
 
 
 if __name__ == "__main__":

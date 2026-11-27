@@ -1086,13 +1086,24 @@ def register_fcm_token(token: str, platform: str = "android",
     return payload
 
 
-def remove_fcm_token(token: str, db_path: str | None = None) -> int:
-    """토큰 하나를 지운다(알림 끄기·만료 정리). 지운 행 수를 돌려준다."""
+def remove_fcm_token(token: str, db_path: str | None = None,
+                     user_id: int | None = None) -> int:
+    """토큰 하나를 지운다(알림 끄기·만료 정리). 지운 행 수를 돌려준다.
+
+    `user_id`를 주면 그 유저 소유의 행만 지운다 — 로그인한 유저가 남의 기기 알림을
+    꺼 버리지 못하게 하는 방어다. 정리 루프는 `user_id=None`으로 소유자와 무관하게 지운다.
+    """
     clean = str(token or "").strip()
     if not clean:
         return 0
     with _connection(db_path, write=True) as (conn, backend):
-        cur = conn.execute(_sql(f"DELETE FROM {TABLE_FCM_TOKENS} WHERE token = ?", backend), (clean,))
+        if user_id is None:
+            cur = conn.execute(_sql(f"DELETE FROM {TABLE_FCM_TOKENS} WHERE token = ?", backend),
+                               (clean,))
+        else:
+            cur = conn.execute(_sql(
+                f"DELETE FROM {TABLE_FCM_TOKENS} WHERE token = ? AND user_id = ?", backend),
+                (clean, int(user_id)))
         return int(getattr(cur, "rowcount", 0) or 0)
 
 

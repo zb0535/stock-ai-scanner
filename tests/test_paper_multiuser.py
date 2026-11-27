@@ -7,13 +7,14 @@
 3. 토큰(`X-Paper-User-Token`)으로 계좌가 분리된다 — 다른 유저의 계좌·체결이 보이지 않고,
    설정·매매도 자기 계좌에만 적용된다. 토큰이 틀리면 401.
 4. `GET /api/paper/leaderboard`: 모든 유저의 합산 수익률 순위, PIN·토큰은 응답에 없다.
-5. 실제 계좌(브로커) API는 지인(비관리자) 토큰에 403, 관리자·무토큰(구 클라이언트)은 허용.
-6. FCM 기기 토큰은 유저별로 분리된다.
+5. 실제 계좌(브로커) API는 지인(비관리자) 토큰에 403, 토큰이 없으면 401, 관리자만 200.
+6. FCM 기기 토큰은 유저별로 분리된다(남의 기기 토큰은 지울 수 없다).
 7. 자동 실행이 지인 계좌까지 돌고, 같은 전략의 후보는 한 번만 수집한다.
 
 실행: python -m pytest tests/test_paper_multiuser.py -q
 """
 
+import json
 import os
 import sqlite3
 import sys
@@ -498,17 +499,20 @@ class ApiSurfaceTests(MultiUserCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(self.client.delete("/api/broker/credentials/kis",
                                             headers=headers).status_code, 403)
-        # 토큰이 없는 구 클라이언트는 예전처럼 허용(하위 호환)
-        self.assertEqual(self.client.get("/api/broker/status").status_code, 200)
+        # 토큰이 없는 요청은 401 — 예전 기본 관리자 폴백은 없다(2026-11-27 차단).
+        self.assertEqual(self.client.get("/api/broker/status").status_code, 401)
 
     def test_leaderboard_endpoint(self):
-        self.auth("민수")
-        response = self.client.get("/api/paper/leaderboard")
+        token = self.auth("민수").json()["token"]
+        response = self.client.get("/api/paper/leaderboard",
+                                   headers={"X-Paper-User-Token": token})
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertTrue(body["ok"])
         self.assertGreaterEqual(body["count"], 2)
         self.assertTrue(all("rank" in row for row in body["rows"]))
+        self.assertNotIn("token", json.dumps(body))
+        self.assertNotIn("pin", json.dumps(body))
 
     def test_fcm_register_is_per_user(self):
         token = self.auth("민수").json()["token"]
@@ -517,8 +521,19 @@ class ApiSurfaceTests(MultiUserCase):
                                     json={"token": "device-min"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["tokens"], 1)
-        admin = self.client.get("/api/paper/fcm/status").json()
+        admin_user = paper_auth.ensure_admin(self.db_path)
+        admin_token, _ = paper_auth.sign_token(admin_user, self.db_path)
+        admin = self.client.get("/api/paper/fcm/status",
+                                headers={"X-Paper-User-Token": admin_token}).json()
         self.assertEqual(admin["tokens"], 0)
+        # 남의 기기 토큰은 지울 수 없다(지워진 행 0).
+        removed = self.client.delete("/api/paper/fcm/register?token=device-min",
+                                     headers={"X-Paper-User-Token": admin_token})
+        self.assertEqual(removed.status_code, 200)
+        self.assertEqual(removed.json()["removed"], 0)
+        self.assertEqual(paper_store.count_fcm_tokens(user_id=admin_user["id"], db_path=self.db_path), 0)
+        minsoo = paper_auth.get_user_by_nickname("민수", self.db_path)
+        self.assertEqual(paper_store.count_fcm_tokens(user_id=minsoo["id"], db_path=self.db_path), 1)
 
 
 if __name__ == "__main__":

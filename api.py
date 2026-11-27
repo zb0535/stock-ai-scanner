@@ -449,6 +449,32 @@ def analysis_cache_status() -> dict:
             "ttl_sec": ANALYSIS_CACHE_TTL, "fallback_ttl_sec": ANALYSIS_FALLBACK_TTL}
 
 
+def _health_broker() -> dict:
+    """`GET /`용 브로커 요약 — 모드·킬 스위치만. 어댑터별 설정·주문 원장 경로는 공개하지 않는다."""
+    try:
+        summary = broker.broker_summary()
+    except Exception as exc:  # 헬스 체크는 어떤 경우에도 200으로 돌아와야 한다
+        logger.warning("헬스 브로커 요약 실패: %s: %s", type(exc).__name__, str(exc)[:120])
+        return {"mode": "paper", "live": False, "real_trading_enabled": False, "dry_run": True}
+    return {"mode": summary.get("mode"), "live": bool(summary.get("live")),
+            "real_trading_enabled": bool(summary.get("real_trading_enabled")),
+            "dry_run": bool(summary.get("dry_run"))}
+
+
+def _health_broker_credentials() -> dict:
+    """`GET /`용 증권사 키 등록 요약 — 등록 건수만(암호화 방식·키 출처·잠금 방식은 공개 금지)."""
+    snapshot = broker_credentials.summary_for_health()
+    return {"registered_count": int(snapshot.get("registered_count") or 0),
+            "error": snapshot.get("error") or ""}
+
+
+def _health_fcm() -> dict:
+    """`GET /`용 푸시 요약 — 설정 여부와 등록 기기 수만(프로젝트·채널·자격 증명 출처는 비공개)."""
+    snapshot = fcm.status()
+    return {"configured": bool(snapshot.get("configured")),
+            "tokens": snapshot.get("tokens")}
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
     """헬스 체크. UptimeRobot 무료 모니터는 HEAD로 찔러오므로 HEAD에도 200을 준다.
@@ -461,8 +487,9 @@ def health():
     전역 우회 상태와 프리 스캔이 미리 적재한 일봉 캐시 개수다. 이 응답은 스캔 중에도 즉시
     돌아온다 — 락은 dict 복사 순간만 잡는다.
     `paper_auto`는 AI 모의투자 자동 실행 상태, `broker`는 지금 주문이 어느 브로커
-    어댑터로 나가는지(모드·실계좌 여부·킬 스위치·1회/1일 한도·어댑터별 키 설정 여부)를
-    요약한다 — 키 본문은 응답에 없다.
+    어댑터로 나가는지(모드·킬 스위치)만 요약한다. 이 응답은 로그인 없이 누구나 볼 수 있으므로
+    증권사 키·계좌·자격 증명·서버 내부 경로는 담지 않는다(`broker_credentials`는 등록 건수,
+    `fcm`은 설정 여부·기기 수만).
     """
     return {"status": "ok", "build": (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "local",
             "finnhub": finnhub_status(),
@@ -478,9 +505,9 @@ def health():
                          "ttl_sec": realtime_quotes.REALTIME_TTL},
             "extended_quotes": extended_quotes.status(),
             "paper_auto": paper_trading.auto_status(),
-            "broker": broker.broker_summary(),
-            "broker_credentials": broker_credentials.summary_for_health(),
-            "fcm": fcm.status(),
+            "broker": _health_broker(),
+            "broker_credentials": _health_broker_credentials(),
+            "fcm": _health_fcm(),
             "yahoo_guard": _yahoo_guard(),
             "errors_recent": recent_errors()}
 
@@ -1169,15 +1196,20 @@ def _paper_ai_call(prompt: str) -> str | None:
 
 
 # --- 닉네임 + 4자리 PIN 인증 --------------------------------------------------
-# 토큰(`X-Paper-User-Token`)이 있으면 그 유저의 계좌만 읽고 쓴다. 헤더가 없으면 예전
-# 클라이언트(앱 v2.10 이하·기존 웹)를 위해 기본 관리자(user 1 = 현우님 계좌)로 동작한다.
+# 모든 모의투자·브로커 API는 `X-Paper-User-Token`(닉네임 + PIN 로그인이 발급한 서명 토큰)으로만
+# 통과한다. 토큰이 없는 요청은 **401**이다 — 2026-11-27 이전에는 헤더가 없으면 기본 관리자
+# (user 1 = 현우님 계좌)로 폴백했는데, 그 구멍으로 누구나 현우님 계좌를 읽고 매매·리셋·키 등록을
+# 할 수 있었다. 구버전 앱(v2.10 이하)·토큰 없는 웹은 이제 로그인 화면을 거쳐야 한다.
 
 def _paper_user(request: Request) -> dict:
-    """요청 헤더의 세션 토큰 → 유저. 토큰이 없으면 기본 관리자(하위 호환)."""
+    """요청 헤더의 세션 토큰 → 유저. 토큰이 없거나 서명·만료가 틀리면 **401**."""
     token = (request.headers.get(paper_auth.HEADER_NAME)
              or request.headers.get("x-paper-user-token") or "").strip()
     if not token:
-        return paper_auth.ensure_admin()
+        raise HTTPException(status_code=401, detail={
+            "code": "paper_token_required",
+            "message": "닉네임과 PIN으로 로그인해 주세요.",
+        })
     payload = paper_auth.verify_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail={
@@ -1190,7 +1222,7 @@ def _paper_user(request: Request) -> dict:
 
 
 def _paper_admin(request: Request) -> dict:
-    """관리자 전용 — 지인 계정 토큰으로는 403. 토큰이 없으면 예전처럼 허용(하위 호환)."""
+    """관리자 전용 — 토큰이 없으면 401, 지인(비관리자) 토큰이면 403."""
     user = _paper_user(request)
     if not user.get("is_admin"):
         raise HTTPException(status_code=403, detail={
@@ -1234,16 +1266,18 @@ def paper_auth_login(req: PaperAuthRequest):
 
 @app.get("/api/paper/leaderboard")
 def paper_leaderboard(request: Request, fresh: bool = False):
-    """🏆 지인 수익률 랭킹 — 닉네임·미장/국장/합산 수익률 순위(PIN·토큰은 절대 포함하지 않는다)."""
+    """🏆 지인 수익률 랭킹 — 닉네임·미장/국장/합산 수익률 순위(PIN·토큰은 절대 포함하지 않는다).
+
+    지인의 닉네임·수익률 목록이라 **로그인한 유저에게만** 준다(토큰 없으면 401). 웹·안드로이드
+    v2.11 모두 로그인 뒤에만 부르므로 화면은 그대로다.
+    """
+    user = _paper_user(request)
     try:
         body = paper_trading.leaderboard()
     except Exception as exc:
         logger.exception("모의투자 랭킹 계산 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_storage_unavailable")
-    token = (request.headers.get(paper_auth.HEADER_NAME) or "").strip()
-    payload = paper_auth.verify_token(token) if token else None
-    if payload:
-        body["me"] = payload["user_id"]
+    body["me"] = user["id"]
     return body
 
 
@@ -1284,7 +1318,7 @@ def paper_status(request: Request, trades: int = 40, history: int = 180, market:
                  fresh: bool = False):
     """한 계좌의 요약·보유·체결·수익률 + 미국·한국 두 계좌 비교 요약(`accounts`).
 
-    `X-Paper-User-Token`이 있으면 그 유저의 두 계좌만 본다(없으면 기본 관리자).
+    `X-Paper-User-Token`의 그 유저 두 계좌만 본다(토큰이 없으면 401).
     두 계좌 평가를 한 벌로 계산해 `PAPER_STATUS_TTL`(기본 25초) 동안 재사용한다 — 앱이
     미국↔한국 탭을 오가도 시세·DB를 다시 부르지 않아 바로 응답한다. `fresh=true`면 캐시를
     건너뛰고 새로 계산한다(진단용). 매매·설정 직후엔 캐시가 자동으로 버려진다.
@@ -1374,7 +1408,7 @@ def paper_fcm_register(req: FcmRegisterRequest, request: Request):
     platform = (req.platform or "android").strip() or "android"
     try:
         if req.enabled is False:
-            paper_store.remove_fcm_token(token)
+            paper_store.remove_fcm_token(token, user_id=uid)
             return {"ok": True, "registered": False,
                     "tokens": paper_store.count_fcm_tokens(user_id=uid)}
         paper_store.register_fcm_token(token, platform, user_id=uid)
@@ -1396,7 +1430,7 @@ def paper_fcm_unregister(request: Request, token: str | None = None):
     uid = user["id"]
     try:
         if token and token.strip():
-            removed = paper_store.remove_fcm_token(token.strip())
+            removed = paper_store.remove_fcm_token(token.strip(), user_id=uid)
         else:
             removed = paper_store.remove_fcm_tokens(
                 [row["token"] for row in paper_store.list_fcm_tokens(user_id=uid)])

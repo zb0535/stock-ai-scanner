@@ -28,6 +28,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import paper_auth  # noqa: E402
 import paper_store  # noqa: E402
 import paper_trading  # noqa: E402
 
@@ -39,6 +40,17 @@ except ImportError:  # pragma: no cover
 KST = timezone(timedelta(hours=9))
 
 SEED = 1_000_000.0
+
+
+def admin_headers(db_path=None):
+    """기본 관리자(user 1) 세션 토큰 헤더.
+
+    모의투자 API는 토큰 없는 요청을 **401**로 막으므로(구버전 호환 폴백 제거) HTTP 표면 테스트도
+    관리자 토큰을 실어 보낸다. 기존 계좌 1·2의 주인이 관리자라 값은 예전과 같다.
+    """
+    user = paper_auth.ensure_admin(db_path)
+    token, _ = paper_auth.sign_token(user, db_path)
+    return {"X-Paper-User-Token": token}
 
 
 def us(ticker, price=100.0, score=80.0, name=""):
@@ -1097,6 +1109,8 @@ class ApiTests(PaperCase):
         import api
         self.api = api
         self.client = TestClient(api.app)
+        # 보호된 API는 토큰 필수 — 이 클래스의 모든 요청에 관리자 토큰을 기본 헤더로 싣는다.
+        self.client.headers.update(admin_headers(self.db_path))
 
     def test_status_endpoint_defaults_to_us_with_comparison(self):
         response = self.client.get("/api/paper/status")

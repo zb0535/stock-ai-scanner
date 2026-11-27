@@ -23,10 +23,18 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import paper_auth  # noqa: E402
 import paper_store  # noqa: E402
 import paper_trading  # noqa: E402
 
 SEED = 1_000_000.0
+
+
+def admin_headers(db_path=None):
+    """기본 관리자(user 1) 세션 토큰 헤더 — 보호된 API는 토큰 없는 요청을 401로 막는다."""
+    user = paper_auth.ensure_admin(db_path)
+    token, _ = paper_auth.sign_token(user, db_path)
+    return {"X-Paper-User-Token": token}
 
 
 class StatusCase(unittest.TestCase):
@@ -423,6 +431,7 @@ class StatusEndpointTests(StatusCase):
         import api
         self.api = api
         self.client = TestClient(api.app)
+        self.client.headers.update(admin_headers(self.db_path))
 
     def test_tab_switch_reuses_snapshot(self):
         builds = []

@@ -413,9 +413,10 @@ class HealthEndpointTests(BrokerCase):
         self.assertFalse(block["live"])
         self.assertFalse(block["real_trading_enabled"])
         self.assertTrue(block["dry_run"])
-        self.assertEqual(block["supported_adapters"], ["paper", "kis", "toss", "mirae"])
-        self.assertIn("guard", block)
-        self.assertEqual(block["guard"]["daily_used_krw"], 0.0)
+        # 헬스 첵은 로그인 없이 누구나 본다 — 어댑터별 설정·주문 원장 경로는 담지 않는다.
+        for hidden in ("supported_adapters", "adapters", "guard", "requested_mode", "label"):
+            self.assertNotIn(hidden, block)
+        self.assertNotIn("state_path", self.client.get("/").text)
 
     def test_root_keeps_the_existing_fields(self):
         body = self.client.get("/").json()
