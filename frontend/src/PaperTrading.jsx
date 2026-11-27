@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { RealAccountCard, RealAccountModal } from "./RealAccount";
 import {
   ResponsiveContainer,
   LineChart,
@@ -111,12 +112,15 @@ export default function PaperTradingView() {
   const [strategy, setStrategy] = useState("balanced");
   const [auto, setAuto] = useState(true);
   const [runResult, setRunResult] = useState(null);
+  const [realOpen, setRealOpen] = useState(false);
+  const [broker, setBroker] = useState(null);
 
   const apply = useCallback((body) => {
     setData(body);
     setSeed(String(Math.round(body?.account?.initial_cash_krw ?? 0)));
     setStrategy(body?.account?.strategy ?? "balanced");
     setAuto(Boolean(body?.account?.auto_enabled));
+    if (body?.broker) setBroker(body.broker);
   }, []);
 
   const load = useCallback(
@@ -228,9 +232,8 @@ export default function PaperTradingView() {
 
   return (
     <div className="paper">
-      {comparison.length > 0 && (
-        <section className="paper-compare">
-          {comparison.map((row) => (
+      <section className="paper-compare paper-compare-three">
+        {comparison.map((row) => (
             <button
               key={row.market}
               type="button"
@@ -253,8 +256,8 @@ export default function PaperTradingView() {
               </em>
             </button>
           ))}
-        </section>
-      )}
+        <RealAccountCard broker={broker} onOpen={() => setRealOpen(true)} />
+      </section>
 
       <section className="panel paper-hero">
         <div className="score-head">
@@ -616,6 +619,14 @@ export default function PaperTradingView() {
         수수료·증권거래세·환전 스프레드가 붙어 현금과 손익에 그대로 반영됩니다. 과거 수익률이 미래 수익을
         보장하지 않습니다.
       </p>
+
+      {realOpen && (
+        <RealAccountModal
+          status={broker}
+          onClose={() => setRealOpen(false)}
+          onChanged={(next) => setBroker(next)}
+        />
+      )}
     </div>
   );
 }

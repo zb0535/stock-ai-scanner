@@ -9,3 +9,4 @@ pydantic
 requests>=2.31
 psycopg[binary]>=3.2
 firebase-admin>=6.5,<8
+cryptography>=42

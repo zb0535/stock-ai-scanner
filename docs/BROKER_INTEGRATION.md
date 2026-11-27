@@ -49,6 +49,8 @@ paper_trading.run(market)                 전략·후보·현금/비중 한도 �
 | `REAL_ORDER_MAX_KRW` | `100000` | 1회 **매수** 주문 상한(원) |
 | `REAL_DAILY_MAX_KRW` | `1000000` | 1일 누적 **매수** 주문 상한(원) |
 | `BROKER_GUARD_STATE` | (SQLite 파일 옆 `broker_guard.json`) | 가드 상태(1일 누적·중복 키) 파일 경로. 빈 값이면 메모리만 |
+| `BROKER_CRED_KEY` | — | **권장.** 화면에서 등록한 증권사 키를 암호화할 재료(문장 아무거나). 없으면 `DATABASE_URL` 등 서버 비밀에서 유도하고, 그것도 없으면 등록을 거부한다(평문 저장 없음) |
+| `BROKER_CRED_TOKEN` | — | **권장.** 등록/삭제 요청에 `X-Broker-Token` 헤더를 요구한다. 없으면 누구나 등록·삭제 요청을 보낼 수 있다(키 원문은 어느 쪽도 못 읽음) |
 | `KIS_APP_KEY` / `KIS_APP_SECRET` / `KIS_ACCOUNT_NO` | — | 한국투자증권 어댑터가 요구하는 키(자리) |
 | `TOSS_CLIENT_ID` / `TOSS_CLIENT_SECRET` / `TOSS_ACCOUNT_NO` | — | 토스증권 어댑터가 요구하는 키(자리) |
 | `MIRAE_API_KEY` / `MIRAE_ACCOUNT_NO` | — | 미래에셋증권 어댑터가 요구하는 키(자리) |
@@ -197,13 +199,36 @@ assert result.status == "blocked" and result.reason == "real_trading_disabled"
 
 ---
 
-## 6. 지금 상태 요약
+## 6. 화면에서 키 등록하기 (앱·웹, v2.10)
+
+환경변수를 직접 만지지 않고 **앱·웹의 `🔌 실제 계좌 (테스트)` 카드 → `실제 계좌로 해보기`**에서
+증권사 키를 등록할 수 있다. 키는 서버에서만 살고, 화면에는 끝 4자리만 돌아온다.
+
+| 메서드 | 경로 | 하는 일 |
+| --- | --- | --- |
+| GET | `/api/broker/status` | 모드·킬 스위치·한도·어댑터별 키 등록 여부(마스킹 힌트)·증권사별 등록 안내 |
+| POST | `/api/broker/credentials` | `{adapter, app_key, app_secret, account_no, confirm_risk:true}` → 암호화 저장 |
+| DELETE | `/api/broker/credentials/{adapter}` | 등록 삭제(연동 해제) |
+
+- **저장 방식**(`broker_credentials.py`): `cryptography.fernet`(AES-128-CBC + HMAC-SHA256) 암호문만
+  `broker_credentials` 테이블(`cipher` 컬럼)에 넣는다. 화면·로그·에러 메시지 어디에도 원문이 없고,
+  상태 응답은 `hint_label`(`App Key ••••3f9a · 계좌번호 ••••-01`)만 준다.
+- **암호화 재료**: `BROKER_CRED_KEY`(권장) → 없으면 `DATABASE_URL` → `FIREBASE_SERVICE_ACCOUNT_JSON`
+  → `GOOGLE_API_KEY`/`GEMINI_API_KEY` → `FINN_API_KEY`에서 PBKDF2-HMAC-SHA256(20만 회)로 유도.
+  재료가 바뀌면 기존 암호문은 못 읽는다(상태에 "다시 등록" 안내, 원문은 절대 안 나옴).
+- **등록 잠금**: `BROKER_CRED_TOKEN`을 넣으면 등록·삭제에 `X-Broker-Token` 헤더가 필요하다.
+  비워 두면 `credentials.auth.mode="open"`이며, 상태 응답이 그 사실을 경고로 알려 준다.
+- **미래에셋은 등록 불가**: 개인용 Open API가 아직 없다(2026-10 개발 착수 보도, 시기 미정).
+  화면은 안내만 보여 주고 `broker_not_registerable`로 거절한다.
+- **등록해도 주문은 안 나간다**: 어댑터 `implemented=false`(주문 코드 미연결) + 킬 스위치 기본
+  꺼짐 + 드라이런 기본 켜짐. 세 겹을 모두 통과해야 실주문이 된다.
+
+## 7. 지금 상태 요약
 
 | 모드 | 실주문 | 상태 |
 | --- | --- | --- |
 | `paper` (기본) | ✗ | 완전 동작. 기존 AI 모의투자와 100% 동일 |
 | `kis` / `toss` / `mirae` | ✗ | 자리만 있음. 키가 없거나 구현 전이면 `broker_not_configured` |
-
 - 실계좌 모드에서 `paper_trading.run()`은 `skipped: live_broker_not_wired`로 **아무 주문도 만들지
   않고 오늘 몫도 소모하지 않는다.** (모의투자를 계속 돌리려면 `BROKER_MODE=paper`)
 - `GET /`의 `broker` 블록은 DB·시세를 건드리지 않는다(헬스 체크가 10분마다 부른다).

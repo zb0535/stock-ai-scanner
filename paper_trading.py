@@ -56,6 +56,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import broker
+import broker_credentials
 import extended_quotes
 import fcm
 import history_store
@@ -1370,6 +1371,9 @@ def status(db_path: str | None = None, price_fn=None, fx_fn=None,
         "auto_schedule": schedule,
         "next_auto": next_auto_info(account),
         "fee_policy": fee_policy(),
+        # 실제 계좌(테스트) 카드 — 어댑터 모드·킬 스위치·한도·키 등록 여부(마스킹).
+        # 키 원문은 없다. 캐시된 스냅샷과 별개로 매번 만들지만 조회는 20초 캐시를 탄다.
+        "broker": broker_credentials.full_status(db_path),
         "as_of": snapshot["as_of"],
         "storage_backend": snapshot["storage_backend"],
         "cache": {"hit": cache_hit, "age_sec": round(cache_age, 1), "ttl_sec": STATUS_TTL},

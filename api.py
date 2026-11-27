@@ -30,6 +30,7 @@ import fcm
 import sector_pe
 import paper_store
 import broker
+import broker_credentials
 import paper_trading
 from finnhub_client import status as finnhub_status
 
@@ -476,6 +477,7 @@ def health():
             "extended_quotes": extended_quotes.status(),
             "paper_auto": paper_trading.auto_status(),
             "broker": broker.broker_summary(),
+            "broker_credentials": broker_credentials.summary_for_health(),
             "fcm": fcm.status(),
             "yahoo_guard": _yahoo_guard(),
             "errors_recent": recent_errors()}
@@ -1316,6 +1318,100 @@ def paper_fcm_status():
     except Exception as exc:
         logger.exception("FCM 상태 조회 실패: %s", exc)
         raise HTTPException(status_code=503, detail="paper_storage_unavailable")
+
+
+# --- 실제 계좌(증권사 키) 등록 ---------------------------------------------------
+#
+# 앱·웹에서 비밀값을 받되, **서버에서 암호화해 보관만** 한다. 어떤 응답에도 키 원문은 없다:
+#   GET    /api/broker/status            등록 여부·마스킹 힌트·안전장치·등록 안내
+#   POST   /api/broker/credentials       등록(덮어쓰기) — confirm_risk=true 필요
+#   DELETE /api/broker/credentials/{a}   연동 해제(삭제)
+# 실제 주문은 여전히 킬 스위치(REAL_TRADING_ENABLED)·드라이런·어댑터 구현을 모두 통과해야 난다.
+
+
+class BrokerCredentialsRequest(BaseModel):
+    """`POST /api/broker/credentials` — 화면에서 받은 증권사 키.
+
+    `confirm_risk`가 true여야 저장한다(경고를 읽고 동의했다는 표시). 값은 응답·로그로 돌아가지 않는다.
+    """
+
+    adapter: str
+    app_key: str | None = None
+    app_secret: str | None = None
+    account_no: str | None = None
+    confirm_risk: bool = False
+
+
+def _broker_error(exc: broker_credentials.CredentialsError) -> HTTPException:
+    """키 오류 코드 → HTTP 상태. 메시지는 `CredentialsError.message`(원문 없음)만 쓴다."""
+    status = 400
+    if exc.code == "broker_token_required":
+        status = 401
+    elif exc.code in ("credentials_key_unavailable", "credentials_storage_unavailable"):
+        status = 503
+    elif exc.code == "credentials_decrypt_failed":
+        status = 409
+    return HTTPException(status_code=status, detail={"code": exc.code, "message": exc.message})
+
+
+@app.get("/api/broker/status")
+def broker_status():
+    """실제 계좌 연동 상태 — 모드·킬 스위치·한도·어댑터별 키 등록 여부(마스킹)·등록 안내.
+
+    키 원문은 어디에도 없다. `credentials.adapters[kis].hint_label`이 화면에 보여 줄 마스킹이다.
+    """
+    try:
+        return broker_credentials.full_status()
+    except Exception as exc:
+        logger.exception("브로커 상태 조회 실패: %s", exc)
+        raise HTTPException(status_code=503, detail="broker_status_unavailable")
+
+
+@app.post("/api/broker/credentials")
+def broker_credentials_save(req: BrokerCredentialsRequest, request: Request):
+    """증권사 API 키 등록(암호화 저장). 화면은 보낸 뒤 입력값을 즉시 비운다.
+
+    `BROKER_CRED_TOKEN`이 설정된 서버에서는 `X-Broker-Token` 헤더가 필요하다. 응답은 마스킹 힌트와
+    갱신된 상태뿐이고, 요청으로 받은 값은 그대로 돌려주지 않는다.
+    """
+    if not req.confirm_risk:
+        raise HTTPException(status_code=400, detail={
+            "code": "confirm_risk_required",
+            "message": "실제 계좌 경고를 확인했다는 표시(confirm_risk)가 필요합니다.",
+        })
+    values = {"app_key": req.app_key, "app_secret": req.app_secret,
+              "account_no": req.account_no}
+    try:
+        broker_credentials.check_write_token(request.headers.get("x-broker-token"))
+        saved = broker_credentials.save(req.adapter, values)
+    except broker_credentials.CredentialsError as exc:
+        logger.warning("증권사 키 등록 거부(adapter=%s, code=%s)", req.adapter, exc.code)
+        raise _broker_error(exc)
+    except Exception as exc:
+        logger.exception("증권사 키 등록 실패(adapter=%s): %s", req.adapter, type(exc).__name__)
+        raise HTTPException(status_code=503, detail={
+            "code": "credentials_storage_unavailable",
+            "message": "키를 저장하지 못했습니다. 잠시 뒤 다시 시도해 주세요.",
+        })
+    return {"ok": True, **saved, "broker": broker_credentials.full_status()}
+
+
+@app.delete("/api/broker/credentials/{adapter}")
+def broker_credentials_delete(adapter: str, request: Request):
+    """등록된 키 삭제(연동 해제). 지운 행 수와 갱신된 상태를 돌려준다."""
+    try:
+        broker_credentials.check_write_token(request.headers.get("x-broker-token"))
+        removed = broker_credentials.delete(adapter)
+    except broker_credentials.CredentialsError as exc:
+        raise _broker_error(exc)
+    except Exception as exc:
+        logger.exception("증권사 키 삭제 실패(adapter=%s): %s", adapter, type(exc).__name__)
+        raise HTTPException(status_code=503, detail={
+            "code": "credentials_storage_unavailable",
+            "message": "키를 삭제하지 못했습니다. 잠시 뒤 다시 시도해 주세요.",
+        })
+    return {"ok": True, "adapter": adapter.lower(), "removed": removed,
+            "broker": broker_credentials.full_status()}
 
 
 @app.post("/api/paper/fcm/test")
