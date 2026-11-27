@@ -268,10 +268,26 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
   서버 정량 점수(`quant_score`·`signals`)만으로 만든 요약을 돌려준다. 이때 응답의
   `analysis_source`가 `fallback`, `analysis_note`에 사유가 담긴다(정상은 `gemini`·빈 문자열).
 
+## 브로커 구조 (모의투자 → 실계좌)
+- **주문은 전부 `broker.py`의 어댑터를 지난다.** 전략·후보·현금 한도 같은 판단은
+  `paper_trading`에 그대로 두고, 체결만 `BrokerAdapter`(`place_buy`·`place_sell`·`get_balance`·
+  `health`) 뒤로 뺐다. 기본값 `BROKER_MODE=paper`는 기존 AI 모의투자와 **100% 동일**하게 돈다
+  (수수료·증권거래세·환차·수량 단위·현금 방어선은 예전 체결 엔진이 그대로 계산).
+- **실계좌 자리**: 한국투자증권(`kis`)·토스증권(`toss`)·미래에셋증권(`mirae`) 어댑터를 미리
+  두었다. 키가 없거나 구현 전이면 어떤 주문도 나가지 않고 `broker_not_configured`를 돌려준다.
+- **실주문 안전장치 `OrderGuard`**: 킬 스위치(`REAL_TRADING_ENABLED`, 기본 꺼짐) · 1회/1일
+  **매수** 상한(`REAL_ORDER_MAX_KRW` 10만원 / `REAL_DAILY_MAX_KRW` 100만원) · 중복 주문 차단
+  (`run_id`·시장·방향·종목) · 드라이런(`REAL_DRY_RUN`, 기본 켜짐). 1일 누적·중복 키는
+  `broker_guard.json`에 남아 서버가 재기동돼도 유지된다.
+- **실계좌 모드에서는 모의투자 실행기를 돌리지 않는다**(`skipped: live_broker_not_wired`) —
+  가짜 시드머니로 실주문을 내는 사고를 막고, 오늘 몫도 소모하지 않는다.
+- `GET /`의 `broker` 블록에 모드·실계좌 여부·킬 스위치·한도·어댑터별 키 설정 여부가 나온다
+  (키 본문은 없음). 붙이는 방법과 전환 체크리스트는 [`docs/BROKER_INTEGRATION.md`](docs/BROKER_INTEGRATION.md).
+
 ## 실행 방법
 1. 백엔드: `pip install -r requirements.txt` 후 `GEMINI_API_KEY` 설정 → `python -m uvicorn api:app --reload --port 8000`
 2. 프론트: `cd frontend && npm install && npm run dev`
-3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자(두 계좌 분리·수수료·세금·환차·마이그레이션)·FCM 체결 푸시·메모리 가드(RSS/한도·슬롯 직렬화·프리워밍 단계 락·캐시 상한) 검증, 637개)
+3. 테스트: `python -m unittest discover -s tests` (지표·스코어링·캐시/폴백·추천 성적표·저장 백엔드·API 계약·한국 주식/코스피 200·NaN 안전/폴백·지연 가드·AI 모의투자(두 계좌 분리·수수료·세금·환차·마이그레이션)·FCM 체결 푸시·메모리 가드(RSS/한도·슬롯 직렬화·프리워밍 단계 락·캐시 상한)·브로커 어댑터/실주문 안전장치(킬 스위치·1회/1일 한도·중복 주문·드라이런·재기동 영속) 검증, 667개)
 
 ## 환경변수
 | 이름 | 설명 |
@@ -299,6 +315,11 @@ yfinance 실시간 주가·재무 데이터와 Gemini AI를 결합한 종목 스
 | `PAPER_STATUS_CACHE` | 상태 스냅샷 캐시 스위치(기본 켜짐). `0`이면 캐시 없이 매번 계산 |
 | `PAPER_STATUS_PREWARM` / `PAPER_STATUS_WARM_DELAY` / `PAPER_STATUS_WARM_INTERVAL` | 기동 후 상태 스냅샷 예열(기본 켜짐) · 예열 시작까지 지연(초, 기본 20) · 다시 채우는 주기(초, 기본 60) |
 | `PAPER_USDKRW` | 환율 조회가 모두 실패할 때 쓰는 고정 USD/KRW(기본 1350) |
+| `BROKER_MODE` | 주문을 내보낼 브로커(기본 `paper`). `kis`·`toss`·`mirae`는 자리만 있고 키가 없으면 `broker_not_configured` |
+| `REAL_TRADING_ENABLED` | **실주문 킬 스위치**(기본 꺼짐). `1`이 아니면 실계좌 주문은 전부 차단 |
+| `REAL_DRY_RUN` | 실주문 드라이런(기본 켜짐). 켜져 있으면 주문을 보내지 않고 결과만 돌려줌 |
+| `REAL_ORDER_MAX_KRW` / `REAL_DAILY_MAX_KRW` | 실계좌 1회/1일 **매수** 주문 상한(기본 10만원 / 100만원) |
+| `BROKER_GUARD_STATE` | 가드 상태(1일 누적·중복 주문 키) JSON 경로. 기본은 SQLite 파일 옆 `broker_guard.json`, 빈 값이면 메모리만 |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | 체결 푸시(FCM) 서비스 계정 JSON 문자열 전체 또는 base64(선택). 없으면 푸시만 건너뜀 |
 | `FIREBASE_CREDENTIALS_PATH` | `FIREBASE_SERVICE_ACCOUNT_JSON` 대신 쓸 서비스 계정 JSON 파일 경로(선택) |
 | `SEC_EDGAR_FALLBACK` / `FINNHUB_FALLBACK` | Yahoo `t.info` 대체 경로 스위치(기본 켜짐). `0`이면 끔 |

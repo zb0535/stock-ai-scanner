@@ -55,6 +55,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+import broker
 import extended_quotes
 import fcm
 import history_store
@@ -497,15 +498,67 @@ def _quant_plan(candidates: list[dict], cash_krw: float, held: set[str],
 # --- 매매 실행 ---------------------------------------------------------------
 
 
+def _sell_shares(position: dict, fraction) -> float:
+    """매도 비중 → 실제 주문 수량(미국 소수점 4자리·한국 1주 정수, 보유량 이하).
+
+    비중이 너무 작아 0주가 되면 전량으로 올린다(0주 주문 방지).
+    """
+    currency = position.get("currency") or "USD"
+    held = float(position["shares"])
+    shares = _round_shares(held * float(fraction), currency)
+    if shares <= 0:
+        shares = held
+    return min(shares, held)
+
+
+def _order_skip_reason(result, action: str) -> str:
+    """어댑터 주문 결과 → 실행 결과의 `skipped` 사유 문장(화면·로그에 그대로 보인다)."""
+    if result.status == broker.STATUS_DRY_RUN:
+        return f"{action} 드라이런 — 실제 주문을 보내지 않았습니다."
+    if result.status == broker.STATUS_NOT_CONFIGURED:
+        return f"{action} 실계좌 미연결(broker_not_configured) — 증권사 키 설정이 필요합니다."
+    if result.status == broker.STATUS_BLOCKED:
+        return f"{action} 차단({result.reason}) — 주문 안전장치가 막았습니다."
+    detail = f" — {result.reason}" if result.reason else ""
+    return f"{action} 미체결({result.status or 'rejected'}){detail}"
+
+
 def _execute_sell(position: dict, price: float, fx_rate: float, fraction: float, reason: str,
                   run_id: str, source: str, db_path: str | None,
-                  account_id: int = paper_store.ACCOUNT_US) -> dict:
-    """포지션 일부/전량 매도 체결 — 수수료·증권거래세를 뺀 **순수취액**이 현금으로 들어온다.
+                  account_id: int = paper_store.ACCOUNT_US) -> "broker.OrderResult":
+    """매도 **주문 경로** — 수량을 정하고 브로커 어댑터에 맡긴다(모의투자는 `_fill_sell`).
+
+    실계좌 어댑터가 붙으면 이 함수만 바뀌지 않고 어댑터가 주문을 내보낸다(안전장치 포함).
+    """
+    market = position.get("market") or market_of(position["ticker"])
+    currency = position.get("currency") or ("KRW" if market == "KR" else "USD")
+    shares = _sell_shares(position, fraction)
+    rate = 1.0 if currency == "KRW" else float(fx_rate)
+    order = broker.OrderRequest(
+        side="SELL", ticker=str(position["ticker"]), market=str(market),
+        shares=shares, price=float(price), currency=str(currency),
+        amount_krw=round(shares * float(price) * rate, 2), fx_rate=float(fx_rate),
+        reason=reason, run_id=run_id, name=str(position.get("name") or ""),
+        account_id=account_id, db_path=db_path,
+        extra={"position": position, "fraction": fraction, "source": source},
+    )
+    result = broker.get_adapter(market=market, db_path=db_path,
+                                account_id=account_id).place_sell(order)
+    if not result.ok or result.trade is None:
+        logger.info("매도 주문 미체결 %s(%s): %s %s", order.ticker, result.adapter,
+                    result.status, result.reason)
+    return result
+
+
+def _fill_sell(position: dict, shares: float, price: float, fx_rate: float, reason: str,
+               run_id: str, source: str, db_path: str | None,
+               account_id: int = paper_store.ACCOUNT_US) -> dict:
+    """모의투자 매도 체결 — 수수료·증권거래세를 뺀 **순수취액**이 현금으로 들어온다.
 
     - 총 매도대금 `gross_krw` = 주가 × 수량 × 현재환율
     - 매도 비용 `fee_krw` = gross × 매도 비용률(한국 0.195% · 미국 0.15%)
     - 실제 입금 `net_krw` = gross - fee
-    - `realized_pnl_krw` = net - (매도 비중 × 포지션 원가). 원가에는 매수 수수료가 들어 있어
+    - `realized_pnl_krw` = net - (매도 수량 비율 × 포지션 원가). 원가에는 매수 수수료가 들어 있어
       이 값이 곧 **수수료·세금·환차를 모두 반영한 순손익**이다.
 
     포지션 축소·현금 증가·체결 기록은 `paper_store.apply_sell`이 한 트랜잭션으로 처리한다.
@@ -515,10 +568,7 @@ def _execute_sell(position: dict, price: float, fx_rate: float, fraction: float,
     _, sell_fee_rate = fee_rates(market)
     rate = 1.0 if currency == "KRW" else fx_rate
     held = float(position["shares"])
-    shares = _round_shares(held * fraction, currency)
-    if shares <= 0:
-        shares = held  # 너무 작은 비율이면 전량으로 올린다(0주 체결 방지)
-    shares = min(shares, held)
+    shares = min(float(shares), held)
 
     gross_krw = round(shares * float(price) * rate, 2)
     fee_krw = round(gross_krw * sell_fee_rate, 2)
@@ -553,8 +603,30 @@ def _execute_sell(position: dict, price: float, fx_rate: float, fraction: float,
 
 def _execute_buy(symbol: str, market: str, name: str, currency: str, price: float,
                  amount_krw: float, fx_rate: float, reason: str, run_id: str, source: str,
-                 db_path: str | None, account_id: int = paper_store.ACCOUNT_US) -> dict | None:
-    """매수 체결 — 현금 한도·최소 주문·수량 단위를 지키고, 불가능하면 None.
+                 db_path: str | None,
+                 account_id: int = paper_store.ACCOUNT_US) -> "broker.OrderResult":
+    """매수 **주문 경로** — 브로커 어댑터에 맡긴다(모의투자는 `_fill_buy`).
+
+    실계좌 어댑터가 붙으면 이 함수만 바뀌지 않고 어댑터가 주문을 내보낸다(안전장치 포함).
+    """
+    order = broker.OrderRequest(
+        side="BUY", ticker=symbol, market=market, shares=0.0, price=float(price),
+        currency=currency, amount_krw=float(amount_krw), fx_rate=float(fx_rate),
+        reason=reason, run_id=run_id, name=name, account_id=account_id, db_path=db_path,
+        extra={"source": source},
+    )
+    result = broker.get_adapter(market=market, db_path=db_path,
+                                account_id=account_id).place_buy(order)
+    if not result.ok or result.trade is None:
+        logger.info("매수 주문 미체결 %s(%s): %s %s", order.ticker, result.adapter,
+                    result.status, result.reason)
+    return result
+
+
+def _fill_buy(symbol: str, market: str, name: str, currency: str, price: float,
+              amount_krw: float, fx_rate: float, reason: str, run_id: str, source: str,
+              db_path: str | None, account_id: int = paper_store.ACCOUNT_US) -> dict | None:
+    """모의투자 매수 체결 — 현금 한도·최소 주문·수량 단위를 지키고, 불가능하면 None.
 
     **수수료까지 예산 안에서 계산한다**: `amount_krw`는 이 종목에 쓸 수 있는 총액(수수료 포함)이고,
     `체결원금 + 매수수수료 <= 현금`이 되도록 수량을 정한다. 원가(`cost_krw`)는 원금과 매수수수료의
@@ -745,6 +817,19 @@ def _run_locked(market=None, force: bool = False, trigger: str = "manual",
 
     scope = account_scope(market)
     account_id = account_id_of(scope)
+    # 실계좌 모드에서는 이 실행기가 모의투자 원장을 보고 주문 금액을 정하면 안 된다
+    # (가짜 잔고로 실주문을 내는 사고). 실계좌 주문 경로는 어댑터를 붙일 때 따로 연결한다
+    # — docs/BROKER_INTEGRATION.md '4. 새 증권사 붙이기 → 3) 실행기 연결'.
+    adapter = broker.get_adapter(market=scope, db_path=db_path, account_id=account_id)
+    if adapter.is_live:
+        return {
+            "ok": True, "skipped": "live_broker_not_wired", "market": scope, "markets": [scope],
+            "broker": {"mode": adapter.name, "live": True,
+                       "status": "not_configured" if not adapter.configured else "wired_pending"},
+            "message": (f"{account_label(scope)} 계좌는 실계좌 모드(BROKER_MODE={adapter.name})입니다. "
+                        "모의투자 실행기로는 실주문을 내지 않습니다 — 모의투자는 BROKER_MODE=paper입니다."),
+            "ran_at": paper_store._now(),
+        }
     account = paper_store.init_store(db_path, account_id)
     targets = [scope]
 
@@ -845,9 +930,12 @@ def _run_locked(market=None, force: bool = False, trigger: str = "manual",
         fraction = _num(item.get("fraction"))
         fraction = 1.0 if fraction is None else max(0.05, min(1.0, fraction))
         reason = str(item.get("reason") or "AI 판단 매도")[:300]
-        trade = _execute_sell(position, price, fx_rate, fraction, reason, run_id,
-                              item.get("source") or ai_source, db_path, account_id)
-        sells.append(trade)
+        result = _execute_sell(position, price, fx_rate, fraction, reason, run_id,
+                               item.get("source") or ai_source, db_path, account_id)
+        if not result.trade:
+            skipped.append({"ticker": symbol, "reason": _order_skip_reason(result, "매도")})
+            continue
+        sells.append(result.trade)
         cash = float(paper_store.get_account(account_id, db_path)["cash_krw"])
 
     # --- 5) 매수 판단 ---
@@ -909,13 +997,13 @@ def _run_locked(market=None, force: bool = False, trigger: str = "manual",
         if amount < MIN_ORDER_KRW:
             skipped.append({"ticker": symbol, "reason": "종목 비중 상한 때문에 금액이 너무 작음"})
             continue
-        trade = _execute_buy(symbol, market_of(symbol), str(row.get("name") or ""), currency,
-                             price, amount, fx_rate, item.get("reason") or "", run_id,
-                             item.get("source") or ai_source, db_path, account_id)
-        if trade:
-            buys.append(trade)
+        result = _execute_buy(symbol, market_of(symbol), str(row.get("name") or ""), currency,
+                              price, amount, fx_rate, item.get("reason") or "", run_id,
+                              item.get("source") or ai_source, db_path, account_id)
+        if result.trade:
+            buys.append(result.trade)
         else:
-            skipped.append({"ticker": symbol, "reason": "수량이 0이 되어 체결하지 않음"})
+            skipped.append({"ticker": symbol, "reason": _order_skip_reason(result, "매수")})
 
     # --- 6.5) 체결 푸시: 실제 체결이 1건 이상일 때만 등록된 기기로 바로 보낸다 ---
     # 발송은 fcm 안에서 예외·시간 초과를 흡수하므로, 여기서 실패해도 매매·기록은 그대로 끝난다.
@@ -1487,6 +1575,7 @@ def clear_caches() -> None:
     """테스트용 캐시 초기화."""
     reset_fx_cache()
     invalidate_status_cache()
+    broker.clear_cache()
     _AUTO_FAILURES.clear()
     if extended_quotes and hasattr(extended_quotes, "clear_cache"):
         try:

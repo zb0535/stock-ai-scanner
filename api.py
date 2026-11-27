@@ -29,6 +29,7 @@ import extended_quotes
 import fcm
 import sector_pe
 import paper_store
+import broker
 import paper_trading
 from finnhub_client import status as finnhub_status
 
@@ -456,6 +457,9 @@ def health():
     `kospi200_cache`는 코스피 200 스냅샷 상태다. `yahoo_guard`는 Yahoo t.info·뉴스의
     전역 우회 상태와 프리 스캔이 미리 적재한 일봉 캐시 개수다. 이 응답은 스캔 중에도 즉시
     돌아온다 — 락은 dict 복사 순간만 잡는다.
+    `paper_auto`는 AI 모의투자 자동 실행 상태, `broker`는 지금 주문이 어느 브로커
+    어댑터로 나가는지(모드·실계좌 여부·킬 스위치·1회/1일 한도·어댑터별 키 설정 여부)를
+    요약한다 — 키 본문은 응답에 없다.
     """
     return {"status": "ok", "build": (os.environ.get("RENDER_GIT_COMMIT") or "")[:7] or "local",
             "finnhub": finnhub_status(),
@@ -471,6 +475,7 @@ def health():
                          "ttl_sec": realtime_quotes.REALTIME_TTL},
             "extended_quotes": extended_quotes.status(),
             "paper_auto": paper_trading.auto_status(),
+            "broker": broker.broker_summary(),
             "fcm": fcm.status(),
             "yahoo_guard": _yahoo_guard(),
             "errors_recent": recent_errors()}
